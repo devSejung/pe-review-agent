@@ -1,0 +1,23 @@
+# Runtime dependency lock for reproducible image builds.
+# Regenerate deliberately after dependency review; do not use unbounded latest at deploy time.
+alembic==1.20.0
+annotated-types==0.8.0
+anyio==4.15.1
+asyncpg==0.31.0
+certifi==2026.7.22
+greenlet==3.5.6
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+Mako==1.4.1
+MarkupSafe==3.0.3
+prometheus_client==0.26.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+PyYAML==6.0.3
+SQLAlchemy==2.0.54
+typing-inspection==0.4.4
+typing_extensions==4.16.0

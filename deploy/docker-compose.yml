@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pe_review
+      POSTGRES_USER: pe_review
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pe_review -d pe_review"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
+    command: ["migrate"]
+    restart: "no"
+    environment: &review-env
+      PE_REVIEW_CONFIG: /etc/pe-review-agent/config.yaml
+      PE_REVIEW__DATABASE__DSN: postgresql+asyncpg://pe_review:${POSTGRES_PASSWORD}@postgres:5432/pe_review
+      PE_REVIEW_LLM_API_KEY: ${PE_REVIEW_LLM_API_KEY:-}
+      PE_REVIEW_GERRIT_HTTP_PASSWORD: ${PE_REVIEW_GERRIT_HTTP_PASSWORD:-}
+    volumes: &review-volumes
+      - ./config.yaml:/etc/pe-review-agent/config.yaml:ro
+      - ./secrets/gerrit_ssh_key:/run/secrets/gerrit_ssh_key:ro
+      - ./secrets/gerrit_known_hosts:/run/secrets/gerrit_known_hosts:ro
+      - repo-data:/var/lib/pe-review-agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  receiver:
+    image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
+    command: ["receiver"]
+    restart: unless-stopped
+    environment: *review-env
+    volumes: *review-volumes
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
+    command: ["worker"]
+    restart: unless-stopped
+    environment: *review-env
+    volumes: *review-volumes
+    ports:
+      - "127.0.0.1:${HEALTH_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  reconciler:
+    image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
+    command: ["reconcile"]
+    restart: unless-stopped
+    environment: *review-env
+    volumes: *review-volumes
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  repo-data:
