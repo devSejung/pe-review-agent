@@ -6,7 +6,7 @@ from pe_review_agent.jobs.models import (
     ReviewFinding,
     ReviewResultRow,
 )
-from pe_review_agent.jobs.store import JobRecord, JobStore
+from pe_review_agent.jobs.store import JobRecord, JobStore, PublishGuardStatus
 
 __all__ = [
     "Attempt",
@@ -15,6 +15,7 @@ __all__ = [
     "JobStore",
     "Publication",
     "PublicationStatus",
+    "PublishGuardStatus",
     "ReviewFinding",
     "ReviewResultRow",
 ]

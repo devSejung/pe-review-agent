@@ -5,16 +5,20 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from pe_review_agent.domain import (
     TERMINAL_JOB_STATES,
     AttemptStage,
+    DiffSide,
     Finding,
+    FindingLineage,
     FindingLocation,
     GerritPatchsetEvent,
     JobIdentity,
@@ -29,8 +33,10 @@ from pe_review_agent.jobs.models import (
     PublicationStatus,
     ReviewFinding,
     ReviewResultRow,
+    ServiceState,
 )
 from pe_review_agent.jobs.state_machine import require_transition, valid_retry_target
+from pe_review_agent.review.lineage import FindingHistory
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +54,14 @@ class JobRecord:
     lease_owner: str | None
     lease_expires_at: datetime | None
     event_payload: dict[str, Any]
+    superseded_by_job_id: uuid.UUID | None = None
+    retry_epoch_start_attempt: int = 0
+
+
+class PublishGuardStatus(StrEnum):
+    OK = "OK"
+    SUPERSEDED = "SUPERSEDED"
+    LEASE_LOST = "LEASE_LOST"
 
 
 def _enqueue_insert(event: GerritPatchsetEvent, policy_version: str):
@@ -76,6 +90,23 @@ def _enqueue_insert(event: GerritPatchsetEvent, policy_version: str):
 
 def _claim_select(now: datetime):
     terminal = [state.value for state in TERMINAL_JOB_STATES]
+    older = aliased(Job)
+    unresolved_older_publication = exists(
+        select(1)
+        .select_from(older)
+        .where(
+            older.project == Job.project,
+            older.change_number == Job.change_number,
+            older.patchset_number < Job.patchset_number,
+            or_(
+                older.state == JobState.PUBLISHING.value,
+                and_(
+                    older.state == JobState.RETRY_WAIT.value,
+                    older.retry_state == JobState.PUBLISHING.value,
+                ),
+            ),
+        )
+    )
     return (
         select(Job)
         .where(
@@ -85,6 +116,7 @@ def _claim_select(now: datetime):
                 Job.state != JobState.RETRY_WAIT.value,
                 Job.next_attempt_at <= now,
             ),
+            ~unresolved_older_publication,
         )
         .order_by(Job.next_attempt_at.asc(), Job.created_at.asc())
         .with_for_update(skip_locked=True)
@@ -113,9 +145,11 @@ def _count_consumed_retry_attempts_select(job_id: uuid.UUID, stage: AttemptStage
     return (
         select(func.count())
         .select_from(Attempt)
+        .join(Job, Job.id == Attempt.job_id)
         .where(
             Attempt.job_id == job_id,
             Attempt.stage == stage.value,
+            Attempt.attempt_number > Job.retry_epoch_start_attempt,
             or_(Attempt.success.is_(False), Attempt.finished_at.is_(None)),
         )
     )
@@ -185,6 +219,12 @@ class JobStore:
             .limit(1)
         )
         if newer_id is not None and job.state not in terminal:
+            if _needs_publish_recovery(job):
+                # A ReviewInput may already have reached Gerrit while the local response/DB commit
+                # is still outstanding. Preserve this job as reclaimable so a later worker can ask
+                # Gerrit whether the side effect happened before deciding SUPERSEDED vs DONE.
+                job.superseded_by_job_id = newer_id
+                return
             job.state = JobState.SUPERSEDED.value
             job.superseded_by_job_id = newer_id
             job.lease_owner = None
@@ -198,6 +238,34 @@ class JobStore:
                 Job.change_number == job.change_number,
                 Job.patchset_number < job.patchset_number,
                 Job.state.not_in(terminal),
+                or_(
+                    Job.state == JobState.PUBLISHING.value,
+                    and_(
+                        Job.state == JobState.RETRY_WAIT.value,
+                        Job.retry_state == JobState.PUBLISHING.value,
+                    ),
+                ),
+            )
+            .values(
+                superseded_by_job_id=job.id,
+                updated_at=func.now(),
+            )
+        )
+
+        await session.execute(
+            update(Job)
+            .where(
+                Job.project == job.project,
+                Job.change_number == job.change_number,
+                Job.patchset_number < job.patchset_number,
+                Job.state.not_in(terminal),
+                ~or_(
+                    Job.state == JobState.PUBLISHING.value,
+                    and_(
+                        Job.state == JobState.RETRY_WAIT.value,
+                        Job.retry_state == JobState.PUBLISHING.value,
+                    ),
+                ),
             )
             .values(
                 state=JobState.SUPERSEDED.value,
@@ -213,6 +281,34 @@ class JobStore:
         async with self._sessions() as session:
             job = await session.get(Job, job_id)
             return _record(job) if job is not None else None
+
+    async def get_service_watermark(self, key: str) -> datetime | None:
+        async with self._sessions() as session:
+            return await session.scalar(
+                select(ServiceState.timestamp_value).where(ServiceState.key == key)
+            )
+
+    async def advance_service_watermark(self, key: str, value: datetime) -> None:
+        if value.tzinfo is None:
+            raise ValueError("service watermark must be timezone-aware")
+        statement = pg_insert(ServiceState).values(
+            key=key,
+            timestamp_value=value,
+            json_value={},
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[ServiceState.key],
+            set_={
+                "timestamp_value": statement.excluded.timestamp_value,
+                "updated_at": func.now(),
+            },
+            where=or_(
+                ServiceState.timestamp_value.is_(None),
+                ServiceState.timestamp_value < statement.excluded.timestamp_value,
+            ),
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(statement)
 
     async def claim_next(self, *, worker_id: str, lease_seconds: int) -> JobRecord | None:
         now = datetime.now(UTC)
@@ -252,6 +348,53 @@ class JobStore:
                 )
             )
             return result.rowcount == 1
+
+    async def refresh_publish_guard(
+        self,
+        job_id: uuid.UUID,
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> PublishGuardStatus:
+        """Atomically prove ownership/latest-PS status and extend the publish lease.
+
+        This is called immediately before the Gerrit POST. Extending the lease here prevents an
+        expired/stale worker and a replacement worker from both publishing the same durable payload.
+        """
+        now = datetime.now(UTC)
+        async with self._sessions.begin() as session:
+            identity = await session.execute(
+                select(Job.project, Job.change_number).where(Job.id == job_id)
+            )
+            row = identity.one_or_none()
+            if row is None:
+                return PublishGuardStatus.LEASE_LOST
+            await session.execute(_change_lock_select(row.project, row.change_number))
+            job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+            if job is None:
+                return PublishGuardStatus.LEASE_LOST
+            if (
+                job.state != JobState.PUBLISHING.value
+                or job.lease_owner != worker_id
+                or job.lease_expires_at is None
+                or job.lease_expires_at <= now
+            ):
+                return PublishGuardStatus.LEASE_LOST
+            newer = await session.scalar(
+                select(Job.id)
+                .where(
+                    Job.project == job.project,
+                    Job.change_number == job.change_number,
+                    Job.patchset_number > job.patchset_number,
+                )
+                .limit(1)
+            )
+            if newer is not None:
+                return PublishGuardStatus.SUPERSEDED
+            job.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            job.updated_at = func.now()
+            await session.flush()
+            return PublishGuardStatus.OK
 
     async def transition(
         self,
@@ -330,15 +473,21 @@ class JobStore:
             return _record(job)
 
     async def mark_superseded(
-        self, job_id: uuid.UUID, *, superseded_by_job_id: uuid.UUID | None = None
+        self,
+        job_id: uuid.UUID,
+        *,
+        worker_id: str,
+        superseded_by_job_id: uuid.UUID | None = None,
     ) -> JobRecord:
         async with self._sessions.begin() as session:
             job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
             if job is None:
                 raise KeyError(job_id)
-            if JobState(job.state) != JobState.SUPERSEDED:
-                require_transition(JobState(job.state), JobState.SUPERSEDED)
-                job.state = JobState.SUPERSEDED.value
+            if JobState(job.state) == JobState.SUPERSEDED:
+                return _record(job)
+            _require_live_lease(job, worker_id)
+            require_transition(JobState(job.state), JobState.SUPERSEDED)
+            job.state = JobState.SUPERSEDED.value
             job.superseded_by_job_id = superseded_by_job_id
             job.retry_state = None
             job.lease_owner = None
@@ -348,6 +497,83 @@ class JobStore:
 
     async def mark_done(self, job_id: uuid.UUID, *, worker_id: str) -> JobRecord:
         return await self.transition(job_id, JobState.DONE, worker_id=worker_id, release_lease=True)
+
+    async def requeue_failed(self, job_id: uuid.UUID) -> JobRecord:
+        """Administratively retry a failed job without erasing its attempt audit history.
+
+        Retry accounting starts a new epoch at the current durable attempt number. If a review or
+        publication intent already exists, resume from that durable phase instead of invoking the
+        model again. A stale Patch Set is never reopened.
+        """
+
+        now = datetime.now(UTC)
+        async with self._sessions.begin() as session:
+            identity = await session.execute(
+                select(Job.project, Job.change_number).where(Job.id == job_id)
+            )
+            row = identity.one_or_none()
+            if row is None:
+                raise KeyError(job_id)
+            await session.execute(_change_lock_select(row.project, row.change_number))
+            job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+            if job is None:
+                raise KeyError(job_id)
+
+            state = JobState(job.state)
+            if state is not JobState.FAILED_PERMANENT:
+                raise RuntimeError(
+                    f"job {job_id} is {state.value}; only FAILED_PERMANENT jobs can be requeued"
+                )
+            newer = await session.scalar(
+                select(Job.id)
+                .where(
+                    Job.project == job.project,
+                    Job.change_number == job.change_number,
+                    Job.patchset_number > job.patchset_number,
+                )
+                .limit(1)
+            )
+            if newer is not None:
+                raise RuntimeError(
+                    f"job {job_id} is an older Patch Set and cannot be manually requeued"
+                )
+
+            publication = await session.scalar(
+                select(Publication).where(Publication.job_id == job_id).with_for_update()
+            )
+            review_exists = (
+                await session.scalar(
+                    select(ReviewResultRow.job_id).where(ReviewResultRow.job_id == job_id)
+                )
+                is not None
+            )
+
+            if publication is not None and publication.status == PublicationStatus.POSTED.value:
+                job.state = JobState.DONE.value
+            elif publication is not None:
+                if publication.status == PublicationStatus.FAILED.value:
+                    publication.status = PublicationStatus.PENDING.value
+                    publication.last_error = None
+                    publication.gerrit_response = None
+                    publication.posted_at = None
+                    publication.updated_at = func.now()
+                job.state = JobState.PUBLISHING.value
+            elif review_exists:
+                job.state = JobState.READY_TO_PUBLISH.value
+            else:
+                job.state = JobState.RECEIVED.value
+
+            job.retry_epoch_start_attempt = job.attempt_count
+            job.retry_state = None
+            job.next_attempt_at = now
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.claimed_at = None
+            job.last_error_class = None
+            job.last_error = None
+            job.updated_at = func.now()
+            await session.flush()
+            return _record(job)
 
     async def start_attempt(self, job_id: uuid.UUID, *, stage: AttemptStage, worker_id: str) -> int:
         now = datetime.now(UTC)
@@ -380,9 +606,7 @@ class JobStore:
             count = await session.scalar(_count_attempts_select(job_id, stage))
             return int(count or 0)
 
-    async def count_consumed_retry_attempts(
-        self, job_id: uuid.UUID, *, stage: AttemptStage
-    ) -> int:
+    async def count_consumed_retry_attempts(self, job_id: uuid.UUID, *, stage: AttemptStage) -> int:
         """Return failures plus unfinished attempts left behind by crashes/lease loss."""
         async with self._sessions() as session:
             count = await session.scalar(_count_consumed_retry_attempts_select(job_id, stage))
@@ -447,7 +671,9 @@ class JobStore:
                 seen: set[str] = set()
                 for ordinal, finding in enumerate(review.findings):
                     finding.ensure_fingerprint(project=job.project)
+                    finding.ensure_semantic_id(project=job.project)
                     assert finding.fingerprint is not None
+                    assert finding.semantic_id is not None
                     if finding.fingerprint in seen:
                         continue
                     seen.add(finding.fingerprint)
@@ -456,6 +682,8 @@ class JobStore:
                             job_id=job_id,
                             ordinal=ordinal,
                             fingerprint=finding.fingerprint,
+                            semantic_id=finding.semantic_id,
+                            lineage_state=(finding.lineage or FindingLineage.NEW).value,
                             severity=finding.severity.value,
                             category=finding.category,
                             title=finding.title,
@@ -464,6 +692,7 @@ class JobStore:
                             evidence=finding.evidence,
                             remediation=finding.remediation,
                             path=finding.location.path,
+                            side=finding.location.side.value,
                             start_line=finding.location.start_line,
                             start_character=finding.location.start_character,
                             end_line=finding.location.end_line,
@@ -510,6 +739,7 @@ class JobStore:
                         remediation=finding.remediation,
                         location=FindingLocation(
                             path=finding.path,
+                            side=DiffSide(finding.side),
                             start_line=finding.start_line,
                             start_character=finding.start_character,
                             end_line=finding.end_line,
@@ -517,9 +747,90 @@ class JobStore:
                         ),
                         confidence=finding.confidence,
                         fingerprint=finding.fingerprint,
+                        semantic_id=finding.semantic_id,
+                        lineage=FindingLineage(finding.lineage_state),
                     )
                     for finding in findings
                 ],
+            )
+
+    async def load_finding_history(self, job_id: uuid.UUID) -> FindingHistory:
+        """Load the last posted Patch Set plus all semantic IDs seen in posted history."""
+        async with self._sessions() as session:
+            job = await session.get(Job, job_id)
+            if job is None:
+                raise KeyError(job_id)
+            baseline_job = await session.scalar(
+                select(Job)
+                .join(ReviewResultRow, ReviewResultRow.job_id == Job.id)
+                .where(
+                    Job.project == job.project,
+                    Job.change_number == job.change_number,
+                    Job.review_policy_version == job.review_policy_version,
+                    Job.patchset_number < job.patchset_number,
+                    Job.state == JobState.DONE.value,
+                    ReviewResultRow.review_metadata["lineage_complete"]
+                    .as_boolean()
+                    .is_not(False),
+                )
+                .order_by(Job.patchset_number.desc(), Job.created_at.desc())
+                .limit(1)
+            )
+            previous: list[Finding] = []
+            if baseline_job is not None:
+                rows = await session.scalars(
+                    select(ReviewFinding)
+                    .where(ReviewFinding.job_id == baseline_job.id)
+                    .order_by(ReviewFinding.ordinal.asc())
+                )
+                previous = [_finding_from_row(row) for row in rows]
+
+            previous_ids = {
+                finding.semantic_id for finding in previous if finding.semantic_id is not None
+            }
+            historical_rows = (
+                await session.execute(
+                    select(ReviewFinding, Job.patchset_number)
+                    .join(Job, Job.id == ReviewFinding.job_id)
+                    .where(
+                        Job.project == job.project,
+                        Job.change_number == job.change_number,
+                        Job.review_policy_version == job.review_policy_version,
+                        Job.patchset_number < job.patchset_number,
+                        Job.state == JobState.DONE.value,
+                    )
+                    .order_by(Job.patchset_number.desc(), ReviewFinding.ordinal.asc())
+                    .limit(200)
+                )
+            ).all()
+            historical: list[Finding] = []
+            historical_ids: set[str] = set()
+            for finding_row, _patchset_number in historical_rows:
+                semantic_id = finding_row.semantic_id
+                if semantic_id in previous_ids or semantic_id in historical_ids:
+                    continue
+                historical_ids.add(semantic_id)
+                historical.append(_finding_from_row(finding_row))
+                if len(historical) >= 20:
+                    break
+
+            seen = await session.scalars(
+                select(ReviewFinding.semantic_id)
+                .join(Job, Job.id == ReviewFinding.job_id)
+                .where(
+                    Job.project == job.project,
+                    Job.change_number == job.change_number,
+                    Job.review_policy_version == job.review_policy_version,
+                    Job.patchset_number < job.patchset_number,
+                    Job.state == JobState.DONE.value,
+                )
+                .distinct()
+            )
+            return FindingHistory(
+                baseline_patchset=baseline_job.patchset_number if baseline_job else None,
+                previous_findings=tuple(previous),
+                seen_semantic_ids=frozenset(seen),
+                historical_findings=tuple(historical),
             )
 
     async def begin_publication(
@@ -586,6 +897,68 @@ class JobStore:
             if result.rowcount != 1:
                 raise KeyError(publication_id)
 
+    async def complete_publication_and_mark_done(
+        self,
+        publication_id: int,
+        *,
+        job_id: uuid.UUID,
+        worker_id: str,
+        gerrit_response: dict[str, Any] | None = None,
+    ) -> JobRecord:
+        """Atomically record Gerrit's side effect and the job's published terminal state.
+
+        A newer Patch Set may arrive after Gerrit accepted the ReviewInput but before this local
+        transaction. In that case the job can carry a supersession marker (or even have briefly been
+        marked SUPERSEDED by older code); the externally observed publication still wins and must be
+        recorded as DONE so future Patch Sets use it as their published baseline.
+        """
+        async with self._sessions.begin() as session:
+            identity = await session.execute(
+                select(Job.project, Job.change_number).where(Job.id == job_id)
+            )
+            row = identity.one_or_none()
+            if row is None:
+                raise KeyError(job_id)
+            await session.execute(_change_lock_select(row.project, row.change_number))
+            job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+            publication = await session.scalar(
+                select(Publication).where(Publication.id == publication_id).with_for_update()
+            )
+            if publication is None:
+                raise KeyError(publication_id)
+            if publication.job_id != job_id:
+                raise RuntimeError("publication belongs to a different review job")
+            if job is None:
+                raise KeyError(job_id)
+
+            state = JobState(job.state)
+            if state == JobState.DONE and publication.status == PublicationStatus.POSTED.value:
+                return _record(job)
+            if state not in {JobState.PUBLISHING, JobState.SUPERSEDED}:
+                raise RuntimeError(
+                    f"cannot finalize Gerrit publication for job {job_id} from {state.value}"
+                )
+            if state == JobState.PUBLISHING and job.lease_owner not in {None, worker_id}:
+                raise RuntimeError(
+                    f"job {job_id} publish lease is owned by {job.lease_owner}, not {worker_id}"
+                )
+
+            publication.status = PublicationStatus.POSTED.value
+            publication.gerrit_response = gerrit_response
+            publication.posted_at = func.now()
+            publication.last_error = None
+            publication.updated_at = func.now()
+
+            job.state = JobState.DONE.value
+            job.retry_state = None
+            job.last_error_class = None
+            job.last_error = None
+            job.lease_owner = None
+            job.lease_expires_at = None
+            job.updated_at = func.now()
+            await session.flush()
+            return _record(job)
+
     async def mark_publication_ambiguous(self, publication_id: int, *, error: str) -> None:
         async with self._sessions.begin() as session:
             result = await session.execute(
@@ -635,6 +1008,26 @@ class JobStore:
             )
             return newer is None
 
+    async def pending_depth(self) -> int:
+        """Count queued/retry-wait/reclaimable jobs for the operational queue gauge."""
+        now = datetime.now(UTC)
+        terminal = [state.value for state in TERMINAL_JOB_STATES]
+        async with self._sessions() as session:
+            count = await session.scalar(
+                select(func.count())
+                .select_from(Job)
+                .where(
+                    Job.state.not_in(terminal),
+                    or_(
+                        Job.state == JobState.RETRY_WAIT.value,
+                        Job.lease_owner.is_(None),
+                        Job.lease_expires_at.is_(None),
+                        Job.lease_expires_at <= now,
+                    ),
+                )
+            )
+            return int(count or 0)
+
 
 def _record(job: Job) -> JobRecord:
     return JobRecord(
@@ -650,7 +1043,39 @@ def _record(job: Job) -> JobRecord:
         next_attempt_at=job.next_attempt_at,
         lease_owner=job.lease_owner,
         lease_expires_at=job.lease_expires_at,
+        superseded_by_job_id=job.superseded_by_job_id,
         event_payload=job.event_payload,
+        retry_epoch_start_attempt=job.retry_epoch_start_attempt,
+    )
+
+
+def _finding_from_row(finding: ReviewFinding) -> Finding:
+    return Finding(
+        severity=Severity(finding.severity),
+        category=finding.category,
+        title=finding.title,
+        message=finding.message,
+        impact=finding.impact,
+        evidence=finding.evidence,
+        remediation=finding.remediation,
+        location=FindingLocation(
+            path=finding.path,
+            side=DiffSide(finding.side),
+            start_line=finding.start_line,
+            start_character=finding.start_character,
+            end_line=finding.end_line,
+            end_character=finding.end_character,
+        ),
+        confidence=finding.confidence,
+        fingerprint=finding.fingerprint,
+        semantic_id=finding.semantic_id,
+        lineage=FindingLineage(finding.lineage_state),
+    )
+
+
+def _needs_publish_recovery(job: Job) -> bool:
+    return job.state == JobState.PUBLISHING.value or (
+        job.state == JobState.RETRY_WAIT.value and job.retry_state == JobState.PUBLISHING.value
     )
 
 

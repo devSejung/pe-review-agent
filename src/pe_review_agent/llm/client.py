@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 import httpx
 
 from pe_review_agent.config import LlmSettings
-from pe_review_agent.retry import PermanentError, TransientError
+from pe_review_agent.observability.metrics import METRICS
+from pe_review_agent.retry import ContextLengthError, PermanentError, TransientError
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +51,9 @@ class LlmClient:
             headers=headers,
             timeout=timeout,
             transport=transport,
+            verify=str(settings.ca_bundle_path) if settings.ca_bundle_path else True,
         )
+        self._semaphore = asyncio.Semaphore(settings.concurrency)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -70,17 +75,21 @@ class LlmClient:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        try:
-            response = await self._client.post("chat/completions", json=payload)
-        except (
-            httpx.ConnectError,
-            httpx.ReadTimeout,
-            httpx.ConnectTimeout,
-            httpx.RemoteProtocolError,
-        ) as exc:
-            raise TransientError(f"LLM transport failure: {type(exc).__name__}: {exc}") from exc
-        except httpx.HTTPError as exc:
-            raise TransientError(f"LLM HTTP transport failure: {exc}") from exc
+        async with self._semaphore:
+            started = perf_counter()
+            try:
+                response = await self._client.post("chat/completions", json=payload)
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.ConnectTimeout,
+                httpx.RemoteProtocolError,
+            ) as exc:
+                raise TransientError(f"LLM transport failure: {type(exc).__name__}: {exc}") from exc
+            except httpx.HTTPError as exc:
+                raise TransientError(f"LLM HTTP transport failure: {exc}") from exc
+            finally:
+                METRICS.llm_latency_seconds.observe(perf_counter() - started)
 
         if response.status_code >= 400:
             self._raise_for_status(response)
@@ -129,6 +138,8 @@ class LlmClient:
         detail = response.text[:2000]
         retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
         message = f"LLM HTTP {status}: {detail}"
+        if status in (400, 413, 422) and _looks_like_context_length_error(detail):
+            raise ContextLengthError(message)
         if status == 429 or 500 <= status <= 599:
             raise TransientError(message, retry_after_seconds=retry_after)
         if status in (408, 409, 425):
@@ -166,3 +177,19 @@ def _int_or_none(value: Any) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _looks_like_context_length_error(detail: str) -> bool:
+    normalized = detail.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "context length",
+            "context_length",
+            "maximum context",
+            "max_model_len",
+            "too many tokens",
+            "prompt is too long",
+            "maximum sequence length",
+        )
+    )

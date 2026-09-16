@@ -23,7 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from pe_review_agent.domain import AttemptStage, JobState, Severity
+from pe_review_agent.domain import AttemptStage, DiffSide, FindingLineage, JobState, Severity
 
 
 def _values(enum_type: type[StrEnum]) -> str:
@@ -65,6 +65,10 @@ class Job(Base):
         ),
         CheckConstraint(f"state IN ({_values(JobState)})", name="ck_review_jobs_state"),
         CheckConstraint(
+            "retry_epoch_start_attempt >= 0 AND retry_epoch_start_attempt <= attempt_count",
+            name="ck_review_jobs_retry_epoch",
+        ),
+        CheckConstraint(
             f"retry_state IS NULL OR retry_state IN ({_RETRY_TARGET_VALUES})",
             name="ck_review_jobs_retry_state",
         ),
@@ -88,6 +92,7 @@ class Job(Base):
     retry_state: Mapped[str | None] = mapped_column(String(32))
     event_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retry_epoch_start_attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -174,9 +179,15 @@ class ReviewFinding(Base):
         UniqueConstraint("job_id", "ordinal", name="uq_review_findings_ordinal"),
         CheckConstraint(f"severity IN ({_values(Severity)})", name="ck_review_findings_severity"),
         CheckConstraint(
+            f"lineage_state IN ({_values(FindingLineage)})",
+            name="ck_review_findings_lineage_state",
+        ),
+        CheckConstraint(f"side IN ({_values(DiffSide)})", name="ck_review_findings_side"),
+        CheckConstraint(
             "confidence >= 0.0 AND confidence <= 1.0",
             name="ck_review_findings_confidence",
         ),
+        Index("ix_review_findings_semantic_id", "semantic_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -185,6 +196,10 @@ class ReviewFinding(Base):
     )
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    semantic_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    lineage_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=FindingLineage.NEW.value
+    )
     severity: Mapped[str] = mapped_column(String(8), nullable=False)
     category: Mapped[str] = mapped_column(String(128), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
@@ -193,6 +208,7 @@ class ReviewFinding(Base):
     evidence: Mapped[str] = mapped_column(Text, nullable=False)
     remediation: Mapped[str | None] = mapped_column(Text)
     path: Mapped[str] = mapped_column(Text, nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False, default=DiffSide.REVISION.value)
     start_line: Mapped[int] = mapped_column(Integer, nullable=False)
     start_character: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     end_line: Mapped[int | None] = mapped_column(Integer)
@@ -233,3 +249,14 @@ class Publication(Base):
     )
 
     job: Mapped[Job] = relationship(back_populates="publications")
+
+
+class ServiceState(Base):
+    __tablename__ = "review_service_state"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    timestamp_value: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    json_value: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )

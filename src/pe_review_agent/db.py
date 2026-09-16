@@ -15,7 +15,7 @@ from pe_review_agent.config import DatabaseSettings
 
 def create_engine(settings: DatabaseSettings) -> AsyncEngine:
     return create_async_engine(
-        settings.dsn,
+        settings.connection_url(),
         pool_pre_ping=True,
         pool_size=settings.pool_size,
         max_overflow=settings.max_overflow,

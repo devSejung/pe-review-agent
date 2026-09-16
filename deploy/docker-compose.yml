@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+    image: pe-review-postgres:16.15
     restart: unless-stopped
     environment:
       POSTGRES_DB: pe_review
@@ -20,13 +20,16 @@ services:
     restart: "no"
     environment: &review-env
       PE_REVIEW_CONFIG: /etc/pe-review-agent/config.yaml
-      PE_REVIEW__DATABASE__DSN: postgresql+asyncpg://pe_review:${POSTGRES_PASSWORD}@postgres:5432/pe_review
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       PE_REVIEW_LLM_API_KEY: ${PE_REVIEW_LLM_API_KEY:-}
       PE_REVIEW_GERRIT_HTTP_PASSWORD: ${PE_REVIEW_GERRIT_HTTP_PASSWORD:-}
     volumes: &review-volumes
       - ./config.yaml:/etc/pe-review-agent/config.yaml:ro
       - ./secrets/gerrit_ssh_key:/run/secrets/gerrit_ssh_key:ro
       - ./secrets/gerrit_known_hosts:/run/secrets/gerrit_known_hosts:ro
+      # If the corporate HTTPS endpoints use a private CA, also mount it and set
+      # gerrit.ca_bundle_path / llm.ca_bundle_path in config.yaml.
+      # - ./secrets/corporate_ca.pem:/run/secrets/corporate_ca.pem:ro
       - repo-data:/var/lib/pe-review-agent
     depends_on:
       postgres:

@@ -8,9 +8,13 @@ fi
 
 user="pe-review-agent"
 home="/home/${user}"
+uid="10001"
 
 if ! id "$user" >/dev/null 2>&1; then
-  useradd --create-home --home-dir "$home" --shell /usr/sbin/nologin "$user"
+  useradd --uid "$uid" --create-home --home-dir "$home" --shell /usr/sbin/nologin "$user"
+elif [[ "$(id -u "$user")" != "$uid" ]]; then
+  echo "$user exists with UID $(id -u "$user"), but containers require UID $uid" >&2
+  exit 2
 fi
 
 install -d -m 0750 -o "$user" -g "$user" \

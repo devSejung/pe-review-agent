@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -5,7 +6,7 @@ import pytest
 
 from pe_review_agent.config import LlmSettings
 from pe_review_agent.llm.client import LlmClient
-from pe_review_agent.retry import TransientError
+from pe_review_agent.retry import ContextLengthError, TransientError
 
 
 @pytest.mark.asyncio
@@ -68,3 +69,55 @@ async def test_llm_client_classifies_429_as_transient() -> None:
         await client.aclose()
 
     assert error.value.retry_after_seconds == 7
+
+
+@pytest.mark.asyncio
+async def test_llm_client_classifies_context_overflow_for_adaptive_chunking() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"message": "prompt exceeds maximum context length"}},
+        )
+
+    client = LlmClient(
+        LlmSettings(base_url="https://llm.example/v1"), transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ContextLengthError):
+            await client.complete(messages=[{"role": "user", "content": "review"}])
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_enforces_configured_concurrency() -> None:
+    active = 0
+    peak = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"finish_reason": "stop", "message": {"role": "assistant", "content": "{}"}}
+                ]
+            },
+        )
+
+    client = LlmClient(
+        LlmSettings(base_url="https://llm.example/v1", concurrency=1),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await asyncio.gather(
+            *(client.complete(messages=[{"role": "user", "content": "review"}]) for _ in range(3))
+        )
+    finally:
+        await client.aclose()
+
+    assert peak == 1

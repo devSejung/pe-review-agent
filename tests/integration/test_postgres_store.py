@@ -10,14 +10,18 @@ from sqlalchemy import text
 from pe_review_agent.config import DatabaseSettings
 from pe_review_agent.db import Database
 from pe_review_agent.domain import (
+    AttemptStage,
+    DiffSide,
     Finding,
+    FindingLineage,
     FindingLocation,
     GerritPatchsetEvent,
     JobState,
     ReviewResult,
     Severity,
 )
-from pe_review_agent.jobs import JobStore
+from pe_review_agent.jobs import JobStore, PublicationStatus, PublishGuardStatus
+from pe_review_agent.retry import TransientError
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="PE_REVIEW_TEST_POSTGRES_DSN is not configured")
@@ -63,7 +67,8 @@ async def store():
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE review_publications, review_findings, review_results, "
+                "TRUNCATE review_service_state, review_publications, review_findings, "
+                "review_results, "
                 "review_attempts, review_jobs RESTART IDENTITY CASCADE"
             )
         )
@@ -99,6 +104,7 @@ async def test_durable_review_and_publication_resume_after_crash(store) -> None:
     assert recovered_review.summary == _review().summary
     assert len(recovered_review.findings) == 1
     assert recovered_review.findings[0].fingerprint
+    assert recovered_review.findings[0].location.side == DiffSide.REVISION
 
     publish_claim = await jobs.claim_next(worker_id="worker-b", lease_seconds=120)
     assert publish_claim is not None and publish_claim.state == JobState.READY_TO_PUBLISH
@@ -180,3 +186,329 @@ async def test_concurrent_claims_do_not_take_same_job(store) -> None:
     )
     assert first_claim is not None and second_claim is not None
     assert {first_claim.id, second_claim.id} == {one.id, two.id}
+
+
+@pytest.mark.asyncio
+async def test_service_watermark_is_durable_and_monotonic(store) -> None:
+    jobs, _database = store
+    key = "test-reconciliation-watermark"
+    first = datetime(2026, 9, 16, 1, 0, tzinfo=UTC)
+    older = first - timedelta(hours=1)
+    newer = first + timedelta(hours=1)
+
+    assert await jobs.get_service_watermark(key) is None
+    await jobs.advance_service_watermark(key, first)
+    await jobs.advance_service_watermark(key, older)
+    assert await jobs.get_service_watermark(key) == first
+    await jobs.advance_service_watermark(key, newer)
+    assert await jobs.get_service_watermark(key) == newer
+
+
+@pytest.mark.asyncio
+async def test_publish_guard_rejects_stale_worker_and_extends_current_lease(store) -> None:
+    jobs, database = store
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40), review_policy_version="firmware-v1"
+    )
+    reviewer = await jobs.claim_next(worker_id="reviewer", lease_seconds=120)
+    assert reviewer is not None
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.VALIDATING, worker_id="reviewer")
+    await jobs.save_review_result_and_mark_ready(job.id, _review(), worker_id="reviewer")
+
+    publisher = await jobs.claim_next(worker_id="publisher-a", lease_seconds=120)
+    assert publisher is not None
+    await jobs.transition(job.id, JobState.PUBLISHING, worker_id="publisher-a")
+    assert (
+        await jobs.refresh_publish_guard(job.id, worker_id="publisher-a", lease_seconds=120)
+        == PublishGuardStatus.OK
+    )
+
+    await _expire_job_lease(database, job.id)
+    replacement = await jobs.claim_next(worker_id="publisher-b", lease_seconds=120)
+    assert replacement is not None and replacement.id == job.id
+    assert (
+        await jobs.refresh_publish_guard(job.id, worker_id="publisher-a", lease_seconds=120)
+        == PublishGuardStatus.LEASE_LOST
+    )
+    with pytest.raises(RuntimeError, match="not leased"):
+        await jobs.mark_superseded(job.id, worker_id="publisher-a")
+    current = await jobs.get(job.id)
+    assert current is not None and current.lease_owner == "publisher-b"
+    assert (
+        await jobs.refresh_publish_guard(job.id, worker_id="publisher-b", lease_seconds=120)
+        == PublishGuardStatus.OK
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_patchset_preserves_inflight_publish_for_side_effect_recovery(store) -> None:
+    jobs, _database = store
+    old, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40), review_policy_version="firmware-v1"
+    )
+    reviewer = await jobs.claim_next(worker_id="reviewer", lease_seconds=120)
+    assert reviewer is not None
+    await jobs.transition(old.id, JobState.FETCHING, worker_id="reviewer")
+    await jobs.transition(old.id, JobState.REVIEWING, worker_id="reviewer")
+    await jobs.transition(old.id, JobState.VALIDATING, worker_id="reviewer")
+    await jobs.save_review_result_and_mark_ready(old.id, _review(), worker_id="reviewer")
+    publisher = await jobs.claim_next(worker_id="publisher", lease_seconds=120)
+    assert publisher is not None
+    await jobs.transition(old.id, JobState.PUBLISHING, worker_id="publisher")
+
+    new, _ = await jobs.enqueue(
+        _event(patchset=2, revision="b" * 40), review_policy_version="firmware-v1"
+    )
+
+    old_after = await jobs.get(old.id)
+    assert old_after is not None and old_after.state == JobState.PUBLISHING
+    assert old_after.superseded_by_job_id == new.id
+    assert old_after.lease_owner == "publisher"
+
+
+@pytest.mark.asyncio
+async def test_newer_patchset_waits_for_unresolved_older_publication_recovery(store) -> None:
+    jobs, _database = store
+    old, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40), review_policy_version="firmware-v1"
+    )
+    reviewer = await jobs.claim_next(worker_id="reviewer", lease_seconds=120)
+    assert reviewer is not None and reviewer.id == old.id
+    await jobs.transition(old.id, JobState.FETCHING, worker_id="reviewer")
+    await jobs.transition(old.id, JobState.REVIEWING, worker_id="reviewer")
+    await jobs.transition(old.id, JobState.VALIDATING, worker_id="reviewer")
+    await jobs.save_review_result_and_mark_ready(old.id, _review(), worker_id="reviewer")
+    publisher = await jobs.claim_next(worker_id="publisher", lease_seconds=120)
+    assert publisher is not None and publisher.id == old.id
+    await jobs.transition(old.id, JobState.PUBLISHING, worker_id="publisher")
+    await jobs.schedule_retry(
+        old.id,
+        resume_state=JobState.PUBLISHING,
+        retry_at=datetime.now(UTC) + timedelta(hours=1),
+        error=TransientError("ambiguous Gerrit POST"),
+        worker_id="publisher",
+    )
+
+    newer, _ = await jobs.enqueue(
+        _event(patchset=2, revision="b" * 40), review_policy_version="firmware-v1"
+    )
+    blocked = await jobs.claim_next(worker_id="new-reviewer", lease_seconds=120)
+
+    assert blocked is None
+    newer_record = await jobs.get(newer.id)
+    assert newer_record is not None and newer_record.state == JobState.RECEIVED
+
+
+@pytest.mark.asyncio
+async def test_finding_history_uses_latest_done_patchset_and_keeps_older_seen_ids(store) -> None:
+    jobs, _database = store
+    first_review = _review()
+    first_review.findings[0].semantic_id = "1" * 32
+    first_review.findings[0].lineage = FindingLineage.NEW
+    first = await _save_done_review(
+        jobs,
+        _event(patchset=1, revision="a" * 40),
+        first_review,
+        worker_prefix="ps1",
+    )
+    assert (await jobs.get(first.id)).state == JobState.DONE  # type: ignore[union-attr]
+
+    # PS2 was published with no findings, meaning the PS1 finding was resolved at that point.
+    second = await _save_done_review(
+        jobs,
+        _event(patchset=2, revision="b" * 40),
+        ReviewResult(summary="No findings", findings=[]),
+        worker_prefix="ps2",
+    )
+    assert (await jobs.get(second.id)).state == JobState.DONE  # type: ignore[union-attr]
+
+    third, _ = await jobs.enqueue(
+        _event(patchset=3, revision="c" * 40),
+        review_policy_version="firmware-v1",
+    )
+    history = await jobs.load_finding_history(third.id)
+
+    assert history.baseline_patchset == 2
+    assert history.previous_findings == ()
+    assert "1" * 32 in history.seen_semantic_ids
+    assert [finding.semantic_id for finding in history.historical_findings] == ["1" * 32]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_review_does_not_replace_last_complete_finding_baseline(store) -> None:
+    jobs, _database = store
+    first_review = _review()
+    first_review.findings[0].semantic_id = "2" * 32
+    first_review.findings[0].lineage = FindingLineage.NEW
+    first = await _save_done_review(
+        jobs,
+        _event(patchset=1, revision="a" * 40),
+        first_review,
+        worker_prefix="ps1",
+    )
+    assert (await jobs.get(first.id)).state == JobState.DONE  # type: ignore[union-attr]
+
+    skipped = ReviewResult(
+        summary="Automated review skipped for this merge commit.",
+        findings=[],
+        review_metadata={"lineage_complete": False, "skipped_reason": "merge"},
+    )
+    second = await _save_done_review(
+        jobs,
+        _event(patchset=2, revision="b" * 40),
+        skipped,
+        worker_prefix="ps2",
+    )
+    assert (await jobs.get(second.id)).state == JobState.DONE  # type: ignore[union-attr]
+
+    third, _ = await jobs.enqueue(
+        _event(patchset=3, revision="c" * 40),
+        review_policy_version="firmware-v1",
+    )
+    history = await jobs.load_finding_history(third.id)
+
+    assert history.baseline_patchset == 1
+    assert [finding.semantic_id for finding in history.previous_findings] == ["2" * 32]
+
+
+@pytest.mark.asyncio
+async def test_manual_requeue_starts_new_retry_epoch_without_erasing_attempt_history(store) -> None:
+    jobs, _database = store
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40), review_policy_version="firmware-v1"
+    )
+    claim = await jobs.claim_next(worker_id="worker", lease_seconds=120)
+    assert claim is not None and claim.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="worker")
+    attempt_id = await jobs.start_attempt(job.id, stage=AttemptStage.FETCH, worker_id="worker")
+    await jobs.finish_attempt(
+        attempt_id,
+        success=False,
+        retryable=False,
+        error="repository access denied",
+    )
+    await jobs.mark_failed_permanent(
+        job.id,
+        error="repository access denied",
+        worker_id="worker",
+    )
+    assert await jobs.count_attempts(job.id, stage=AttemptStage.FETCH) == 1
+    assert await jobs.count_consumed_retry_attempts(job.id, stage=AttemptStage.FETCH) == 1
+
+    requeued = await jobs.requeue_failed(job.id)
+
+    assert requeued.state == JobState.RECEIVED
+    assert requeued.retry_epoch_start_attempt == 1
+    assert await jobs.count_attempts(job.id, stage=AttemptStage.FETCH) == 1
+    assert await jobs.count_consumed_retry_attempts(job.id, stage=AttemptStage.FETCH) == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_requeue_resumes_durable_review_without_model_phase(store) -> None:
+    jobs, _database = store
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="b" * 40), review_policy_version="firmware-v1"
+    )
+    reviewer = await jobs.claim_next(worker_id="reviewer", lease_seconds=120)
+    assert reviewer is not None and reviewer.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.VALIDATING, worker_id="reviewer")
+    await jobs.save_review_result_and_mark_ready(job.id, _review(), worker_id="reviewer")
+    publisher = await jobs.claim_next(worker_id="publisher", lease_seconds=120)
+    assert publisher is not None and publisher.id == job.id
+    await jobs.mark_failed_permanent(job.id, error="Gerrit 403", worker_id="publisher")
+
+    requeued = await jobs.requeue_failed(job.id)
+
+    assert requeued.state == JobState.READY_TO_PUBLISH
+    persisted = await jobs.load_review_result(job.id)
+    assert persisted is not None and persisted.summary == _review().summary
+
+
+@pytest.mark.asyncio
+async def test_manual_requeue_resets_failed_publication_for_reconciliation(store) -> None:
+    jobs, _database = store
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="c" * 40), review_policy_version="firmware-v1"
+    )
+    reviewer = await jobs.claim_next(worker_id="reviewer", lease_seconds=120)
+    assert reviewer is not None and reviewer.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.VALIDATING, worker_id="reviewer")
+    await jobs.save_review_result_and_mark_ready(job.id, _review(), worker_id="reviewer")
+    publisher = await jobs.claim_next(worker_id="publisher", lease_seconds=120)
+    assert publisher is not None and publisher.id == job.id
+    await jobs.transition(job.id, JobState.PUBLISHING, worker_id="publisher")
+    publication = await jobs.begin_publication(
+        job.id,
+        worker_id="publisher",
+        request_payload={"message": "durable summary", "tag": "autogenerated:pe-ai-review"},
+        finding_fingerprints=[],
+    )
+    await jobs.mark_publication_failed(publication.id, error="Gerrit 403")
+    await jobs.mark_failed_permanent(job.id, error="Gerrit 403", worker_id="publisher")
+
+    requeued = await jobs.requeue_failed(job.id)
+    reset_publication = await jobs.publication_for_job(job.id)
+
+    assert requeued.state == JobState.PUBLISHING
+    assert reset_publication is not None
+    assert reset_publication.status == PublicationStatus.PENDING.value
+    assert reset_publication.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_manual_requeue_refuses_stale_failed_patchset(store) -> None:
+    jobs, _database = store
+    old, _ = await jobs.enqueue(
+        _event(patchset=1, revision="d" * 40), review_policy_version="firmware-v1"
+    )
+    claim = await jobs.claim_next(worker_id="worker", lease_seconds=120)
+    assert claim is not None and claim.id == old.id
+    await jobs.mark_failed_permanent(old.id, error="bad config", worker_id="worker")
+    await jobs.enqueue(
+        _event(patchset=2, revision="e" * 40), review_policy_version="firmware-v1"
+    )
+
+    with pytest.raises(RuntimeError, match="older Patch Set"):
+        await jobs.requeue_failed(old.id)
+
+
+async def _save_done_review(
+    jobs: JobStore,
+    event: GerritPatchsetEvent,
+    review: ReviewResult,
+    *,
+    worker_prefix: str,
+):
+    job, _ = await jobs.enqueue(event, review_policy_version="firmware-v1")
+    review_worker = f"{worker_prefix}-review"
+    claim = await jobs.claim_next(worker_id=review_worker, lease_seconds=120)
+    assert claim is not None and claim.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id=review_worker)
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id=review_worker)
+    await jobs.transition(job.id, JobState.VALIDATING, worker_id=review_worker)
+    await jobs.save_review_result_and_mark_ready(job.id, review, worker_id=review_worker)
+
+    publish_worker = f"{worker_prefix}-publish"
+    publish_claim = await jobs.claim_next(worker_id=publish_worker, lease_seconds=120)
+    assert publish_claim is not None and publish_claim.id == job.id
+    await jobs.transition(job.id, JobState.PUBLISHING, worker_id=publish_worker)
+    await jobs.mark_done(job.id, worker_id=publish_worker)
+    return job
+
+
+async def _expire_job_lease(database: Database, job_id) -> None:
+    async with database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE review_jobs SET lease_expires_at = now() - interval '1 second' "
+                "WHERE id = CAST(:job_id AS uuid)"
+            ),
+            {"job_id": str(job_id)},
+        )
+        await session.commit()

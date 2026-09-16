@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
@@ -20,6 +20,10 @@ from .allowlist import ProjectAllowlist
 
 _XSSI_PREFIX = ")]}'"
 _PATCH_SET_PREFIX = re.compile(r"^\s*Patch\s+Set\s+\d+\s*:\s*", re.IGNORECASE)
+_REVIEW_DECORATION_PREFIX = re.compile(
+    r"^(?:\([^\n]*\bcomments?\)|(?:[A-Za-z][^:\n]*:\s*[+-]?\d+(?:,\s*)?)+)\s*",
+    re.IGNORECASE,
+)
 
 
 class SupersededRevisionError(PermanentError):
@@ -74,7 +78,10 @@ class GerritRestClient:
                 raise PermanentError("Gerrit bearer REST auth requires configured token secret")
             self._headers["Authorization"] = f"Bearer {secret}"
 
-        self._client = client or httpx.AsyncClient(follow_redirects=True)
+        self._client = client or httpx.AsyncClient(
+            follow_redirects=True,
+            verify=str(settings.ca_bundle_path) if settings.ca_bundle_path else True,
+        )
         self._owns_client = client is None
 
         root = settings.rest_url.rstrip("/")
@@ -160,6 +167,7 @@ class GerritRestClient:
             review,
             tag=self._settings.review_tag,
             notify=self._settings.notify,
+            max_comment_bytes=self._settings.max_comment_bytes,
         )
         return await self.publish_review_input(
             project=project,
@@ -175,12 +183,20 @@ class GerritRestClient:
         change_number: int,
         revision_sha: str,
         payload: Mapping[str, Any],
+        pre_post_guard: Callable[[], Awaitable[bool]] | None = None,
     ) -> dict[str, Any]:
         """Publish a persisted ReviewInput without rebuilding or mutating its payload."""
 
         # Keep this check next to the POST even when the payload was durably built much earlier.
         # A newer patch set must supersede the job before any comments leave this process.
         await self.ensure_current_revision(project, change_number, revision_sha)
+        if pre_post_guard is not None and not await pre_post_guard():
+            raise SupersededRevisionError(
+                project=project,
+                change_number=change_number,
+                expected=revision_sha,
+                actual="newer-patchset-known-by-worker",
+            )
         response = await self._request_json(
             "POST",
             f"changes/{_change_identifier(project, change_number)}/revisions/"
@@ -200,6 +216,7 @@ class GerritRestClient:
         change_number: int,
         patchset_number: int,
         summary: str,
+        tag: str | None = None,
     ) -> bool:
         """Resolve an ambiguous POST by matching this bot's patch-set change message."""
 
@@ -207,6 +224,7 @@ class GerritRestClient:
         if patchset_number < 1:
             raise ValueError("patchset_number must be positive")
         expected_message = _normalize_review_message(summary)
+        expected_tag = tag or self._settings.review_tag
         if not expected_message:
             return False
 
@@ -220,7 +238,7 @@ class GerritRestClient:
         for item in payload:
             if not isinstance(item, Mapping):
                 raise TransientError("Gerrit List Change Messages returned a malformed message")
-            if item.get("tag") != self._settings.review_tag:
+            if item.get("tag") != expected_tag:
                 continue
             if _message_revision_number(item) != patchset_number:
                 continue
@@ -232,27 +250,40 @@ class GerritRestClient:
     async def query_recent_open_changes(
         self,
         *,
-        since: datetime,
+        since: datetime | None,
         page_size: int = 100,
     ) -> list[GerritChange]:
-        if since.tzinfo is None:
+        if since is not None and since.tzinfo is None:
             raise ValueError("since must be timezone-aware")
         if page_size < 1:
             raise ValueError("page_size must be positive")
 
-        since_utc = since.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S %z")
+        since_utc = since.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S %z") if since else None
         changes: list[GerritChange] = []
         for project in self._allowlist.projects:
-            start = 0
-            query = f'status:open project:{_query_value(project)} after:"{since_utc}"'
+            base_query = f"status:open project:{_query_value(project)}"
+            if since_utc:
+                base_query += f' after:"{since_utc}"'
+            before_boundary: str | None = None
+            excluded_at_boundary: set[int] = set()
+            seen_change_numbers: set[int] = set()
             while True:
+                query = base_query
+                if before_boundary is not None:
+                    query += f' before:"{before_boundary}"'
+                    for change_number in sorted(excluded_at_boundary):
+                        query += f" -change:{change_number}"
+                if len(query.encode("utf-8")) > 64_000:
+                    raise TransientError(
+                        "Gerrit reconciliation has too many changes sharing one update-second "
+                        "boundary to continue safely without offset pagination"
+                    )
                 payload = await self._request_json(
                     "GET",
                     "changes/",
                     params=[
                         ("q", query),
                         ("n", str(page_size)),
-                        ("S", str(start)),
                         ("o", "CURRENT_REVISION"),
                     ],
                 )
@@ -270,17 +301,37 @@ class GerritRestClient:
                         expected_project=project,
                         expected_number=number,
                     )
-                    changes.append(parsed)
+                    if number not in seen_change_numbers:
+                        changes.append(parsed)
+                        seen_change_numbers.add(number)
 
                 if not bool(payload[-1].get("_more_changes")):
                     break
-                start += len(payload)
+
+                oldest_updated = payload[-1].get("updated")
+                if not isinstance(oldest_updated, str):
+                    raise TransientError(
+                        "Gerrit Query Changes pagination requires an updated timestamp"
+                    )
+                next_boundary = _gerrit_search_boundary(oldest_updated)
+                if before_boundary != next_boundary:
+                    before_boundary = next_boundary
+                    excluded_at_boundary.clear()
+                for item in payload:
+                    updated = item.get("updated") if isinstance(item, Mapping) else None
+                    number = item.get("_number") if isinstance(item, Mapping) else None
+                    if (
+                        isinstance(updated, str)
+                        and isinstance(number, int)
+                        and _gerrit_search_boundary(updated) == before_boundary
+                    ):
+                        excluded_at_boundary.add(number)
         return changes
 
     async def reconciliation_events(
         self,
         *,
-        since: datetime,
+        since: datetime | None,
         page_size: int = 100,
     ) -> list[GerritPatchsetEvent]:
         changes = await self.query_recent_open_changes(since=since, page_size=page_size)
@@ -356,11 +407,17 @@ def build_review_input(
     *,
     tag: str = "autogenerated:pe-ai-review",
     notify: str = "OWNER",
+    max_comment_bytes: int = 16 * 1024,
 ) -> dict[str, Any]:
+    if max_comment_bytes < 1024:
+        raise ValueError("max_comment_bytes must be at least 1024")
     comments: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for finding in review.findings:
         location = finding.location
-        comment: dict[str, Any] = {"message": _finding_message(finding)}
+        comment: dict[str, Any] = {
+            "message": _truncate_utf8_comment(_finding_message(finding), max_comment_bytes),
+            "side": location.side.value,
+        }
         if location.end_line is None:
             comment["line"] = location.start_line
         else:
@@ -373,7 +430,7 @@ def build_review_input(
         comments[location.path].append(comment)
 
     payload: dict[str, Any] = {
-        "message": review.summary,
+        "message": _truncate_utf8_comment(review.summary, max_comment_bytes),
         "tag": tag,
         "notify": notify,
         "omit_duplicate_comments": True,
@@ -394,11 +451,30 @@ def _finding_message(finding: Finding) -> str:
     return "\n\n".join(sections)
 
 
+def _truncate_utf8_comment(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    marker = "\n\n[truncated by review bot to Gerrit comment size limit]"
+    marker_bytes = marker.encode("utf-8")
+    keep = max(0, max_bytes - len(marker_bytes))
+    prefix = encoded[:keep].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
 def _normalize_review_message(value: str) -> str:
     # Gerrit commonly prefixes review change messages with "Patch Set N:". The revision number
     # is matched separately, so strip only that presentation prefix and normalize whitespace.
-    without_patchset_prefix = _PATCH_SET_PREFIX.sub("", value, count=1)
-    return " ".join(without_patchset_prefix.split())
+    normalized = _PATCH_SET_PREFIX.sub("", value, count=1).lstrip()
+    # Set Review change messages may prepend generated metadata such as "(1 comment)" or label
+    # votes before ReviewInput.message. Recovery keys on the exact bot tag + patch set, then strips
+    # only these Gerrit-generated decorations before comparing the durable summary.
+    while True:
+        stripped = _REVIEW_DECORATION_PREFIX.sub("", normalized, count=1).lstrip()
+        if stripped == normalized:
+            break
+        normalized = stripped
+    return " ".join(normalized.split())
 
 
 def _message_revision_number(message: Mapping[str, Any]) -> int | None:
@@ -473,6 +549,40 @@ def _change_identifier(project: str, change_number: int) -> str:
 def _query_value(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _gerrit_search_boundary(value: str) -> str:
+    """Ceil Gerrit's nanosecond UTC timestamp to a search-safe millisecond boundary."""
+
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?", value
+    )
+    if match is None:
+        raise TransientError(f"Gerrit response has invalid updated timestamp {value!r}")
+    try:
+        base = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise TransientError(f"Gerrit response has invalid updated timestamp {value!r}") from exc
+    fraction = (match.group(2) or "").ljust(9, "0")
+    nanoseconds = int(fraction or "0")
+    milliseconds, remainder = divmod(nanoseconds, 1_000_000)
+    if remainder:
+        milliseconds += 1
+    if milliseconds == 1000:
+        base += timedelta(seconds=1)
+        milliseconds = 0
+    return f"{base.strftime('%Y-%m-%d %H:%M:%S')}.{milliseconds:03d} +0000"
+
+
+def _gerrit_update_second(value: str) -> str:
+    """Normalize Gerrit's UTC Timestamp string to a search-safe whole-second boundary."""
+
+    candidate = value[:19]
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise TransientError(f"Gerrit response has invalid updated timestamp {value!r}") from exc
+    return candidate
 
 
 def _required_positive_int(parent: Mapping[str, Any], key: str) -> int:

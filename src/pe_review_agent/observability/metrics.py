@@ -40,7 +40,7 @@ METRICS = ReviewMetrics(
     queue_depth=Gauge("review_queue_depth", "Runnable/retry-wait review jobs"),
     review_latency_seconds=Histogram(
         "review_latency_seconds",
-        "End-to-end review job latency",
+        "Successful review execution latency through durable review result",
         buckets=(1, 5, 15, 30, 60, 120, 300, 600, 1800),
     ),
     llm_latency_seconds=Histogram(

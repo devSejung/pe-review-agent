@@ -21,6 +21,12 @@ class PermanentError(RuntimeError):
     pass
 
 
+class ContextLengthError(RuntimeError):
+    """The provider rejected the request because model context was too large."""
+
+    pass
+
+
 def exponential_backoff(
     attempt: int,
     *,

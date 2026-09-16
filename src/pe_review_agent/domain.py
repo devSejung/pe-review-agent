@@ -45,6 +45,17 @@ class Severity(StrEnum):
     P2 = "P2"
 
 
+class FindingLineage(StrEnum):
+    NEW = "NEW"
+    PERSISTING = "PERSISTING"
+    REOPENED = "REOPENED"
+
+
+class DiffSide(StrEnum):
+    REVISION = "REVISION"
+    PARENT = "PARENT"
+
+
 class GerritPatchsetEvent(BaseModel):
     project: str
     change_number: int
@@ -59,6 +70,7 @@ class GerritPatchsetEvent(BaseModel):
 
 class FindingLocation(BaseModel):
     path: str
+    side: DiffSide = DiffSide.REVISION
     start_line: int = Field(ge=1)
     start_character: int = Field(default=0, ge=0)
     end_line: int | None = Field(default=None, ge=1)
@@ -72,9 +84,13 @@ class FindingLocation(BaseModel):
             return self
         if self.end_line < self.start_line:
             raise ValueError("end_line cannot precede start_line")
-        if self.end_character is None:
-            self.end_character = self.start_character + 1 if self.end_line == self.start_line else 0
-        if self.end_line == self.start_line and self.end_character < self.start_character:
+        if self.end_line == self.start_line and self.end_character is None:
+            self.end_character = self.start_character + 1
+        if (
+            self.end_line == self.start_line
+            and self.end_character is not None
+            and self.end_character <= self.start_character
+        ):
             raise ValueError("end_character cannot precede start_character")
         return self
 
@@ -90,6 +106,8 @@ class Finding(BaseModel):
     location: FindingLocation
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     fingerprint: str | None = None
+    semantic_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    lineage: FindingLineage | None = None
 
     def ensure_fingerprint(self, *, project: str) -> Finding:
         if self.fingerprint:
@@ -97,6 +115,7 @@ class Finding(BaseModel):
         payload = {
             "project": project,
             "path": self.location.path,
+            "side": self.location.side.value,
             "line": self.location.start_line,
             "category": _normalize_text(self.category),
             "title": _normalize_text(self.title),
@@ -106,6 +125,22 @@ class Finding(BaseModel):
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         self.fingerprint = digest[:32]
+        return self
+
+    def ensure_semantic_id(self, *, project: str) -> Finding:
+        if self.semantic_id:
+            return self
+        payload = {
+            "project": project,
+            "path": self.location.path,
+            "category": _normalize_text(self.category),
+            "title": _normalize_text(self.title),
+            "message": _normalize_text(self.message),
+        }
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.semantic_id = digest[:32]
         return self
 
 
@@ -120,6 +155,7 @@ class ReviewResult(BaseModel):
 
 class ChangedLine(BaseModel):
     path: str
+    side: DiffSide = DiffSide.REVISION
     line: int = Field(ge=1)
     text: str
 
@@ -138,6 +174,9 @@ class ReviewContext(BaseModel):
     policy_text: str
     repository_root: str
     previous_findings: list[Finding] = Field(default_factory=list)
+    historical_findings: list[Finding] = Field(default_factory=list)
+    previous_patchset_number: int | None = Field(default=None, ge=1)
+    skip_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

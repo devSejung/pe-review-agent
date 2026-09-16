@@ -22,3 +22,11 @@ The initial production engine is `NativeFirmwareReviewEngine`, which implements 
 high-signal firmware policy directly. PR-Agent can be integrated behind the same interface after a
 pinned release/commit is validated in the target offline build, without changing Gerrit lifecycle
 or persistence semantics.
+
+The Patch-Set finding lifecycle deliberately adopts the conservative principle used by PR-Agent's
+MIT-licensed `review_finding_state.py` at the pinned commit above: absence from a partial/failed pass
+is not evidence that a finding is resolved. In this service, every finding from the previous
+successfully published Patch Set is injected into the independent verification pass even when the
+candidate-generation pass misses it. Only a complete successful verification can therefore move a
+previous finding to the resolved summary. Older resolved findings are retained as bounded context so
+the model can preserve the original semantic identity when a root cause reappears.
