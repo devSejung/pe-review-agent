@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}Gerrit AI Reviewer{% endblock %}</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/vendor/tabler.min.css">
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="page">
+  <aside class="navbar navbar-vertical navbar-expand-lg" data-bs-theme="dark">
+    <div class="container-fluid">
+      <h1 class="navbar-brand navbar-brand-autodark">
+        <a href="/" class="text-decoration-none text-white">
+          <span class="brand-mark">AI</span>
+          <span>Gerrit Reviewer</span>
+        </a>
+      </h1>
+      <div class="collapse navbar-collapse show">
+        <ul class="navbar-nav pt-lg-3">
+          {% set nav = [
+            ('dashboard', '/', 'Dashboard'),
+            ('projects', '/projects', 'Projects'),
+            ('connections', '/connections', 'Connections'),
+            ('jobs', '/jobs', 'Jobs'),
+            ('settings', '/settings', 'Settings')
+          ] %}
+          {% for key, href, label in nav %}
+          <li class="nav-item {% if page == key %}active{% endif %}">
+            <a class="nav-link" href="{{ href }}"><span class="nav-link-title">{{ label }}</span></a>
+          </li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </aside>
+  <div class="page-wrapper">
+    <header class="navbar navbar-expand-md d-print-none">
+      <div class="container-xl">
+        <div class="navbar-nav flex-row order-md-last">
+          <span class="badge bg-green-lt">Admin Console · :8080</span>
+        </div>
+        <div>
+          <div class="text-secondary small">Production control plane</div>
+          <div class="fw-semibold">Gerrit AI Reviewer</div>
+        </div>
+      </div>
+    </header>
+    <div class="page-body">
+      <div class="container-xl">
+        <div id="flash-area" aria-live="polite"></div>
+        {% block content %}{% endblock %}
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/static/vendor/tabler.min.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>

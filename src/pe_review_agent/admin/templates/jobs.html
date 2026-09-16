@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Jobs · Gerrit AI Reviewer{% endblock %}
+{% block content %}
+<div class="page-header mb-4"><div class="page-pretitle">Durable state machine</div><h2 class="page-title">Jobs</h2></div>
+<div class="card mb-4">
+  <div class="card-body">
+    <form method="get" class="row g-2">
+      <div class="col-md-4"><select class="form-select" name="project"><option value="">All projects</option>{% for item in projects %}<option value="{{ item.project }}" {% if project_filter == item.project %}selected{% endif %}>{{ item.project }}</option>{% endfor %}</select></div>
+      <div class="col-md-4"><select class="form-select" name="state"><option value="">All states</option>{% for state in ['RECEIVED','FETCHING','REVIEWING','VALIDATING','READY_TO_PUBLISH','PUBLISHING','RETRY_WAIT','DONE','SUPERSEDED','FAILED_PERMANENT'] %}<option value="{{ state }}" {% if state_filter == state %}selected{% endif %}>{{ state }}</option>{% endfor %}</select></div>
+      <div class="col-md-2"><button class="btn btn-outline-primary w-100">Filter</button></div>
+      <div class="col-md-2"><a class="btn btn-outline-secondary w-100" href="/jobs">Reset</a></div>
+    </form>
+  </div>
+</div>
+<div class="card">
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>Project / Change</th><th>Patch Set</th><th>State</th><th>Attempts</th><th>Last error</th><th>Updated</th><th></th></tr></thead>
+      <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td><div class="fw-semibold">{{ job.project }}</div><div class="text-secondary">#{{ job.change_number }} · {{ job.revision_sha[:10] }}</div></td>
+        <td>{{ job.patchset_number }}</td>
+        <td><span class="badge {% if job.state == 'DONE' %}bg-green-lt{% elif job.state == 'FAILED_PERMANENT' %}bg-red-lt{% elif job.state == 'SUPERSEDED' %}bg-secondary-lt{% else %}bg-blue-lt{% endif %}">{{ job.state }}</span>{% if job.retry_state %}<div class="small text-secondary mt-1">→ {{ job.retry_state }}</div>{% endif %}</td>
+        <td>{{ job.attempt_count }}</td>
+        <td class="error-cell"><div class="text-danger small">{{ job.last_error_class or '' }}</div><div class="text-secondary small text-truncate">{{ job.last_error or '' }}</div></td>
+        <td class="text-secondary">{{ job.updated_at }}</td>
+        <td>{% if job.state == 'FAILED_PERMANENT' %}<button class="btn btn-sm btn-outline-primary" data-requeue="{{ job.id }}">Requeue</button>{% endif %}</td>
+      </tr>
+      {% else %}<tr><td colspan="7" class="text-center text-secondary py-5">No matching jobs.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

@@ -53,7 +53,7 @@ services:
     environment: *review-env
     volumes: *review-volumes
     ports:
-      - "127.0.0.1:${HEALTH_PORT:-8080}:8080"
+      - "127.0.0.1:${WORKER_HEALTH_PORT:-8081}:8081"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -64,6 +64,20 @@ services:
     restart: unless-stopped
     environment: *review-env
     volumes: *review-volumes
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  admin:
+    image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
+    command: ["admin"]
+    restart: unless-stopped
+    environment:
+      <<: *review-env
+      PE_REVIEW_ADMIN_PASSWORD: ${PE_REVIEW_ADMIN_PASSWORD:?set PE_REVIEW_ADMIN_PASSWORD}
+    volumes: *review-volumes
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_PORT:-8080}:8080"
     depends_on:
       migrate:
         condition: service_completed_successfully

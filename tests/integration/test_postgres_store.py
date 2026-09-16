@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import text
 
+from pe_review_agent.admin import ControlStore
 from pe_review_agent.config import DatabaseSettings
 from pe_review_agent.db import Database
 from pe_review_agent.domain import (
@@ -67,7 +68,8 @@ async def store():
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE review_service_state, review_publications, review_findings, "
+                "TRUNCATE review_managed_projects, review_service_state, review_publications, "
+                "review_findings, "
                 "review_results, "
                 "review_attempts, review_jobs RESTART IDENTITY CASCADE"
             )
@@ -77,6 +79,23 @@ async def store():
         yield JobStore(database.sessions), database
     finally:
         await database.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_managed_project_is_not_claimed(store) -> None:
+    jobs, database = store
+    control = ControlStore(database.sessions)
+    await control.upsert_project("team/fw", enabled=False)
+    queued, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40),
+        review_policy_version="firmware-v1",
+    )
+
+    assert await jobs.claim_next(worker_id="worker-disabled", lease_seconds=120) is None
+
+    await control.set_project_enabled("team/fw", True)
+    claimed = await jobs.claim_next(worker_id="worker-enabled", lease_seconds=120)
+    assert claimed is not None and claimed.id == queued.id
 
 
 @pytest.mark.asyncio

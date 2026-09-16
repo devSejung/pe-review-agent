@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Gerrit AI Reviewer{% endblock %}
+{% block content %}
+<div class="page-header d-print-none mb-4">
+  <div class="row align-items-center">
+    <div class="col">
+      <div class="page-pretitle">Operations</div>
+      <h2 class="page-title">Dashboard</h2>
+    </div>
+    <div class="col-auto ms-auto">
+      {% if snapshot.service_enabled %}
+      <span class="badge bg-green-lt fs-6">Review service enabled</span>
+      {% else %}
+      <span class="badge bg-red-lt fs-6">Review service paused</span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="row row-deck row-cards mb-4">
+  <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">Jobs / 24h</div><div class="h1 mb-0">{{ snapshot.recent_24h }}</div></div></div></div>
+  <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">Failed / 24h</div><div class="h1 mb-0 {% if snapshot.failed_24h %}text-danger{% endif %}">{{ snapshot.failed_24h }}</div></div></div></div>
+  <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">Projects enabled</div><div class="h1 mb-0">{{ snapshot.projects_enabled }} / {{ snapshot.projects_total }}</div></div></div></div>
+  <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">Queue / active</div><div class="h1 mb-0">{{ snapshot.states.get('RECEIVED', 0) + snapshot.states.get('RETRY_WAIT', 0) + snapshot.states.get('FETCHING', 0) + snapshot.states.get('REVIEWING', 0) + snapshot.states.get('VALIDATING', 0) + snapshot.states.get('READY_TO_PUBLISH', 0) + snapshot.states.get('PUBLISHING', 0) }}</div></div></div></div>
+</div>
+
+<div class="row row-cards">
+  <div class="col-lg-4">
+    <div class="card h-100">
+      <div class="card-header"><h3 class="card-title">Job states</h3></div>
+      <div class="card-body">
+        {% if snapshot.states %}
+          {% for state, count in snapshot.states.items() %}
+          <div class="d-flex align-items-center mb-3">
+            <div class="flex-fill"><span class="state-dot state-{{ state|lower }}"></span>{{ state }}</div>
+            <div class="fw-semibold">{{ count }}</div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <div class="empty-state">No jobs yet. Add a test project and upload a Patch Set.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Recent jobs</h3><div class="card-actions"><a href="/jobs" class="btn btn-sm btn-outline-primary">View all</a></div></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Project</th><th>Change</th><th>Patch Set</th><th>State</th><th>Updated</th></tr></thead>
+          <tbody>
+          {% for job in snapshot.recent_jobs %}
+          <tr>
+            <td class="text-truncate project-cell">{{ job.project }}</td>
+            <td>#{{ job.change_number }}</td>
+            <td>{{ job.patchset_number }}</td>
+            <td><span class="badge bg-secondary-lt">{{ job.state }}</span></td>
+            <td class="text-secondary">{{ job.updated_at }}</td>
+          </tr>
+          {% else %}<tr><td colspan="5" class="text-center text-secondary py-5">No review jobs yet.</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

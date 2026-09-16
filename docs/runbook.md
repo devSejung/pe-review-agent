@@ -88,10 +88,33 @@ Extract it under `/home/pe-review-agent/releases/`, then:
 The release contains Docker image tarballs, so the target host does not need public registry or PyPI
 access.
 
-## 5. Enable one test project first
+## 5. Admin Web and first project
 
-Keep `gerrit.projects` to one test repository for the first end-to-end run. Upload a new Patch Set
-and verify, in order:
+After `install.sh` starts the stack, open:
+
+```text
+http://REVIEW_HOST:8080/
+```
+
+Authenticate with `admin.username` from `config.yaml` and `PE_REVIEW_ADMIN_PASSWORD` from `.env`.
+The default deployment binds port 8080 to the host. This is intended for an internal trusted network;
+for shared use, put an internal HTTPS/SSO reverse proxy in front of it because Basic credentials are
+not encrypted by plain HTTP.
+
+The web UI manages projects, connection metadata, durable jobs, service enable/disable, and review
+policy. It never stores Gerrit/LLM/admin secrets in PostgreSQL. Project enable/disable and global
+pause/resume take effect live. Gerrit endpoint/auth metadata, LLM endpoint/model, and review-policy
+changes are saved durably but require restarting receiver/worker/reconciler so active clients are not
+mutated mid-review.
+
+Use **Projects -> Add Gerrit project** for the first test repository. The project name must be the
+exact Gerrit project path (for example `platform/dmc-fw`). Use **Test** to verify REST Read access
+and Git/SSH fetch access before enabling it.
+
+### Enable one test project first
+
+Keep only one test repository enabled for the first end-to-end run. Upload a new Patch Set and
+verify, in order:
 
 1. receiver consumes `patchset-created`;
 2. the unique durable job exists;
@@ -111,11 +134,18 @@ Gerrit 3.8 presents merge diffs against its auto-merge base.
 Also exercise an intentionally oversized Patch Set with a low test `repos.max_diff_bytes`; it should
 post a summary explaining that automated review was skipped, not end as a silent permanent failure.
 
-Only then expand the project allowlist.
+Only then add/enable more projects in the Admin Web.
 
 ## 6. Health and metrics
 
-The worker exposes localhost-only port 8080 by default:
+Admin Web health is exposed on host port 8080:
+
+```text
+GET /healthz
+GET /readyz
+```
+
+The worker exposes localhost-only port 8081 by default:
 
 ```text
 GET /healthz
@@ -128,15 +158,21 @@ token usage, publish latency, verified finding counts, duplicate events, and sup
 
 ## 7. Incident behavior
 
-Emergency stop: set `service.enabled: false` (or `PE_REVIEW__SERVICE__ENABLED=false`) and restart the
-reviewer services. Receiver, worker and reconciler remain running but idle, so they start no new
-Gerrit/LLM side effects and preserve all PostgreSQL state. Restore `true` and restart to resume.
+Emergency stop for new work: use **Settings -> AI review service** in the Admin Web. The DB-backed
+switch is checked by receiver, worker claim loops, and reconciliation. It prevents new ingest/claims
+while preserving PostgreSQL state; an already in-flight review may finish its current operation.
+Restore the switch to resume. The bootstrap alternative is `service.enabled: false` (or
+`PE_REVIEW__SERVICE__ENABLED=false`) followed by service restart. The bootstrap value is the hard
+kill switch and takes precedence over the DB-backed web value; the web UI cannot re-enable work until
+the bootstrap value is restored to `true` and services are restarted.
 
 To retry a job that is already `FAILED_PERMANENT` after the underlying problem is fixed:
 
 ```bash
 docker compose run --rm worker requeue --job-id <review-job-uuid>
 ```
+
+The same operation is available as **Jobs -> Requeue** in the Admin Web.
 
 This is an administrative retry, not a state reset. Previous attempt rows remain as audit history,
 while a new retry-budget epoch starts at the current attempt number. A durable review resumes at

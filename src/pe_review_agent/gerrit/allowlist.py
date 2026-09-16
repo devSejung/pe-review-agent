@@ -10,8 +10,8 @@ class ProjectAllowlist:
 
     def __init__(self, projects: Iterable[str]) -> None:
         values = tuple(projects)
-        if not values or any(not project for project in values):
-            raise ValueError("Gerrit project allowlist must contain non-empty project names")
+        if any(not project for project in values):
+            raise ValueError("Gerrit project allowlist cannot contain empty project names")
         self._projects = frozenset(values)
 
     @property

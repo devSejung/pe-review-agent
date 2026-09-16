@@ -11,6 +11,7 @@ from time import perf_counter
 
 from sqlalchemy import text
 
+from pe_review_agent.admin import ControlStore
 from pe_review_agent.config import Settings
 from pe_review_agent.db import Database
 from pe_review_agent.domain import AttemptStage, GerritPatchsetEvent, JobState, ReviewResult
@@ -96,12 +97,14 @@ class ReviewWorker:
         gerrit: GerritRestClient,
         repos: RepositoryManager,
         engine: NativeFirmwareReviewEngine,
+        control: ControlStore | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.gerrit = gerrit
         self.repos = repos
         self.engine = engine
+        self.control = control
 
     async def run_forever(self) -> None:
         async with self.repos.worker_runtime():
@@ -132,7 +135,16 @@ class ReviewWorker:
     async def _slot(self, index: int) -> None:
         worker_id = f"{uuid.uuid4()}:{index}"
         while True:
-            if not self.settings.service.enabled:
+            if self.control is not None:
+                enabled = await self.control.service_enabled(default=self.settings.service.enabled)
+                projects = await self.control.enabled_projects(
+                    fallback=tuple(self.settings.gerrit.projects)
+                )
+                self.gerrit.replace_projects(projects)
+            else:
+                enabled = self.settings.service.enabled
+                projects = tuple(self.settings.gerrit.projects)
+            if not enabled or not projects:
                 await asyncio.sleep(self.settings.service.poll_interval_seconds)
                 continue
             job = await self.store.claim_next(
@@ -730,12 +742,23 @@ class ReviewWorker:
             ).inc()
 
 
-async def run_receiver(settings: Settings, store: JobStore) -> None:
-    if not settings.service.enabled:
-        logger.warning("review service kill switch is off; receiver is idling")
-        await asyncio.Event().wait()
-    stream = GerritEventStream(settings.gerrit)
+async def run_receiver(
+    settings: Settings,
+    store: JobStore,
+    control: ControlStore | None = None,
+) -> None:
+    stream = GerritEventStream(settings.gerrit, filter_projects=control is None)
     async for event in stream:
+        if control is not None:
+            if not await control.service_enabled(default=settings.service.enabled):
+                continue
+            if not await control.project_enabled(
+                event.project,
+                fallback=tuple(settings.gerrit.projects),
+            ):
+                continue
+        elif not settings.service.enabled:
+            continue
         job, created = await store.enqueue(
             event, review_policy_version=settings.review.policy_version
         )
@@ -754,16 +777,30 @@ async def run_receiver(settings: Settings, store: JobStore) -> None:
             METRICS.duplicate_events_total.labels(project=event.project).inc()
 
 
-async def run_reconciler(settings: Settings, store: JobStore, gerrit: GerritRestClient) -> None:
-    if not settings.service.enabled:
-        logger.warning("review service kill switch is off; reconciler is idling")
-        await asyncio.Event().wait()
+async def run_reconciler(
+    settings: Settings,
+    store: JobStore,
+    gerrit: GerritRestClient,
+    control: ControlStore | None = None,
+) -> None:
     interval = settings.service.reconcile_interval_seconds
     overlap = timedelta(seconds=max(60, interval))
     full_sweep_interval = timedelta(
         seconds=settings.service.reconcile_full_sweep_interval_seconds
     )
     while True:
+        if control is not None:
+            if not await control.service_enabled(default=settings.service.enabled):
+                await asyncio.sleep(interval)
+                continue
+            projects = await control.enabled_projects(fallback=tuple(settings.gerrit.projects))
+            if not projects:
+                await asyncio.sleep(interval)
+                continue
+            gerrit.replace_projects(projects)
+        elif not settings.service.enabled:
+            await asyncio.sleep(interval)
+            continue
         pass_started = datetime.now(UTC)
         try:
             watermark = await store.get_service_watermark(_RECONCILIATION_WATERMARK_KEY)
@@ -820,16 +857,21 @@ async def database_ready(database: Database) -> tuple[bool, str]:
 @asynccontextmanager
 async def service_components(
     settings: Settings,
-) -> AsyncIterator[tuple[Database, JobStore, GerritRestClient, LlmClient, ReviewWorker]]:
+) -> AsyncIterator[
+    tuple[Database, JobStore, ControlStore, Settings, GerritRestClient, LlmClient, ReviewWorker]
+]:
     database = Database(settings.database)
     store = JobStore(database.sessions)
-    gerrit = GerritRestClient(settings.gerrit)
-    llm = LlmClient(settings.llm)
-    repos = RepositoryManager(settings.repos, settings.gerrit)
-    engine = NativeFirmwareReviewEngine(llm, settings.review)
-    worker = ReviewWorker(settings, store, gerrit, repos, engine)
+    control = ControlStore(database.sessions)
+    await control.ensure_bootstrap(settings)
+    effective = await control.effective_settings(settings)
+    gerrit = GerritRestClient(effective.gerrit)
+    llm = LlmClient(effective.llm)
+    repos = RepositoryManager(effective.repos, effective.gerrit)
+    engine = NativeFirmwareReviewEngine(llm, effective.review)
+    worker = ReviewWorker(effective, store, gerrit, repos, engine, control=control)
     try:
-        yield database, store, gerrit, llm, worker
+        yield database, store, control, effective, gerrit, llm, worker
     finally:
         await llm.aclose()
         await gerrit.aclose()

@@ -112,8 +112,8 @@ then configure the project as:
 
 ```yaml
 gerrit:
-  projects:
-    - "platform/dmc-fw"
+  # Optional bootstrap list. Leave empty when projects will be managed from the Admin Web.
+  projects: []
 ```
 
 Start production acceptance with **one test project only**. Expand the allowlist after the first
@@ -205,7 +205,10 @@ REVIEWER_IMAGE=gerrit-ai-reviewer:local
 PE_REVIEW_LLM_API_KEY=
 PE_REVIEW_GERRIT_HTTP_PASSWORD=
 PE_REVIEW_GERRIT_TOKEN=
-HEALTH_PORT=8080
+PE_REVIEW_ADMIN_PASSWORD=CHANGE_ME_TO_ANOTHER_RANDOM_SECRET
+ADMIN_BIND_ADDRESS=0.0.0.0
+ADMIN_PORT=8080
+WORKER_HEALTH_PORT=8081
 ```
 
 For bearer Gerrit auth, also provide the variable named by `rest_auth.token_env`, for example:
@@ -257,7 +260,7 @@ Run the configuration check from the release/container environment before first 
 pe-review-agent check-config
 ```
 
-The emergency kill switch is:
+The bootstrap-file emergency kill switch is:
 
 ```yaml
 service:
@@ -270,8 +273,11 @@ or:
 PE_REVIEW__SERVICE__ENABLED=false
 ```
 
-Restart the reviewer services after changing the kill switch. Durable jobs and review results are
-retained while disabled.
+Restart the reviewer services after changing the YAML/environment kill switch. This bootstrap value
+is a **hard** switch: `service.enabled=false` cannot be overridden by a previously stored Admin Web
+value. With the bootstrap switch left `true`, **Settings -> AI review service** provides the normal
+live pause/resume control without editing files. Durable jobs and review results are retained while
+disabled.
 
 ### 8. Install and start
 
@@ -296,11 +302,69 @@ migrate     one-shot schema migration
 receiver    Gerrit patchset-created ingestion
 worker      repository fetch + Qwen review + Gerrit publication
 reconciler missed-event / ambiguous-publication recovery
+admin       internal web control plane on port 8080
 ```
 
-### 9. First end-to-end acceptance
+### 9. Admin Web on port 8080
 
-Keep only one test repository in `gerrit.projects`, upload a new Patch Set, and verify in order:
+The deployment includes an operations UI at:
+
+```text
+http://REVIEW_HOST:8080/
+```
+
+It is intentionally an **admin control plane**, not a public end-user application. The default
+configuration requires HTTP Basic authentication using `admin.username` from `config.yaml` and the
+password stored in `PE_REVIEW_ADMIN_PASSWORD`. The application also enforces CSRF validation,
+SameSite cookies, a restrictive Content-Security-Policy, `frame-ancestors 'none'`, and common browser
+security headers.
+
+> Basic authentication does not encrypt credentials on plain HTTP. For a shared corporate service,
+> terminate HTTPS and preferably company SSO at an internal reverse proxy in front of port 8080.
+> Keep direct access to 8080 restricted to the trusted internal network. `admin.auth_mode: none` is
+> rejected unless `admin.host` is loopback.
+
+The UI has five operational surfaces:
+
+- **Dashboard** — recent job volume, failures, active queue/state counts, and recent Changes.
+- **Projects** — add exact Gerrit project names, test REST Read + Git/SSH fetch access, and
+  enable/disable review.
+- **Connections** — edit/test Gerrit SSH + REST and the OpenAI-compatible Qwen endpoint.
+- **Jobs** — filter durable jobs, inspect failure text, and requeue `FAILED_PERMANENT` jobs.
+- **Settings** — live global pause/resume plus review-policy controls.
+
+Project enable/disable and the global service switch are live DB-backed controls. Disabled projects
+are filtered at event ingestion, reconciliation, **and the PostgreSQL claim query**, so queued work is
+not claimed while a project is disabled. When re-enabled, durable queued jobs become claimable again
+and reconciliation can recover Patch Sets that arrived while disabled.
+
+Gerrit endpoint/auth metadata, LLM endpoint/model, and review-policy edits are persisted in PostgreSQL
+but deliberately require restart of `receiver`, `worker`, and `reconciler`. This avoids mutating
+long-lived HTTP/SSH/model clients in the middle of an active review. On restart the services overlay
+the DB-managed values on top of the bootstrap configuration.
+
+Secrets remain bootstrap-only:
+
+```text
+Gerrit SSH private key   -> mounted file
+Gerrit REST password     -> environment
+Gerrit bearer token      -> environment
+LLM API key              -> environment
+Admin password           -> environment
+```
+
+The web application never writes these secret values to PostgreSQL and never renders them back to
+the browser. It only reports whether a required secret/file is configured.
+
+The UI is server-rendered FastAPI with locally vendored **Tabler 1.5.1** assets. No CDN is contacted at
+runtime, so the same web console works in the offline corporate deployment. Tabler is MIT licensed;
+its license text is kept with the vendored assets under
+`src/pe_review_agent/admin/static/vendor/TABLER-LICENSE.txt`.
+
+### 10. First end-to-end acceptance
+
+Keep only one test repository enabled (preferably through the Admin Web; the bootstrap
+`gerrit.projects` list is also supported), upload a new Patch Set, and verify in order:
 
 1. `patchset-created` is consumed by the receiver.
 2. A unique PostgreSQL review job is created.
@@ -316,12 +380,20 @@ Keep only one test repository in `gerrit.projects`, upload a new Patch Set, and 
 Also test a merge commit and an intentionally oversized diff. Both should produce explicit safe-skip
 summaries rather than unsafe line anchors or silent background failures.
 
-Health and operational endpoints are bound to localhost by the supplied Compose file:
+The Admin Web owns host port `8080`. Its health endpoints are:
 
 ```text
-GET http://127.0.0.1:8080/healthz
-GET http://127.0.0.1:8080/readyz
-GET http://127.0.0.1:8080/metrics
+GET http://REVIEW_HOST:8080/healthz
+GET http://REVIEW_HOST:8080/readyz
+```
+
+Worker-only health and Prometheus metrics remain bound to localhost on `8081` by the supplied
+Compose file:
+
+```text
+GET http://127.0.0.1:8081/healthz
+GET http://127.0.0.1:8081/readyz
+GET http://127.0.0.1:8081/metrics
 ```
 
 ## Why this service owns the Gerrit lifecycle instead of using an OSS reviewer end-to-end
