@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Logs · Gerrit AI Reviewer{% endblock %}
+{% block content %}
+<div class="page-header mb-4">
+  <div class="row align-items-center">
+    <div class="col"><div class="page-pretitle">Operational diagnostics</div><h2 class="page-title">Logs</h2></div>
+    <div class="col-auto ms-auto d-flex align-items-center gap-2">
+      <label class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" id="logs-auto-refresh" checked><span class="form-check-label">Auto refresh 5s</span></label>
+      <button class="btn btn-outline-primary" type="button" id="logs-refresh">Refresh now</button>
+    </div>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-body">
+    <form method="get" class="row g-2" id="log-filter-form">
+      <div class="col-md-3"><select class="form-select" name="component"><option value="">All components</option>{% for item in components %}<option value="{{ item }}" {% if component_filter == item %}selected{% endif %}>{{ item }}</option>{% endfor %}</select></div>
+      <div class="col-md-2"><select class="form-select" name="level"><option value="">All levels</option>{% for item in ['DEBUG','INFO','WARNING','ERROR','CRITICAL'] %}<option value="{{ item }}" {% if level_filter == item %}selected{% endif %}>{{ item }}</option>{% endfor %}</select></div>
+      <div class="col-md-5"><input class="form-control" name="q" value="{{ query_filter }}" placeholder="Search message, logger, job id, exception…"></div>
+      <div class="col-md-2"><button class="btn btn-primary w-100">Apply</button></div>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><h3 class="card-title">Recent structured logs</h3><div class="card-actions text-secondary small" id="log-count">{{ entries|length }} entries</div></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table log-table">
+      <thead><tr><th>Time</th><th>Level</th><th>Component</th><th>Logger / message</th><th>Full detail</th></tr></thead>
+      <tbody id="logs-body" data-component="{{ component_filter }}" data-level="{{ level_filter }}" data-query="{{ query_filter }}">
+      {% for entry in entries %}
+      <tr>
+        <td class="text-secondary text-nowrap">{{ entry.get('ts', '') }}</td>
+        <td><span class="badge {% if entry.get('level') in ['ERROR','CRITICAL'] %}bg-red-lt{% elif entry.get('level') == 'WARNING' %}bg-yellow-lt{% else %}bg-blue-lt{% endif %}">{{ entry.get('level', 'UNKNOWN') }}</span></td>
+        <td><span class="badge bg-secondary-lt">{{ entry.get('component', 'unknown') }}</span></td>
+        <td class="log-message"><div class="small text-secondary">{{ entry.get('logger', '') }}</div><div>{{ entry.get('message', '') }}</div></td>
+        <td><details><summary>Open</summary><pre class="audit-pre mt-2">{{ entry | tojson(indent=2) }}</pre></details></td>
+      </tr>
+      {% else %}<tr><td colspan="5" class="text-center text-secondary py-5">No matching logs yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

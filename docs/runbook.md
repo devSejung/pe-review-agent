@@ -101,8 +101,8 @@ The default deployment binds port 8080 to the host. This is intended for an inte
 for shared use, put an internal HTTPS/SSO reverse proxy in front of it because Basic credentials are
 not encrypted by plain HTTP.
 
-The web UI manages projects, connection metadata, durable jobs, service enable/disable, and review
-policy. It never stores Gerrit/LLM/admin secrets in PostgreSQL. Project enable/disable and global
+The web UI manages projects, connection metadata, durable jobs, service enable/disable, review
+audit, structured logs, and review policy. It never stores Gerrit/LLM/admin secrets in PostgreSQL. Project enable/disable and global
 pause/resume take effect live. Gerrit endpoint/auth metadata, LLM endpoint/model, and review-policy
 changes are saved durably but require restarting receiver/worker/reconciler so active clients are not
 mutated mid-review.
@@ -173,6 +173,12 @@ docker compose run --rm worker requeue --job-id <review-job-uuid>
 ```
 
 The same operation is available as **Jobs -> Requeue** in the Admin Web.
+
+For incident triage, open **Jobs -> Audit** on the affected Change. That page contains the complete
+durable attempt timeline, full stored failure text, model summary/findings, and the exact Gerrit
+`ReviewInput`/response. Use **Logs** for process-level details and exception tracebacks. Logs are
+persisted in the shared reviewer volume as rotating JSONL files and can be filtered by service,
+severity, or free text; the page auto-refreshes every five seconds.
 
 This is an administrative retry, not a state reset. Previous attempt rows remain as audit history,
 while a new retry-budget epoch starts at the current attempt number. A durable review resumes at

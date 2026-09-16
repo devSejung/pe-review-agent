@@ -324,13 +324,19 @@ security headers.
 > Keep direct access to 8080 restricted to the trusted internal network. `admin.auth_mode: none` is
 > rejected unless `admin.host` is loopback.
 
-The UI has five operational surfaces:
+The UI has six operational surfaces:
 
 - **Dashboard** — recent job volume, failures, active queue/state counts, and recent Changes.
 - **Projects** — add exact Gerrit project names, test REST Read + Git/SSH fetch access, and
   enable/disable review.
 - **Connections** — edit/test Gerrit SSH + REST and the OpenAI-compatible Qwen endpoint.
-- **Jobs** — filter durable jobs, inspect failure text, and requeue `FAILED_PERMANENT` jobs.
+- **Jobs** — filter durable jobs, inspect state/failure text, open the full audit trail, and requeue
+  `FAILED_PERMANENT` jobs. The audit page shows every durable attempt, the model summary and findings,
+  file/side/line/confidence/evidence/remediation, the exact persisted Gerrit `ReviewInput`, publication
+  status, and Gerrit's response.
+- **Logs** — browse receiver/worker/reconciler/admin structured logs, filter by component/level/text,
+  auto-refresh every five seconds, and expand the complete JSON/exception traceback instead of a
+  truncated one-line error.
 - **Settings** — live global pause/resume plus review-policy controls.
 
 Project enable/disable and the global service switch are live DB-backed controls. Disabled projects
@@ -355,6 +361,11 @@ Admin password           -> environment
 
 The web application never writes these secret values to PostgreSQL and never renders them back to
 the browser. It only reports whether a required secret/file is configured.
+
+Operational logs are additionally written as rotating JSONL files under `admin.log_root`
+(`/var/lib/pe-review-agent/logs` by default). Compose gives each process its own file (`worker.jsonl`,
+`receiver.jsonl`, `reconciler.jsonl`, `admin.jsonl`, and `migrate.jsonl`). The default rotation is
+10 MiB with five backups per process. Console JSON logging remains enabled as well.
 
 The UI is server-rendered FastAPI with locally vendored **Tabler 1.5.1** assets. No CDN is contacted at
 runtime, so the same web console works in the offline corporate deployment. Tabler is MIT licensed;

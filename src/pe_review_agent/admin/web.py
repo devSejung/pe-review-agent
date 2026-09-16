@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -170,6 +172,51 @@ def create_admin_app(settings: Settings) -> FastAPI:
             projects=await control.list_projects(),
             state_filter=state_filter,
             project_filter=project,
+        )
+
+    @app.get("/jobs/{job_id}", response_class=HTMLResponse)
+    async def job_audit_page(
+        request: Request,
+        job_id: uuid.UUID,
+        _: str = Depends(auth_dependency),
+    ):
+        control: ControlStore = request.app.state.control
+        audit = await control.get_job_audit(job_id)
+        if audit is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return _render(
+            request,
+            "job_detail.html",
+            page="jobs",
+            audit=audit,
+        )
+
+    @app.get("/logs", response_class=HTMLResponse)
+    async def logs_page(
+        request: Request,
+        _: str = Depends(auth_dependency),
+        component: str | None = None,
+        level: str | None = None,
+        q: str | None = None,
+    ):
+        entries = await asyncio.to_thread(
+            _read_logs,
+            settings.admin.log_root,
+            component=component,
+            level=level,
+            query=q,
+            limit=500,
+        )
+        components = await asyncio.to_thread(_log_components, settings.admin.log_root)
+        return _render(
+            request,
+            "logs.html",
+            page="logs",
+            entries=entries,
+            components=components,
+            component_filter=component or "",
+            level_filter=(level or "").upper(),
+            query_filter=q or "",
         )
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -352,6 +399,24 @@ def create_admin_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True, "job_id": str(job.id), "state": job.state.value}
 
+    @app.get("/api/logs")
+    async def logs_api(
+        _: str = Depends(auth_dependency),
+        component: str | None = None,
+        level: str | None = None,
+        q: str | None = None,
+        limit: int = Query(default=500, ge=1, le=1000),
+    ):
+        entries = await asyncio.to_thread(
+            _read_logs,
+            settings.admin.log_root,
+            component=component,
+            level=level,
+            query=q,
+            limit=limit,
+        )
+        return {"entries": entries}
+
     return app
 
 
@@ -364,8 +429,73 @@ async def run_admin(settings: Settings) -> None:
         log_level="info",
         access_log=True,
         server_header=False,
+        log_config=None,
     )
     await uvicorn.Server(config).serve()
+
+
+def _log_components(root: Path) -> list[str]:
+    if not root.is_dir():
+        return []
+    return sorted(
+        {
+            path.name.split(".jsonl", 1)[0]
+            for path in root.glob("*.jsonl*")
+            if path.is_file()
+        }
+    )
+
+
+def _read_logs(
+    root: Path,
+    *,
+    component: str | None,
+    level: str | None,
+    query: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not root.is_dir():
+        return []
+    wanted_component = component.strip() if component else None
+    wanted_level = level.strip().upper() if level else None
+    needle = query.strip().lower() if query else None
+    candidates: list[dict[str, Any]] = []
+    for path in sorted(root.glob("*.jsonl*")):
+        if not path.is_file():
+            continue
+        inferred_component = path.name.split(".jsonl", 1)[0]
+        if wanted_component and inferred_component != wanted_component:
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                lines = deque(handle, maxlen=max(limit * 4, 1000))
+        except OSError:
+            continue
+        for line in lines:
+            raw = line.rstrip("\r\n")
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = {
+                    "ts": "",
+                    "level": "UNKNOWN",
+                    "component": inferred_component,
+                    "logger": "raw",
+                    "message": raw,
+                }
+            if not isinstance(payload, dict):
+                continue
+            payload.setdefault("component", inferred_component)
+            if wanted_level and str(payload.get("level", "")).upper() != wanted_level:
+                continue
+            searchable = json.dumps(payload, ensure_ascii=False, default=str).lower()
+            if needle and needle not in searchable:
+                continue
+            candidates.append(payload)
+    candidates.sort(key=lambda item: str(item.get("ts", "")), reverse=True)
+    return candidates[:limit]
 
 
 def _auth_dependency(settings: Settings):  # type: ignore[no-untyped-def]

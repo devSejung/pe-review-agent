@@ -51,8 +51,8 @@
           <tbody>
           {% for job in snapshot.recent_jobs %}
           <tr>
-            <td class="text-truncate project-cell">{{ job.project }}</td>
-            <td>#{{ job.change_number }}</td>
+            <td class="text-truncate project-cell"><a href="/jobs/{{ job.id }}" class="text-reset fw-medium">{{ job.project }}</a></td>
+            <td><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a></td>
             <td>{{ job.patchset_number }}</td>
             <td><span class="badge bg-secondary-lt">{{ job.state }}</span></td>
             <td class="text-secondary">{{ job.updated_at }}</td>

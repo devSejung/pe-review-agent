@@ -19,13 +19,13 @@
       <tbody>
       {% for job in jobs %}
       <tr>
-        <td><div class="fw-semibold">{{ job.project }}</div><div class="text-secondary">#{{ job.change_number }} · {{ job.revision_sha[:10] }}</div></td>
+        <td><div class="fw-semibold"><a href="/jobs/{{ job.id }}" class="text-reset">{{ job.project }}</a></div><div class="text-secondary"><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a> · {{ job.revision_sha[:10] }}</div></td>
         <td>{{ job.patchset_number }}</td>
         <td><span class="badge {% if job.state == 'DONE' %}bg-green-lt{% elif job.state == 'FAILED_PERMANENT' %}bg-red-lt{% elif job.state == 'SUPERSEDED' %}bg-secondary-lt{% else %}bg-blue-lt{% endif %}">{{ job.state }}</span>{% if job.retry_state %}<div class="small text-secondary mt-1">→ {{ job.retry_state }}</div>{% endif %}</td>
         <td>{{ job.attempt_count }}</td>
         <td class="error-cell"><div class="text-danger small">{{ job.last_error_class or '' }}</div><div class="text-secondary small text-truncate">{{ job.last_error or '' }}</div></td>
         <td class="text-secondary">{{ job.updated_at }}</td>
-        <td>{% if job.state == 'FAILED_PERMANENT' %}<button class="btn btn-sm btn-outline-primary" data-requeue="{{ job.id }}">Requeue</button>{% endif %}</td>
+        <td><div class="btn-list flex-nowrap"><a class="btn btn-sm btn-outline-secondary" href="/jobs/{{ job.id }}">Audit</a>{% if job.state == 'FAILED_PERMANENT' %}<button class="btn btn-sm btn-outline-primary" data-requeue="{{ job.id }}">Requeue</button>{% endif %}</div></td>
       </tr>
       {% else %}<tr><td colspan="7" class="text-center text-secondary py-5">No matching jobs.</td></tr>{% endfor %}
       </tbody>

@@ -131,4 +131,95 @@
       finally { toggle.disabled = false; }
     });
   });
+
+  const logsBody = document.getElementById('logs-body');
+  if (logsBody) {
+    const refreshButton = document.getElementById('logs-refresh');
+    const autoRefresh = document.getElementById('logs-auto-refresh');
+    const logCount = document.getElementById('log-count');
+
+    function logBadgeClass(level) {
+      if (level === 'ERROR' || level === 'CRITICAL') return 'bg-red-lt';
+      if (level === 'WARNING') return 'bg-yellow-lt';
+      return 'bg-blue-lt';
+    }
+
+    function renderLogs(entries) {
+      logsBody.replaceChildren();
+      if (!entries.length) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 5;
+        cell.className = 'text-center text-secondary py-5';
+        cell.textContent = 'No matching logs yet.';
+        row.appendChild(cell);
+        logsBody.appendChild(row);
+      }
+      for (const entry of entries) {
+        const row = document.createElement('tr');
+        const time = document.createElement('td');
+        time.className = 'text-secondary text-nowrap';
+        time.textContent = entry.ts || '';
+
+        const levelCell = document.createElement('td');
+        const level = document.createElement('span');
+        level.className = `badge ${logBadgeClass(entry.level || '')}`;
+        level.textContent = entry.level || 'UNKNOWN';
+        levelCell.appendChild(level);
+
+        const componentCell = document.createElement('td');
+        const component = document.createElement('span');
+        component.className = 'badge bg-secondary-lt';
+        component.textContent = entry.component || 'unknown';
+        componentCell.appendChild(component);
+
+        const messageCell = document.createElement('td');
+        messageCell.className = 'log-message';
+        const logger = document.createElement('div');
+        logger.className = 'small text-secondary';
+        logger.textContent = entry.logger || '';
+        const message = document.createElement('div');
+        message.textContent = entry.message || '';
+        messageCell.append(logger, message);
+
+        const detailCell = document.createElement('td');
+        const details = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = 'Open';
+        const pre = document.createElement('pre');
+        pre.className = 'audit-pre mt-2';
+        pre.textContent = JSON.stringify(entry, null, 2);
+        details.append(summary, pre);
+        detailCell.appendChild(details);
+
+        row.append(time, levelCell, componentCell, messageCell, detailCell);
+        logsBody.appendChild(row);
+      }
+      if (logCount) logCount.textContent = `${entries.length} entries`;
+    }
+
+    async function refreshLogs() {
+      if (refreshButton) refreshButton.disabled = true;
+      try {
+        const params = new URLSearchParams();
+        if (logsBody.dataset.component) params.set('component', logsBody.dataset.component);
+        if (logsBody.dataset.level) params.set('level', logsBody.dataset.level);
+        if (logsBody.dataset.query) params.set('q', logsBody.dataset.query);
+        params.set('limit', '500');
+        const response = await fetch(`/api/logs?${params.toString()}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        renderLogs(payload.entries || []);
+      } catch (error) {
+        show(`Log refresh failed: ${error.message}`, 'danger');
+      } finally {
+        if (refreshButton) refreshButton.disabled = false;
+      }
+    }
+
+    refreshButton?.addEventListener('click', refreshLogs);
+    window.setInterval(() => {
+      if (autoRefresh?.checked && !document.hidden) refreshLogs();
+    }, 5000);
+  }
 })();

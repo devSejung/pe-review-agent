@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Job Audit · Gerrit AI Reviewer{% endblock %}
+{% block content %}
+<div class="page-header mb-4">
+  <div class="row align-items-center">
+    <div class="col">
+      <div class="page-pretitle">Review audit trail</div>
+      <h2 class="page-title">{{ audit.project }} · Change #{{ audit.change_number }} · PS{{ audit.patchset_number }}</h2>
+    </div>
+    <div class="col-auto ms-auto"><a href="/jobs" class="btn btn-outline-secondary">Back to jobs</a></div>
+  </div>
+</div>
+
+<div class="row row-cards mb-4">
+  <div class="col-md-3"><div class="card"><div class="card-body"><div class="subheader">State</div><div class="h3 mb-0">{{ audit.state }}</div></div></div></div>
+  <div class="col-md-3"><div class="card"><div class="card-body"><div class="subheader">Attempts</div><div class="h3 mb-0">{{ audit.attempt_count }}</div></div></div></div>
+  <div class="col-md-3"><div class="card"><div class="card-body"><div class="subheader">Policy</div><div class="h3 mb-0">{{ audit.policy_version }}</div></div></div></div>
+  <div class="col-md-3"><div class="card"><div class="card-body"><div class="subheader">Revision</div><div class="font-monospace small text-break">{{ audit.revision_sha }}</div></div></div></div>
+</div>
+
+{% if audit.last_error %}
+<div class="card border-danger mb-4">
+  <div class="card-header"><h3 class="card-title text-danger">Current failure</h3></div>
+  <div class="card-body">
+    <div class="fw-semibold mb-2">{{ audit.last_error_class or 'Error' }}</div>
+    <pre class="audit-pre text-danger">{{ audit.last_error }}</pre>
+  </div>
+</div>
+{% endif %}
+
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Attempt timeline</h3></div>
+  <div class="table-responsive">
+    <table class="table table-vcenter card-table">
+      <thead><tr><th>#</th><th>Stage</th><th>Result</th><th>Started</th><th>Finished</th><th>Error</th></tr></thead>
+      <tbody>
+      {% for attempt in audit.attempts %}
+      <tr>
+        <td>{{ attempt.attempt_number }}</td>
+        <td><span class="badge bg-blue-lt">{{ attempt.stage }}</span></td>
+        <td>{% if attempt.success is sameas true %}<span class="badge bg-green-lt">success</span>{% elif attempt.success is sameas false %}<span class="badge bg-red-lt">failed</span>{% else %}<span class="badge bg-yellow-lt">open/crashed</span>{% endif %}</td>
+        <td class="text-secondary">{{ attempt.started_at }}</td>
+        <td class="text-secondary">{{ attempt.finished_at or '—' }}</td>
+        <td>{% if attempt.error_message %}<details><summary class="text-danger">{{ attempt.error_class or 'error' }}</summary><pre class="audit-pre mt-2">{{ attempt.error_message }}</pre></details>{% else %}—{% endif %}</td>
+      </tr>
+      {% else %}<tr><td colspan="6" class="text-center text-secondary py-4">No attempts recorded yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Review result</h3></div>
+  <div class="card-body">
+    {% if audit.review %}
+    <div class="row g-3 mb-4">
+      <div class="col-md-4"><div class="subheader">Model</div><div>{{ audit.review.model or 'unknown' }}</div></div>
+      <div class="col-md-4"><div class="subheader">Input tokens</div><div>{{ audit.review.input_tokens or '—' }}</div></div>
+      <div class="col-md-4"><div class="subheader">Output tokens</div><div>{{ audit.review.output_tokens or '—' }}</div></div>
+    </div>
+    <div class="subheader mb-2">Change-level summary</div>
+    <pre class="audit-pre mb-4">{{ audit.review.summary }}</pre>
+    <div class="subheader mb-2">Findings / inline comments</div>
+    {% for finding in audit.review.findings %}
+    <div class="card audit-finding mb-3">
+      <div class="card-body">
+        <div class="d-flex gap-2 align-items-center mb-2">
+          <span class="badge {% if finding.severity == 'P0' or finding.severity == 'P1' %}bg-red-lt{% elif finding.severity == 'P2' %}bg-yellow-lt{% else %}bg-blue-lt{% endif %}">{{ finding.severity }}</span>
+          <span class="badge bg-secondary-lt">{{ finding.lineage }}</span>
+          <span class="fw-semibold">{{ finding.title }}</span>
+        </div>
+        <div class="font-monospace small text-secondary mb-3">{{ finding.path }} · {{ finding.side }} · line {{ finding.start_line }}{% if finding.end_line %}-{{ finding.end_line }}{% endif %} · confidence {{ '%.2f'|format(finding.confidence) }}</div>
+        <div class="mb-2"><strong>Message</strong><div>{{ finding.message }}</div></div>
+        <div class="mb-2"><strong>Impact</strong><div>{{ finding.impact }}</div></div>
+        <div class="mb-2"><strong>Evidence</strong><div>{{ finding.evidence }}</div></div>
+        {% if finding.remediation %}<div><strong>Remediation</strong><div>{{ finding.remediation }}</div></div>{% endif %}
+        <details class="mt-3"><summary>Audit identity</summary><div class="font-monospace small mt-2 text-break">fingerprint={{ finding.fingerprint }}<br>semantic_id={{ finding.semantic_id }}</div></details>
+      </div>
+    </div>
+    {% else %}<div class="text-secondary">No durable review result yet.</div>{% endfor %}
+    {% else %}
+    <div class="text-secondary">The model has not produced a durable review result for this job.</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Gerrit publication audit</h3></div>
+  <div class="card-body">
+    {% if audit.publication %}
+    <div class="row g-3 mb-4">
+      <div class="col-md-3"><div class="subheader">Status</div><div>{{ audit.publication.status }}</div></div>
+      <div class="col-md-3"><div class="subheader">Created</div><div>{{ audit.publication.created_at }}</div></div>
+      <div class="col-md-3"><div class="subheader">Posted</div><div>{{ audit.publication.posted_at or '—' }}</div></div>
+      <div class="col-md-3"><div class="subheader">Fingerprint</div><div class="font-monospace small text-break">{{ audit.publication.fingerprint }}</div></div>
+    </div>
+    {% if audit.publication.last_error %}<div class="alert alert-danger"><pre class="audit-pre mb-0">{{ audit.publication.last_error }}</pre></div>{% endif %}
+    <div class="subheader mb-2">Exact durable ReviewInput sent to Gerrit</div>
+    <pre class="audit-pre audit-json mb-4">{{ audit.publication.request_payload | tojson(indent=2) }}</pre>
+    <div class="subheader mb-2">Gerrit response</div>
+    <pre class="audit-pre audit-json">{{ (audit.publication.gerrit_response or {}) | tojson(indent=2) }}</pre>
+    {% else %}
+    <div class="text-secondary">No publication intent has been created yet.</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

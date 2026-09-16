@@ -154,6 +154,7 @@ class AdminSettings(StrictSettingsModel):
     auth_mode: Literal["basic", "none"] = "basic"
     username: str = "admin"
     password_env: str = "PE_REVIEW_ADMIN_PASSWORD"
+    log_root: Path = Path("/var/lib/pe-review-agent/logs")
 
     @property
     def password(self) -> SecretStr | None:

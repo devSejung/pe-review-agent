@@ -11,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pe_review_agent.config import Settings
 from pe_review_agent.domain import JobState
-from pe_review_agent.jobs.models import Job, ManagedProject, ServiceState
+from pe_review_agent.jobs.models import (
+    Attempt,
+    Job,
+    ManagedProject,
+    Publication,
+    ReviewFinding,
+    ReviewResultRow,
+    ServiceState,
+)
 
 _RUNTIME_CONFIG_KEY = "admin-runtime-config"
 
@@ -297,6 +305,105 @@ class ControlStore:
         async with self._sessions() as session:
             job = await session.get(Job, job_id)
             return _job_dict(job) if job is not None else None
+
+    async def get_job_audit(self, job_id: uuid.UUID) -> dict[str, Any] | None:
+        """Return the durable audit trail for one review job, including exact Gerrit payload."""
+
+        async with self._sessions() as session:
+            job = await session.get(Job, job_id)
+            if job is None:
+                return None
+
+            attempts = (
+                await session.scalars(
+                    select(Attempt)
+                    .where(Attempt.job_id == job_id)
+                    .order_by(Attempt.attempt_number.asc())
+                )
+            ).all()
+            result = await session.get(ReviewResultRow, job_id)
+            findings = (
+                (
+                    await session.scalars(
+                        select(ReviewFinding)
+                        .where(ReviewFinding.job_id == job_id)
+                        .order_by(ReviewFinding.ordinal.asc())
+                    )
+                ).all()
+                if result is not None
+                else []
+            )
+            publication = await session.scalar(
+                select(Publication).where(Publication.job_id == job_id)
+            )
+
+            audit = _job_dict(job)
+            audit["attempts"] = [
+                {
+                    "attempt_number": attempt.attempt_number,
+                    "stage": attempt.stage,
+                    "worker_id": attempt.worker_id,
+                    "started_at": attempt.started_at,
+                    "finished_at": attempt.finished_at,
+                    "success": attempt.success,
+                    "retryable": attempt.retryable,
+                    "error_class": attempt.error_class,
+                    "error_message": attempt.error_message,
+                }
+                for attempt in attempts
+            ]
+            audit["review"] = (
+                {
+                    "summary": result.summary,
+                    "model": result.model,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "metadata": result.review_metadata,
+                    "created_at": result.created_at,
+                    "findings": [
+                        {
+                            "ordinal": finding.ordinal,
+                            "fingerprint": finding.fingerprint,
+                            "semantic_id": finding.semantic_id,
+                            "lineage": finding.lineage_state,
+                            "severity": finding.severity,
+                            "category": finding.category,
+                            "title": finding.title,
+                            "message": finding.message,
+                            "impact": finding.impact,
+                            "evidence": finding.evidence,
+                            "remediation": finding.remediation,
+                            "path": finding.path,
+                            "side": finding.side,
+                            "start_line": finding.start_line,
+                            "start_character": finding.start_character,
+                            "end_line": finding.end_line,
+                            "end_character": finding.end_character,
+                            "confidence": finding.confidence,
+                        }
+                        for finding in findings
+                    ],
+                }
+                if result is not None
+                else None
+            )
+            audit["publication"] = (
+                {
+                    "id": publication.id,
+                    "fingerprint": publication.publication_fingerprint,
+                    "status": publication.status,
+                    "finding_fingerprints": publication.finding_fingerprints,
+                    "request_payload": publication.request_payload,
+                    "gerrit_response": publication.gerrit_response,
+                    "last_error": publication.last_error,
+                    "created_at": publication.created_at,
+                    "posted_at": publication.posted_at,
+                    "updated_at": publication.updated_at,
+                }
+                if publication is not None
+                else None
+            )
+            return audit
 
 
 def _defaults_from_settings(settings: Settings) -> dict[str, Any]:
