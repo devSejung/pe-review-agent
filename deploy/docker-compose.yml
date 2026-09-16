@@ -23,6 +23,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       PE_REVIEW_LLM_API_KEY: ${PE_REVIEW_LLM_API_KEY:-}
       PE_REVIEW_GERRIT_HTTP_PASSWORD: ${PE_REVIEW_GERRIT_HTTP_PASSWORD:-}
+      PE_REVIEW_GERRIT_TOKEN: ${PE_REVIEW_GERRIT_TOKEN:-}
     volumes: &review-volumes
       - ./config.yaml:/etc/pe-review-agent/config.yaml:ro
       - ./secrets/gerrit_ssh_key:/run/secrets/gerrit_ssh_key:ro
