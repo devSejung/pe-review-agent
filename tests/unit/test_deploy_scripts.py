@@ -86,5 +86,5 @@ def test_corporate_build_args_are_supported() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "ARG PIP_INDEX_URL" in dockerfile
     assert "ARG PIP_TRUSTED_HOST" in dockerfile
-    assert "ARG APT_DEBIAN_MIRROR_URL" in dockerfile
-    assert "ARG APT_DEBIAN_SECURITY_MIRROR_URL" in dockerfile
+    assert 'ARG APT_DEBIAN_MIRROR_URL=""' in dockerfile
+    assert 'ARG APT_DEBIAN_SECURITY_MIRROR_URL=""' in dockerfile

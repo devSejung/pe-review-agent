@@ -2,6 +2,21 @@
 {% block title %}Settings · Gerrit AI Reviewer{% endblock %}
 {% block content %}
 <div class="page-header mb-4"><div class="page-pretitle">Runtime policy</div><h2 class="page-title">Settings</h2></div>
+{% if review_override_active %}
+<div class="alert {% if legacy_review_snapshot %}alert-warning{% else %}alert-info{% endif %} d-flex align-items-center mb-4">
+  <div class="flex-fill">
+    <strong>Saved DB review-policy override is active.</strong>
+    {% if legacy_review_snapshot %}
+      A full review-policy snapshot from an earlier release differs from the current <code>config.yaml</code>. Verify the file before clearing it.
+    {% else %}
+      Only review-policy values that differ from <code>config.yaml</code> are stored as Admin overrides.
+    {% endif %}
+  </div>
+  <button type="button" class="btn btn-sm btn-outline-primary" data-reset-review>Use config.yaml values</button>
+</div>
+{% else %}
+<div class="alert alert-secondary mb-4"><strong>Review policy source:</strong> config.yaml (no saved Admin review override).</div>
+{% endif %}
 <div class="row row-cards">
   <div class="col-lg-5">
     <div class="card">
@@ -16,8 +31,6 @@
   </div>
   <div class="col-lg-7">
     <form class="card" data-runtime-config>
-      <input type="hidden" name="gerrit.ssh_host" value="{{ runtime.gerrit.ssh_host }}"><input type="hidden" name="gerrit.ssh_port" value="{{ runtime.gerrit.ssh_port }}"><input type="hidden" name="gerrit.ssh_user" value="{{ runtime.gerrit.ssh_user }}"><input type="hidden" name="gerrit.rest_url" value="{{ runtime.gerrit.rest_url }}"><input type="hidden" name="gerrit.rest_auth_mode" value="{{ runtime.gerrit.rest_auth_mode }}"><input type="hidden" name="gerrit.rest_username" value="{{ runtime.gerrit.rest_username or '' }}">
-      <input type="hidden" name="llm.base_url" value="{{ runtime.llm.base_url }}"><input type="hidden" name="llm.model" value="{{ runtime.llm.model }}"><input type="hidden" name="llm.temperature" value="{{ runtime.llm.temperature }}"><input type="hidden" name="llm.max_output_tokens" value="{{ runtime.llm.max_output_tokens }}">
       <div class="card-header"><h3 class="card-title">Review policy</h3><div class="card-actions"><span class="badge bg-yellow-lt">Restart required</span></div></div>
       <div class="card-body">
         <div class="row g-3">

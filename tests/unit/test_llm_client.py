@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from pe_review_agent.config import LlmSettings
-from pe_review_agent.llm.client import LlmClient
+from pe_review_agent.llm.client import LlmClient, assistant_message_for_tool_loop
 from pe_review_agent.retry import ContextLengthError, TransientError
 
 
@@ -23,6 +23,7 @@ async def test_llm_client_parses_tool_call_and_usage() -> None:
                         "message": {
                             "role": "assistant",
                             "content": "",
+                            "reasoning": "I need to inspect fw.c before concluding.",
                             "tool_calls": [
                                 {
                                     "id": "call-1",
@@ -52,6 +53,9 @@ async def test_llm_client_parses_tool_call_and_usage() -> None:
     assert result.tool_calls[0].arguments == {"path": "fw.c"}
     assert result.input_tokens == 10
     assert result.output_tokens == 4
+    assert assistant_message_for_tool_loop(result)["reasoning"] == (
+        "I need to inspect fw.c before concluding."
+    )
 
 
 @pytest.mark.asyncio

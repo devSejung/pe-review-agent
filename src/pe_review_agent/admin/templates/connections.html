@@ -8,6 +8,22 @@
   </div>
 </div>
 
+{% if 'gerrit' in connection_overrides or 'llm' in connection_overrides %}
+<div class="alert {% if legacy_connection_snapshots %}alert-warning{% else %}alert-info{% endif %} d-flex align-items-center mb-4">
+  <div class="flex-fill">
+    <strong>Saved DB connection overrides are active.</strong>
+    {% if legacy_connection_snapshots %}
+      A full connection snapshot from an earlier release is still preserved because it differs from the current <code>config.yaml</code>. Verify the file, then use the button if <code>config.yaml</code> should become authoritative.
+    {% else %}
+      Only values that differ from <code>config.yaml</code> are stored as Admin overrides.
+    {% endif %}
+  </div>
+  <button type="button" class="btn btn-sm btn-outline-primary" data-reset-connections>Use config.yaml values</button>
+</div>
+{% else %}
+<div class="alert alert-secondary mb-4"><strong>Connection source:</strong> config.yaml (no saved Admin connection overrides).</div>
+{% endif %}
+
 <form data-runtime-config>
 <div class="row row-cards">
   <div class="col-xl-6">
@@ -26,7 +42,17 @@
         <div class="row g-2 small">
           <div class="col-6">SSH key {% if secret_status.ssh_key %}<span class="badge bg-green-lt">mounted</span>{% else %}<span class="badge bg-red-lt">missing</span>{% endif %}</div>
           <div class="col-6">known_hosts {% if secret_status.known_hosts %}<span class="badge bg-green-lt">mounted</span>{% else %}<span class="badge bg-red-lt">missing</span>{% endif %}</div>
-          <div class="col-12">REST secret {% if secret_status.gerrit_rest_secret %}<span class="badge bg-green-lt">configured</span>{% else %}<span class="badge bg-yellow-lt">not configured</span>{% endif %} <span class="text-secondary">Secrets stay in environment / mounted files and are never returned to the browser.</span></div>
+          <div class="col-12">
+            REST secret
+            {% if effective.gerrit.rest_auth.mode == 'none' %}
+              <span class="badge bg-secondary-lt">not required (auth=None)</span>
+            {% elif secret_status.gerrit_rest_secret %}
+              <span class="badge bg-green-lt">configured</span>
+            {% else %}
+              <span class="badge bg-red-lt">missing</span>
+            {% endif %}
+            <span class="text-secondary">Effective auth: <strong>{{ effective.gerrit.rest_auth.mode }}</strong>{% if rest_secret_env %}; secret env: <code>{{ rest_secret_env }}</code>{% endif %}. Secret values stay in the container environment and are never returned to the browser.</span>
+          </div>
         </div>
       </div>
     </div>

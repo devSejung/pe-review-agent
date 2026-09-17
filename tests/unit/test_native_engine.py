@@ -16,9 +16,11 @@ class FakeLlm:
         self.completions = list(completions)
         self.settings = type("Settings", (), {"model": "Qwen3.6-27B"})()
         self.seen_messages: list[list[dict]] = []
+        self.seen_tools: list[list[dict] | None] = []
 
     async def complete(self, *, messages, tools=None, **kwargs):
         self.seen_messages.append(list(messages))
+        self.seen_tools.append(tools)
         result = self.completions.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -107,6 +109,227 @@ async def test_two_pass_engine_uses_tools_then_verifies(tmp_path: Path) -> None:
     assert "natural Korean" in llm.seen_messages[2][1]["content"]
     assert result.input_tokens == 30
     assert result.output_tokens == 15
+
+
+@pytest.mark.asyncio
+async def test_tool_round_limit_forces_final_json_instead_of_failing(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    first = ToolCall(
+        id="call-1",
+        name="read_file",
+        arguments={"path": "fw.c"},
+        raw_arguments='{"path":"fw.c"}',
+    )
+    second = ToolCall(
+        id="call-2",
+        name="search_text",
+        arguments={"query": "changed"},
+        raw_arguments='{"query":"changed"}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", first),
+            _completion("", second),
+            _completion(json.dumps({"summary": "done", "findings": []})),
+        ]
+    )
+    settings = ReviewSettings(max_tool_rounds=1)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=13,
+        patchset_number=1,
+        revision_sha="1" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    result = await engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        tool_trace=capture,
+    )
+
+    assert result.findings == []
+    assert len(llm.seen_messages) == 3
+    assert llm.seen_tools[-1] is None
+    assert any(
+        event.get("tool") == "search_text" and event.get("status") == "round_limit_suppressed"
+        for event in trace
+    )
+    assert any(
+        event.get("event") == "forced_finalization" and event.get("reason") == "max_tool_rounds"
+        for event in trace
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_repository_tool_call_is_suppressed_and_finalized(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    duplicate = ToolCall(
+        id="call-1",
+        name="read_file",
+        arguments={"path": "fw.c", "start_line": 1},
+        raw_arguments='{"path":"fw.c","start_line":1}',
+    )
+    duplicate_again = ToolCall(
+        id="call-2",
+        name="read_file",
+        arguments={"path": "fw.c", "start_line": 1},
+        raw_arguments='{"path":"fw.c","start_line":1}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", duplicate),
+            _completion("", duplicate_again),
+            _completion(json.dumps({"summary": "done", "findings": []})),
+        ]
+    )
+    settings = ReviewSettings(max_tool_rounds=8)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=14,
+        patchset_number=1,
+        revision_sha="2" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    result = await engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        tool_trace=capture,
+    )
+
+    assert result.findings == []
+    statuses = [event.get("status") for event in trace if event.get("event") == "tool_call"]
+    assert statuses == ["ok", "duplicate_suppressed"]
+    assert trace[-1]["event"] == "forced_finalization"
+    assert trace[-1]["reason"] == "duplicate_tool_loop"
+    assert llm.seen_tools[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_semantically_equivalent_tool_defaults_are_duplicate_suppressed(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    implicit_defaults = ToolCall(
+        id="call-1",
+        name="read_file",
+        arguments={"path": "./fw.c"},
+        raw_arguments='{"path":"./fw.c"}',
+    )
+    explicit_defaults = ToolCall(
+        id="call-2",
+        name="read_file",
+        arguments={"path": "fw.c", "start_line": 1, "end_line": 200},
+        raw_arguments='{"path":"fw.c","start_line":1,"end_line":200}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", implicit_defaults),
+            _completion("", explicit_defaults),
+            _completion(json.dumps({"summary": "done", "findings": []})),
+        ]
+    )
+    settings = ReviewSettings(max_tool_rounds=8)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=17,
+        patchset_number=1,
+        revision_sha="5" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    result = await engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        tool_trace=capture,
+    )
+
+    assert result.findings == []
+    statuses = [event.get("status") for event in trace if event.get("event") == "tool_call"]
+    assert statuses == ["ok", "duplicate_suppressed"]
+
+
+@pytest.mark.asyncio
+async def test_tool_error_can_be_retried_without_duplicate_suppression(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    invalid = ToolCall(
+        id="call-1",
+        name="read_file",
+        arguments={"path": "../outside.c"},
+        raw_arguments='{"path":"../outside.c"}',
+    )
+    invalid_retry = ToolCall(
+        id="call-2",
+        name="read_file",
+        arguments={"path": "../outside.c"},
+        raw_arguments='{"path":"../outside.c"}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", invalid),
+            _completion("", invalid_retry),
+            _completion(json.dumps({"summary": "done", "findings": []})),
+        ]
+    )
+    settings = ReviewSettings(max_tool_rounds=8)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=15,
+        patchset_number=1,
+        revision_sha="3" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    result = await engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        tool_trace=capture,
+    )
+
+    assert result.findings == []
+    statuses = [event.get("status") for event in trace if event.get("event") == "tool_call"]
+    assert statuses == ["error", "error"]
 
 
 @pytest.mark.asyncio
@@ -219,6 +442,46 @@ async def test_context_overflow_splits_diff_instead_of_retrying_same_prompt(tmp_
     first_prompt = llm.seen_messages[0][1]["content"]
     retry_prompt = llm.seen_messages[1][1]["content"]
     assert len(retry_prompt) < len(first_prompt)
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_after_tool_round_keeps_spent_usage(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    diff = "+changed();\n" * 800
+    read = ToolCall(
+        id="call-1",
+        name="read_file",
+        arguments={"path": "fw.c"},
+        raw_arguments='{"path":"fw.c"}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", read),
+            ContextLengthError("maximum context length"),
+            _completion(json.dumps({"summary": "done", "findings": []})),
+            _completion(json.dumps({"summary": "done", "findings": []})),
+        ]
+    )
+    settings = ReviewSettings(max_diff_chunk_chars=20_000)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=16,
+        patchset_number=1,
+        revision_sha="4" * 40,
+        diff=diff,
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    # 10/5 from the abandoned tool round plus 10/5 for each successful split chunk.
+    assert result.input_tokens == 30
+    assert result.output_tokens == 15
 
 
 @pytest.mark.asyncio

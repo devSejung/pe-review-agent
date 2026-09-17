@@ -269,7 +269,30 @@ class ReviewWorker:
                     return
                 review_attempt = await self._start_attempt(job, AttemptStage.REVIEW, worker_id)
                 try:
-                    review = await self.engine.review(context, tools)
+
+                    async def tool_trace(event: dict[str, object]) -> None:
+                        try:
+                            await self.store.append_attempt_tool_event(
+                                review_attempt.id,
+                                dict(event),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "failed to persist review tool trace",
+                                extra={
+                                    "job_id": str(job.id),
+                                    "attempt_id": review_attempt.id,
+                                },
+                            )
+                        log_event(
+                            logger,
+                            "review repository tool",
+                            job_id=str(job.id),
+                            attempt_id=review_attempt.id,
+                            **event,
+                        )
+
+                    review = await self.engine.review(context, tools, tool_trace=tool_trace)
                     if review.review_metadata.get("lineage_complete", True):
                         review = reconcile_finding_lineage(
                             project=job.project,
@@ -554,9 +577,7 @@ class ReviewWorker:
                 )
                 await self._schedule_retry(job.id, AttemptStage.RECONCILE, worker_id, exc)
                 return
-            await self._finish_attempt_if_open(
-                attempt, success=False, retryable=False, error=exc
-            )
+            await self._finish_attempt_if_open(attempt, success=False, retryable=False, error=exc)
             await self.store.mark_superseded(job.id, worker_id=worker_id)
             METRICS.superseded_total.labels(project=job.project).inc()
             return
@@ -807,9 +828,7 @@ async def run_reconciler(
 ) -> None:
     interval = settings.service.reconcile_interval_seconds
     overlap = timedelta(seconds=max(60, interval))
-    full_sweep_interval = timedelta(
-        seconds=settings.service.reconcile_full_sweep_interval_seconds
-    )
+    full_sweep_interval = timedelta(seconds=settings.service.reconcile_full_sweep_interval_seconds)
     while True:
         project_cutoffs: dict[str, datetime | None] | None = None
         project_scopes = ()
@@ -852,11 +871,7 @@ async def run_reconciler(
             # Change omitted by a temporarily stale Gerrit secondary index is never aged out
             # forever.
             since = (
-                None
-                if full_sweep_due
-                else watermark - overlap
-                if watermark is not None
-                else None
+                None if full_sweep_due else watermark - overlap if watermark is not None else None
             )
             events = await gerrit.reconciliation_events(
                 since=since,

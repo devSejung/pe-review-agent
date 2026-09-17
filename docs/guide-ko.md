@@ -906,6 +906,8 @@ review:
   output_language: "ko-KR"
   max_findings: 8
   min_confidence: 0.82
+  # 기본 8. 실제 repo 탐색량이 많으면 16 전후부터 조정하고, 무작정 크게 올리지 않습니다.
+  max_tool_rounds: 8
 
 service:
   enabled: true
@@ -1508,8 +1510,23 @@ Company HTTPS / SSO reverse proxy
 - Gerrit REST/SSH/Stream Events 테스트
 - Qwen endpoint/model 설정
 - Qwen `/models` 테스트
+- 현재 연결값이 `config.yaml`인지 saved Admin override인지 확인
+- **Use config.yaml values**로 Gerrit/LLM Admin override 제거
+- REST auth가 필요한 경우 실제 secret 값이 아니라 필요한 env 이름과 configured/missing 상태 확인
 
 connection metadata 변경은 저장 후 receiver/worker/reconciler restart가 필요합니다.
+Admin Web에서 직접 저장한 항목만 DB override가 되며, 저장하지 않은 connection 값은 계속
+`config.yaml`을 따릅니다. `Use config.yaml values`를 누른 뒤에도 long-lived client에는 restart가
+필요합니다.
+
+이전 버전에서 업그레이드한 DB에는 과거의 전체 config snapshot이 남아 있을 수 있습니다.
+현재 `config.yaml`과 완전히 같은 legacy section은 시작 시 자동 정리합니다. 값이 다른 snapshot은
+과거 Admin 수정일 수도 있으므로 임의 삭제하지 않고 Connections에 경고를 표시합니다. 이 경우
+현재 파일을 확인한 뒤 YAML을 기준으로 쓸 것이 맞으면 **Use config.yaml values**를 한 번 눌러
+Gerrit/LLM snapshot을 명시적으로 제거합니다.
+
+같은 방식으로 legacy `review` snapshot이 남아 있으면 **Settings** 상단에 경고와
+**Use config.yaml values** 버튼이 표시됩니다. 이 버튼은 review-policy override만 제거합니다.
 
 ### Jobs
 
@@ -1532,8 +1549,10 @@ connection metadata 변경은 저장 후 receiver/worker/reconciler restart가 �
 - revision SHA
 - policy version
 - 전체 attempt timeline
-- stage별 성공/실패
+- stage별 성공/실패/running/abandoned
 - 전체 error text
+- REVIEW attempt의 repository tool trace(round/phase/tool/args/result preview)
+- duplicate tool suppression 및 forced finalization 사유
 - Qwen summary
 - finding 목록
 - severity
@@ -1877,6 +1896,20 @@ process-level stack trace와 전체 structured JSON을 확인합니다.
 - timeout 확인
 
 job은 PostgreSQL에 남아 있습니다.
+
+### `repository tool-call rounds` 반복 / tool loop
+
+과거처럼 `max_tool_rounds`만 계속 키우는 방식으로 대응하지 않습니다.
+
+- Job Audit의 **Repository tool trace**에서 실제 `read_file`, `search_text`, `list_files` 호출을 확인
+- 동일 tool + 동일 args 반복은 두 번째부터 자동 suppress됨
+- 한 round 전체가 duplicate이면 즉시 tool 사용을 중단하고 final JSON 생성을 강제
+- round budget을 다 써도 리뷰 전체를 transient failure로 버리지 않고, tools를 제거한 마지막
+  LLM 호출에서 지금까지 확보한 근거만으로 final JSON을 생성
+- 운영값은 8~16 정도에서 시작해 실제 trace를 보고 조정하고, 설정상 최대값은 64
+
+따라서 작은 테스트 commit에서 8/16 round를 반복 소진한다면 단순히 64로 올리기보다 먼저
+Job Audit trace에서 어떤 탐색을 반복했는지 확인합니다.
 
 ### Gerrit 403
 

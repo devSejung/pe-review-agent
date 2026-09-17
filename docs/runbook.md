@@ -165,6 +165,25 @@ pause/resume take effect live. Gerrit endpoint/auth metadata, LLM endpoint/model
 changes are saved durably but require restarting receiver/worker/reconciler so active clients are not
 mutated mid-review.
 
+Admin Web stores only fields that an operator explicitly overrides. On **Connections**, the source
+banner shows whether Gerrit/LLM values currently come from `config.yaml` or saved Admin overrides.
+**Use config.yaml values** clears the Gerrit/LLM overrides; restart the long-lived services afterward.
+The page reports REST secrets as `not required`, `configured`, or `missing` and shows the expected
+environment-variable name, never the secret value itself.
+
+For model browsing loops, keep `review.max_tool_rounds` near the normal operating value (8-16 is a
+reasonable starting range; the validated ceiling is 64) rather than using a very large number as the
+primary fix. The reviewer suppresses identical read-only tool calls within a model tool session and,
+when the round budget is exhausted, disables repository tools for one final JSON response instead of
+discarding the whole review. The Job Audit page records the bounded tool trace and forced-finalization
+reason for diagnosis.
+
+Upgrade note: older releases stored a full runtime snapshot. At startup, a legacy section that is
+identical to the current `config.yaml` is removed automatically. A differing full snapshot is retained
+to avoid deleting a potentially intentional Admin edit; Connections or Settings shows a warning for
+the corresponding section. After verifying the deployment file, use **Use config.yaml values** when
+the YAML should win.
+
 **Settings -> Review language** selects the human-facing language injected into both the candidate
 review and independent-verifier prompts. The default is `ko-KR`; `en-US` is also available. Function
 names, variables, macros, register names, paths, commands, literals, and error codes are instructed to
