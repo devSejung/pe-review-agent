@@ -342,6 +342,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
             json={
                 "review": {
                     "policy_version": "firmware-v2",
+                    "output_language": "en-US",
                     "max_findings": 6,
                     "min_confidence": 0.9,
                 },
@@ -349,6 +350,9 @@ def test_admin_live_controls_runtime_config_and_requeue(
         )
         assert saved_review.status_code == 200
         assert saved_review.json()["restart_required"] is True
+
+        settings_page = client.get("/settings", auth=auth)
+        assert 'value="en-US" selected' in settings_page.text
 
         connections = client.get("/connections", auth=auth)
         assert "gerrit-new" in connections.text

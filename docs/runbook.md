@@ -107,6 +107,11 @@ pause/resume take effect live. Gerrit endpoint/auth metadata, LLM endpoint/model
 changes are saved durably but require restarting receiver/worker/reconciler so active clients are not
 mutated mid-review.
 
+**Settings -> Review language** selects the human-facing language injected into both the candidate
+review and independent-verifier prompts. The default is `ko-KR`; `en-US` is also available. Function
+names, variables, macros, register names, paths, commands, literals, and error codes are instructed to
+remain verbatim rather than being translated.
+
 Use **Projects -> Add Gerrit project** for the first test repository. The project name must be the
 exact Gerrit project path (for example `platform/dmc-fw`). Use **Test** to verify REST Read access
 and Git/SSH fetch access before enabling it.

@@ -21,7 +21,8 @@
       <div class="card-header"><h3 class="card-title">Review policy</h3><div class="card-actions"><span class="badge bg-yellow-lt">Restart required</span></div></div>
       <div class="card-body">
         <div class="row g-3">
-          <div class="col-12"><label class="form-label">Policy version</label><input class="form-control" name="review.policy_version" value="{{ runtime.review.policy_version }}" required><div class="form-hint">Changing this creates a new durable job identity for future Patch Sets.</div></div>
+          <div class="col-md-8"><label class="form-label">Policy version</label><input class="form-control" name="review.policy_version" value="{{ runtime.review.policy_version }}" required><div class="form-hint">Changing this creates a new durable job identity for future Patch Sets.</div></div>
+          <div class="col-md-4"><label class="form-label">Review language</label><select class="form-select" name="review.output_language"><option value="ko-KR" {% if runtime.review.output_language == 'ko-KR' %}selected{% endif %}>한국어 (ko-KR)</option><option value="en-US" {% if runtime.review.output_language == 'en-US' %}selected{% endif %}>English (en-US)</option></select><div class="form-hint">Code identifiers and register names are never translated.</div></div>
           <div class="col-md-6"><label class="form-label">Max findings</label><input class="form-control" type="number" min="0" max="50" name="review.max_findings" value="{{ runtime.review.max_findings }}"></div>
           <div class="col-md-6"><label class="form-label">Min confidence</label><input class="form-control" type="number" step="0.01" min="0" max="1" name="review.min_confidence" value="{{ runtime.review.min_confidence }}"></div>
         </div>

@@ -337,7 +337,10 @@ The UI has six operational surfaces:
 - **Logs** — browse receiver/worker/reconciler/admin structured logs, filter by component/level/text,
   auto-refresh every five seconds, and expand the complete JSON/exception traceback instead of a
   truncated one-line error.
-- **Settings** — live global pause/resume plus review-policy controls.
+- **Settings** — live global pause/resume plus review-policy controls, including the human-facing
+  review language. The default is Korean (`ko-KR`); English (`en-US`) can be selected. The prompt
+  explicitly keeps code identifiers, paths, macros, register names, literals, and error codes in
+  their original form.
 
 Project enable/disable and the global service switch are live DB-backed controls. Disabled projects
 are filtered at event ingestion, reconciliation, **and the PostgreSQL claim query**, so queued work is

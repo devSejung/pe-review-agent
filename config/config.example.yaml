@@ -41,6 +41,8 @@ repos:
 
 review:
   policy_version: "firmware-v1"
+  # Human-facing Gerrit review text. Code identifiers, symbols, paths, and register names stay as-is.
+  output_language: "ko-KR"
   max_findings: 8
   min_confidence: 0.82
   max_tool_rounds: 8
