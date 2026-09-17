@@ -1679,11 +1679,24 @@ Disable하면:
 
 ## 21. 리뷰가 실제 Gerrit에 어떻게 표시되는가
 
-`ko-KR` prompt를 따르는 일반적인 Change-level summary 예:
+Change-level summary는 **변경 요약**과 **리뷰 결과**를 분리합니다. finding이 0건이어도
+변경 요약은 유지됩니다.
+
+`ko-KR`의 0-finding 예:
 
 ```text
-검증된 수정 필요 결함 2건을 찾았습니다.
+변경 요약
+- LPDDR PHY register init table과 training sequence를 갱신합니다.
+- 관련 register mapping을 함께 수정합니다.
+
+리뷰 결과
+- 추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다.
 ```
+
+리뷰 모델에는 Gerrit Change `subject`, target `branch`, 현재 Patch Set의 bounded commit message도
+전달합니다. 이 metadata는 작성자 의도를 이해하기 위한 **참고 정보**일 뿐이며, 오래되거나
+부정확할 수 있으므로 실제 변경 내용은 Patch Set diff를 authoritative source로 사용합니다.
+commit message와 Change metadata는 prompt instruction이 아닌 untrusted data로 취급합니다.
 
 inline finding은 file/line/range에 native comment로 붙습니다.
 

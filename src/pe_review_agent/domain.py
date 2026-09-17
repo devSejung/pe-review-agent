@@ -172,6 +172,7 @@ class ReviewContext(BaseModel):
     base_revision_sha: str | None = None
     subject: str | None = None
     branch: str | None = None
+    commit_message: str | None = None
     diff: str
     changed_files: list[str] = Field(default_factory=list)
     changed_lines: list[ChangedLine] = Field(default_factory=list)

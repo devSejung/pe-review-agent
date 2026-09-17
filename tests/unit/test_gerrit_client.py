@@ -59,6 +59,7 @@ def _change_info(
                 "ref": f"refs/changes/{number % 100:02d}/{number}/{patchset}",
                 "uploader": {"username": "alice"},
                 "created": created or updated,
+                "commit": {"message": "Fix memory ordering\n\nAvoid stale reads."},
             }
         },
     }
@@ -82,15 +83,16 @@ async def test_get_change_handles_xssi_prefix_and_context_path() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
         client = GerritRestClient(_settings(), client=http_client)
-        change = await client.get_change("team/fw", 123)
+        change = await client.get_change("team/fw", 123, include_commit=True)
 
     assert change.current_revision == REVISION
     assert change.patchset_number == 4
     assert change.ref == "refs/changes/23/123/4"
+    assert change.commit_message == "Fix memory ordering\n\nAvoid stale reads."
     assert seen[0].url.raw_path.decode().split("?", 1)[0] == (
         "/gerrit/changes/team%2Ffw~123/detail"
     )
-    assert seen[0].url.params.get_list("o") == ["CURRENT_REVISION"]
+    assert seen[0].url.params.get_list("o") == ["CURRENT_REVISION", "CURRENT_COMMIT"]
 
 
 @pytest.mark.asyncio
@@ -108,6 +110,7 @@ async def test_basic_auth_uses_authenticated_a_prefix(monkeypatch: pytest.Monkey
         await client.get_change("team/fw", 123)
 
     assert seen[0].url.path.startswith("/gerrit/a/changes/")
+    assert seen[0].url.params.get_list("o") == ["CURRENT_REVISION"]
     assert seen[0].headers["Authorization"].startswith("Basic ")
 
 

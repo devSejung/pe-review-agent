@@ -225,7 +225,10 @@ class ReviewWorker:
         failure_stage = AttemptStage.FETCH
         try:
             change = await self.gerrit.ensure_current_revision(
-                job.project, job.change_number, job.revision_sha
+                job.project,
+                job.change_number,
+                job.revision_sha,
+                include_commit=True,
             )
             async with self.repos.workspace(
                 project=job.project,
@@ -258,6 +261,7 @@ class ReviewWorker:
                     patchset_number=job.patchset_number,
                     subject=change.subject,
                     branch=change.branch,
+                    commit_message=change.commit_message,
                     policy_text=policy_text,
                 )
                 history = await self.store.load_finding_history(job.id)

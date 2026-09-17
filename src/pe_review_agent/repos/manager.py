@@ -396,6 +396,7 @@ class RepositoryManager:
         patchset_number: int,
         subject: str | None,
         branch: str | None,
+        commit_message: str | None,
         policy_text: str,
     ) -> ReviewContext:
         return ReviewContext(
@@ -406,6 +407,7 @@ class RepositoryManager:
             base_revision_sha=workspace.base_revision_sha,
             subject=subject,
             branch=branch,
+            commit_message=commit_message,
             diff=workspace.diff,
             changed_files=workspace.changed_files,
             changed_lines=workspace.changed_lines,

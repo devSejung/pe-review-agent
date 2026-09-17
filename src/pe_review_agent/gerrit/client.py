@@ -48,6 +48,7 @@ class GerritChange:
     branch: str | None
     change_id: str | None
     subject: str | None
+    commit_message: str | None
     updated: str | None
     revision_created: datetime | None
     raw: dict[str, Any]
@@ -118,12 +119,21 @@ class GerritRestClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def get_change(self, project: str, change_number: int) -> GerritChange:
+    async def get_change(
+        self,
+        project: str,
+        change_number: int,
+        *,
+        include_commit: bool = False,
+    ) -> GerritChange:
         self._allowlist.require(project)
+        options = [("o", "CURRENT_REVISION")]
+        if include_commit:
+            options.append(("o", "CURRENT_COMMIT"))
         payload = await self._request_json(
             "GET",
             f"changes/{_change_identifier(project, change_number)}/detail",
-            params=[("o", "CURRENT_REVISION")],
+            params=options,
         )
         if not isinstance(payload, Mapping):
             raise TransientError("Gerrit Get Change returned a non-object JSON response")
@@ -150,8 +160,10 @@ class GerritRestClient:
         project: str,
         change_number: int,
         revision_sha: str,
+        *,
+        include_commit: bool = False,
     ) -> GerritChange:
-        change = await self.get_change(project, change_number)
+        change = await self.get_change(project, change_number, include_commit=include_commit)
         if change.status != "NEW":
             raise PermanentError(
                 f"Gerrit change {project}~{change_number} is not open (status={change.status})"
@@ -571,6 +583,11 @@ def _parse_change(
     if not isinstance(status, str) or not status:
         raise TransientError("Gerrit ChangeInfo is missing status")
 
+    commit = revision.get("commit")
+    commit_message = (
+        _optional_string(commit.get("message")) if isinstance(commit, Mapping) else None
+    )
+
     return GerritChange(
         project=expected_project,
         change_number=expected_number,
@@ -581,6 +598,7 @@ def _parse_change(
         branch=_optional_string(payload.get("branch")),
         change_id=_optional_string(payload.get("change_id")),
         subject=_optional_string(payload.get("subject")),
+        commit_message=commit_message,
         updated=_optional_string(payload.get("updated")),
         revision_created=_gerrit_timestamp(_optional_string(revision.get("created"))),
         raw=dict(payload),
