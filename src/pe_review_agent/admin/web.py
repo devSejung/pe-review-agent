@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -23,7 +23,7 @@ from sqlalchemy import text
 from pe_review_agent.config import Settings
 from pe_review_agent.db import Database
 from pe_review_agent.gerrit import GerritEventStream, GerritRestClient
-from pe_review_agent.jobs import JobStore
+from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
 from pe_review_agent.llm import LlmClient
 from pe_review_agent.repos import RepositoryManager
 from pe_review_agent.retry import PermanentError, TransientError
@@ -38,11 +38,17 @@ _BASIC = HTTPBasic(auto_error=False)
 class ProjectCreate(BaseModel):
     project: str = Field(min_length=1, max_length=512)
     enabled: bool = True
+    review_start_mode: Literal["FROM_NOW", "INCLUDE_OPEN"] = "FROM_NOW"
 
 
 class ProjectToggle(BaseModel):
     project: str = Field(min_length=1, max_length=512)
     enabled: bool
+
+
+class ProjectReviewStartUpdate(BaseModel):
+    project: str = Field(min_length=1, max_length=512)
+    review_start_mode: Literal["FROM_NOW", "INCLUDE_OPEN"]
 
 
 class ServiceToggle(BaseModel):
@@ -249,8 +255,18 @@ def create_admin_app(settings: Settings) -> FastAPI:
                 ),
             )
         control: ControlStore = request.app.state.control
-        project = await control.upsert_project(payload.project, enabled=payload.enabled)
-        return {"ok": True, "project": project.project, "enabled": project.enabled}
+        project = await control.upsert_project(
+            payload.project,
+            enabled=payload.enabled,
+            review_start_mode=ProjectReviewStartMode(payload.review_start_mode),
+        )
+        return {
+            "ok": True,
+            "project": project.project,
+            "enabled": project.enabled,
+            "review_start_mode": project.review_start_mode.value,
+            "review_start_at": project.review_start_at,
+        }
 
     @app.post("/api/projects/toggle")
     async def toggle_project(
@@ -265,6 +281,28 @@ def create_admin_app(settings: Settings) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="project not found") from exc
         return {"ok": True, "project": project.project, "enabled": project.enabled}
+
+    @app.post("/api/projects/review-start")
+    async def set_project_review_start(
+        request: Request,
+        payload: ProjectReviewStartUpdate,
+        _: str = Depends(auth_dependency),
+    ):
+        _verify_csrf(request)
+        control: ControlStore = request.app.state.control
+        try:
+            project = await control.set_project_review_start_mode(
+                payload.project,
+                ProjectReviewStartMode(payload.review_start_mode),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        return {
+            "ok": True,
+            "project": project.project,
+            "review_start_mode": project.review_start_mode.value,
+            "review_start_at": project.review_start_at,
+        }
 
     @app.post("/api/projects/test")
     async def test_project(

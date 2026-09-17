@@ -5,16 +5,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pe_review_agent.config import Settings
-from pe_review_agent.domain import JobState
+from pe_review_agent.domain import TERMINAL_JOB_STATES, JobState
 from pe_review_agent.jobs.models import (
     Attempt,
     Job,
     ManagedProject,
+    ProjectReviewStartMode,
     Publication,
     ReviewFinding,
     ReviewResultRow,
@@ -28,6 +29,8 @@ _RUNTIME_CONFIG_KEY = "admin-runtime-config"
 class ManagedProjectRecord:
     project: str
     enabled: bool
+    review_start_mode: ProjectReviewStartMode
+    review_start_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -48,7 +51,12 @@ class ControlStore:
                     pg_insert(ManagedProject)
                     .values(
                         [
-                            {"project": project, "enabled": True}
+                            {
+                                "project": project,
+                                "enabled": True,
+                                "review_start_mode": ProjectReviewStartMode.FROM_NOW.value,
+                                "review_start_at": datetime.now(UTC),
+                            }
                             for project in settings.gerrit.projects
                         ]
                     )
@@ -190,6 +198,8 @@ class ControlStore:
                 ManagedProjectRecord(
                     project=row.project,
                     enabled=row.enabled,
+                    review_start_mode=ProjectReviewStartMode(row.review_start_mode),
+                    review_start_at=row.review_start_at,
                     created_at=row.created_at,
                     updated_at=row.updated_at,
                 )
@@ -208,29 +218,57 @@ class ControlStore:
             )
             return tuple(rows.all())
 
-    async def upsert_project(self, project: str, *, enabled: bool = True) -> ManagedProjectRecord:
+    async def enabled_project_scopes(self) -> tuple[ManagedProjectRecord, ...]:
+        """Return enabled projects with their durable reconciliation start policy."""
+
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(ManagedProject)
+                    .where(ManagedProject.enabled.is_(True))
+                    .order_by(ManagedProject.project.asc())
+                )
+            ).all()
+            return tuple(_managed_project_record(row) for row in rows)
+
+    async def upsert_project(
+        self,
+        project: str,
+        *,
+        enabled: bool = True,
+        review_start_mode: ProjectReviewStartMode = ProjectReviewStartMode.FROM_NOW,
+    ) -> ManagedProjectRecord:
         normalized = project.strip()
         if not normalized or len(normalized) > 512:
             raise ValueError("project must be between 1 and 512 characters")
         if any(ord(char) < 32 for char in normalized):
             raise ValueError("project cannot contain control characters")
+        now = datetime.now(UTC)
+        review_start_at = now if review_start_mode is ProjectReviewStartMode.FROM_NOW else None
         async with self._sessions.begin() as session:
             statement = (
                 pg_insert(ManagedProject)
-                .values(project=normalized, enabled=enabled)
+                .values(
+                    project=normalized,
+                    enabled=enabled,
+                    review_start_mode=review_start_mode.value,
+                    review_start_at=review_start_at,
+                )
                 .on_conflict_do_update(
                     index_elements=[ManagedProject.project],
-                    set_={"enabled": enabled, "updated_at": func.now()},
+                    set_={
+                        "enabled": enabled,
+                        "review_start_mode": review_start_mode.value,
+                        "review_start_at": review_start_at,
+                        "updated_at": func.now(),
+                    },
                 )
                 .returning(ManagedProject)
             )
             row = (await session.execute(statement)).scalar_one()
-            return ManagedProjectRecord(
-                project=row.project,
-                enabled=row.enabled,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
+            if review_start_mode is ProjectReviewStartMode.FROM_NOW:
+                await _skip_pre_cutoff_jobs(session, normalized, review_start_at)
+            return _managed_project_record(row)
 
     async def set_project_enabled(self, project: str, enabled: bool) -> ManagedProjectRecord:
         async with self._sessions.begin() as session:
@@ -238,14 +276,33 @@ class ControlStore:
             if row is None:
                 raise KeyError(project)
             row.enabled = enabled
+            if enabled and row.review_start_mode == ProjectReviewStartMode.FROM_NOW.value:
+                # Re-enabling FROM_NOW means exactly that: do not backfill Patch Sets uploaded while
+                # the project was disabled.
+                row.review_start_at = datetime.now(UTC)
+                await _skip_pre_cutoff_jobs(session, row.project, row.review_start_at)
             row.updated_at = datetime.now(UTC)
             await session.flush()
-            return ManagedProjectRecord(
-                project=row.project,
-                enabled=row.enabled,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
+            return _managed_project_record(row)
+
+    async def set_project_review_start_mode(
+        self,
+        project: str,
+        mode: ProjectReviewStartMode,
+    ) -> ManagedProjectRecord:
+        async with self._sessions.begin() as session:
+            row = await session.get(ManagedProject, project, with_for_update=True)
+            if row is None:
+                raise KeyError(project)
+            row.review_start_mode = mode.value
+            row.review_start_at = (
+                datetime.now(UTC) if mode is ProjectReviewStartMode.FROM_NOW else None
             )
+            if row.review_start_at is not None:
+                await _skip_pre_cutoff_jobs(session, row.project, row.review_start_at)
+            row.updated_at = datetime.now(UTC)
+            await session.flush()
+            return _managed_project_record(row)
 
     async def project_enabled(self, project: str, *, fallback: tuple[str, ...] = ()) -> bool:
         async with self._sessions() as session:
@@ -461,3 +518,54 @@ def _job_dict(job: Job) -> dict[str, Any]:
         "created_at": job.created_at,
         "updated_at": job.updated_at,
     }
+
+
+def _managed_project_record(row: ManagedProject) -> ManagedProjectRecord:
+    return ManagedProjectRecord(
+        project=row.project,
+        enabled=row.enabled,
+        review_start_mode=ProjectReviewStartMode(row.review_start_mode),
+        review_start_at=row.review_start_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+async def _skip_pre_cutoff_jobs(
+    session: AsyncSession,
+    project: str,
+    cutoff: datetime,
+) -> None:
+    """Stop queued backfill work when a project returns to FROM_NOW.
+
+    Jobs with an external publication intent are deliberately excluded. A Gerrit POST may already
+    be ambiguous and must continue through the normal reconciliation path.
+    """
+
+    now = datetime.now(UTC)
+    publication_exists = exists(
+        select(1).select_from(Publication).where(Publication.job_id == Job.id)
+    )
+    await session.execute(
+        update(Job)
+        .where(
+            Job.project == project,
+            Job.created_at < cutoff,
+            Job.state.not_in([state.value for state in TERMINAL_JOB_STATES]),
+            or_(
+                Job.lease_owner.is_(None),
+                Job.lease_expires_at.is_(None),
+                Job.lease_expires_at <= now,
+            ),
+            ~publication_exists,
+        )
+        .values(
+            state=JobState.SKIPPED_SCOPE.value,
+            retry_state=None,
+            lease_owner=None,
+            lease_expires_at=None,
+            last_error_class="ReviewScopeChanged",
+            last_error="Skipped because project review scope changed to FROM_NOW.",
+            updated_at=func.now(),
+        )
+    )

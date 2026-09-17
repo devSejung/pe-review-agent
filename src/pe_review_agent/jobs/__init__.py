@@ -1,6 +1,7 @@
 from pe_review_agent.jobs.models import (
     Attempt,
     Job,
+    ProjectReviewStartMode,
     Publication,
     PublicationStatus,
     ReviewFinding,
@@ -13,6 +14,7 @@ __all__ = [
     "Job",
     "JobRecord",
     "JobStore",
+    "ProjectReviewStartMode",
     "Publication",
     "PublicationStatus",
     "PublishGuardStatus",

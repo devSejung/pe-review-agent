@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -21,12 +22,14 @@ class JobState(StrEnum):
     FAILED_TRANSIENT = "FAILED_TRANSIENT"
     FAILED_PERMANENT = "FAILED_PERMANENT"
     SUPERSEDED = "SUPERSEDED"
+    SKIPPED_SCOPE = "SKIPPED_SCOPE"
     DONE = "DONE"
 
 
 TERMINAL_JOB_STATES = {
     JobState.FAILED_PERMANENT,
     JobState.SUPERSEDED,
+    JobState.SKIPPED_SCOPE,
     JobState.DONE,
 }
 
@@ -65,6 +68,7 @@ class GerritPatchsetEvent(BaseModel):
     branch: str | None = None
     change_id: str | None = None
     uploader: str | None = None
+    occurred_at: datetime | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
 

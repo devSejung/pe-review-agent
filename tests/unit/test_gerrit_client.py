@@ -41,6 +41,7 @@ def _change_info(
     patchset: int = 4,
     more: bool = False,
     updated: str = "2026-09-16 06:00:00.000000000",
+    created: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": f"{project}~main~Ideadbeef",
@@ -57,6 +58,7 @@ def _change_info(
                 "_number": patchset,
                 "ref": f"refs/changes/{number % 100:02d}/{number}/{patchset}",
                 "uploader": {"username": "alice"},
+                "created": created or updated,
             }
         },
     }
@@ -572,6 +574,41 @@ async def test_reconciliation_bootstrap_queries_all_open_allowlisted_changes() -
 
     assert len(events) == 1
     assert queries == ['status:open project:"team/fw"']
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_project_cutoff_avoids_old_open_patchsets() -> None:
+    queries: list[str] = []
+    cutoff = datetime(2026, 9, 16, 5, 30, tzinfo=UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.params["q"])
+        return _gerrit_json(
+            [
+                _change_info(
+                    number=201,
+                    updated="2026-09-16 06:10:00.000000000",
+                    created="2026-09-16 05:00:00.000000000",
+                ),
+                _change_info(
+                    number=202,
+                    revision=NEW_REVISION,
+                    patchset=2,
+                    updated="2026-09-16 06:05:00.000000000",
+                    created="2026-09-16 05:45:00.000000000",
+                ),
+            ]
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = GerritRestClient(_settings(), client=http_client)
+        events = await client.reconciliation_events(
+            since=None,
+            project_since={"team/fw": cutoff},
+        )
+
+    assert queries == ['status:open project:"team/fw" after:"2026-09-16 05:30:00 +0000"']
+    assert [(event.change_number, event.patchset_number) for event in events] == [(202, 2)]
 
 
 def test_review_input_caps_summary_and_inline_comments_by_utf8_bytes() -> None:

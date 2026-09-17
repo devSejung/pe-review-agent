@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -47,6 +47,11 @@ class PublicationStatus(StrEnum):
     POSTED = "POSTED"
     AMBIGUOUS = "AMBIGUOUS"
     FAILED = "FAILED"
+
+
+class ProjectReviewStartMode(StrEnum):
+    FROM_NOW = "FROM_NOW"
+    INCLUDE_OPEN = "INCLUDE_OPEN"
 
 
 class Base(DeclarativeBase):
@@ -264,9 +269,26 @@ class ServiceState(Base):
 
 class ManagedProject(Base):
     __tablename__ = "review_managed_projects"
+    __table_args__ = (
+        CheckConstraint(
+            f"review_start_mode IN ({_values(ProjectReviewStartMode)})",
+            name="ck_review_managed_projects_start_mode",
+        ),
+        CheckConstraint(
+            "(review_start_mode = 'FROM_NOW' AND review_start_at IS NOT NULL) OR "
+            "(review_start_mode = 'INCLUDE_OPEN' AND review_start_at IS NULL)",
+            name="ck_review_managed_projects_start_scope",
+        ),
+    )
 
     project: Mapped[str] = mapped_column(String(512), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    review_start_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ProjectReviewStartMode.FROM_NOW.value
+    )
+    review_start_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=lambda: datetime.now(UTC)
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,7 @@ from pe_review_agent.domain import (
     ReviewResult,
     Severity,
 )
-from pe_review_agent.jobs import JobStore
+from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
 from pe_review_agent.retry import PermanentError
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
@@ -195,6 +196,8 @@ async def test_concurrent_control_plane_bootstrap_is_idempotent(tmp_path: Path) 
         await asyncio.gather(*(control.ensure_bootstrap(settings) for _ in range(8)))
         projects = await control.list_projects()
         assert [(item.project, item.enabled) for item in projects] == [("team/fw", True)]
+        assert projects[0].review_start_mode is ProjectReviewStartMode.FROM_NOW
+        assert projects[0].review_start_at is not None
         runtime = await control.runtime_config(settings)
         assert runtime["gerrit"]["ssh_host"] == "gerrit"
     finally:
@@ -223,6 +226,58 @@ async def test_concurrent_runtime_patches_do_not_clobber_other_controls(tmp_path
         await control.set_project_enabled("team/fw", False)
         effective = await control.effective_settings(settings)
         assert effective.gerrit.projects == []
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_project_review_scope_can_switch_and_reenable_resets_from_now_cutoff(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        initial = (await control.list_projects())[0]
+        assert initial.review_start_mode is ProjectReviewStartMode.FROM_NOW
+        assert initial.review_start_at is not None
+
+        backfill = await control.set_project_review_start_mode(
+            "team/fw", ProjectReviewStartMode.INCLUDE_OPEN
+        )
+        assert backfill.review_start_mode is ProjectReviewStartMode.INCLUDE_OPEN
+        assert backfill.review_start_at is None
+
+        jobs = JobStore(database.sessions)
+        queued, _ = await jobs.enqueue(
+            GerritPatchsetEvent(
+                project="team/fw",
+                change_number=990,
+                patchset_number=1,
+                revision_sha="c" * 40,
+                ref="refs/changes/90/990/1",
+                branch="main",
+            ),
+            review_policy_version="firmware-v1",
+        )
+
+        before_from_now = datetime.now(UTC)
+        from_now = await control.set_project_review_start_mode(
+            "team/fw", ProjectReviewStartMode.FROM_NOW
+        )
+        assert from_now.review_start_at is not None
+        assert from_now.review_start_at >= before_from_now
+        queued_after = await jobs.get(queued.id)
+        assert queued_after is not None
+        assert queued_after.state is JobState.SKIPPED_SCOPE
+
+        await control.set_project_enabled("team/fw", False)
+        before_reenable = datetime.now(UTC)
+        reenabled = await control.set_project_enabled("team/fw", True)
+        assert reenabled.review_start_at is not None
+        assert reenabled.review_start_at >= before_reenable
     finally:
         await database.close()
 
@@ -282,9 +337,22 @@ def test_admin_requires_auth_and_mutations_are_csrf_protected(
         )
         assert added.status_code == 200
         assert added.json()["project"] == "team/new-fw"
+        assert added.json()["review_start_mode"] == "FROM_NOW"
+        assert added.json()["review_start_at"] is not None
+
+        backfill = client.post(
+            "/api/projects/review-start",
+            auth=("ops", "correct-horse"),
+            headers=headers,
+            json={"project": "team/new-fw", "review_start_mode": "INCLUDE_OPEN"},
+        )
+        assert backfill.status_code == 200
+        assert backfill.json()["review_start_mode"] == "INCLUDE_OPEN"
+        assert backfill.json()["review_start_at"] is None
 
         projects = client.get("/projects", auth=("ops", "correct-horse"))
         assert "team/new-fw" in projects.text
+        assert "Backfill enabled" in projects.text
 
 
 def test_admin_live_controls_runtime_config_and_requeue(

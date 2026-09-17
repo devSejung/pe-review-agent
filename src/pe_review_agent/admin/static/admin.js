@@ -97,6 +97,45 @@
     });
   });
 
+  document.querySelectorAll('[data-project-review-start]').forEach((select) => {
+    select.addEventListener('change', async () => {
+      const previous = select.dataset.previousValue || '';
+      if (!select.dataset.previousValue) select.dataset.previousValue = previous || select.value;
+      if (
+        select.value === 'INCLUDE_OPEN'
+        && !window.confirm(
+          'Include all currently open Changes? On established repositories this can enqueue a very large backfill.'
+        )
+      ) {
+        select.value = select.dataset.previousValue;
+        return;
+      }
+      select.disabled = true;
+      try {
+        const result = await api('/api/projects/review-start', {
+          method: 'POST',
+          body: JSON.stringify({
+            project: select.dataset.projectReviewStart,
+            review_start_mode: select.value,
+          }),
+        });
+        const backfill = result.review_start_mode === 'INCLUDE_OPEN';
+        show(
+          backfill
+            ? 'Backfill enabled. Reconciliation will include currently open Changes.'
+            : 'Review scope reset to From now on.',
+          backfill ? 'warning' : 'success',
+        );
+        window.setTimeout(() => window.location.reload(), 500);
+      } catch (error) {
+        if (select.dataset.previousValue) select.value = select.dataset.previousValue;
+        show(error.message, 'danger');
+        select.disabled = false;
+      }
+    });
+    select.dataset.previousValue = select.value;
+  });
+
   document.querySelectorAll('[data-connection-test]').forEach((button) => {
     button.addEventListener('click', async () => {
       button.disabled = true;

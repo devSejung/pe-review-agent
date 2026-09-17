@@ -49,6 +49,7 @@ class GerritChange:
     change_id: str | None
     subject: str | None
     updated: str | None
+    revision_created: datetime | None
     raw: dict[str, Any]
 
 
@@ -269,16 +270,27 @@ class GerritRestClient:
         self,
         *,
         since: datetime | None,
+        project_since: Mapping[str, datetime | None] | None = None,
         page_size: int = 100,
     ) -> list[GerritChange]:
         if since is not None and since.tzinfo is None:
             raise ValueError("since must be timezone-aware")
+        if project_since is not None:
+            for project, cutoff in project_since.items():
+                if cutoff is not None and cutoff.tzinfo is None:
+                    raise ValueError(f"project cutoff for {project!r} must be timezone-aware")
         if page_size < 1:
             raise ValueError("page_size must be positive")
 
-        since_utc = since.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S %z") if since else None
         changes: list[GerritChange] = []
         for project in self._allowlist.projects:
+            project_cutoff = project_since.get(project) if project_since is not None else None
+            effective_since = _latest_cutoff(since, project_cutoff)
+            since_utc = (
+                effective_since.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S %z")
+                if effective_since
+                else None
+            )
             base_query = f"status:open project:{_query_value(project)}"
             if since_utc:
                 base_query += f' after:"{since_utc}"'
@@ -350,11 +362,26 @@ class GerritRestClient:
         self,
         *,
         since: datetime | None,
+        project_since: Mapping[str, datetime | None] | None = None,
         page_size: int = 100,
     ) -> list[GerritPatchsetEvent]:
-        changes = await self.query_recent_open_changes(since=since, page_size=page_size)
+        changes = await self.query_recent_open_changes(
+            since=since,
+            project_since=project_since,
+            page_size=page_size,
+        )
         events: list[GerritPatchsetEvent] = []
         for change in changes:
+            project_cutoff = (
+                project_since.get(change.project) if project_since is not None else None
+            )
+            if project_cutoff is not None:
+                # The Gerrit `after:` operator filters by Change update time, not Patch Set creation
+                # time. An old open Change can therefore reappear after a comment or metadata
+                # update.
+                # Verify the current revision's own creation time before treating it as new work.
+                if change.revision_created is None or change.revision_created < project_cutoff:
+                    continue
             revision_info = change.raw.get("revisions", {}).get(change.current_revision, {})
             uploader = revision_info.get("uploader") if isinstance(revision_info, Mapping) else None
             raw = {
@@ -372,6 +399,7 @@ class GerritRestClient:
                     branch=change.branch,
                     change_id=change.change_id,
                     uploader=_account_name(uploader),
+                    occurred_at=change.revision_created,
                     raw=raw,
                 )
             )
@@ -554,6 +582,7 @@ def _parse_change(
         change_id=_optional_string(payload.get("change_id")),
         subject=_optional_string(payload.get("subject")),
         updated=_optional_string(payload.get("updated")),
+        revision_created=_gerrit_timestamp(_optional_string(revision.get("created"))),
         raw=dict(payload),
     )
 
@@ -567,6 +596,31 @@ def _change_identifier(project: str, change_number: int) -> str:
 def _query_value(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _latest_cutoff(first: datetime | None, second: datetime | None) -> datetime | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return max(first, second)
+
+
+def _gerrit_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?",
+        value,
+    )
+    if match is None:
+        return None
+    try:
+        base = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    fraction = (match.group(2) or "").ljust(6, "0")[:6]
+    return base.replace(microsecond=int(fraction or "0"))
 
 
 def _gerrit_search_boundary(value: str) -> str:
