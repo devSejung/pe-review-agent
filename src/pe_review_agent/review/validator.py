@@ -50,9 +50,7 @@ class FindingValidator:
                 target.relative_to(root)
             except ValueError:
                 continue
-            anchor_text = changed_lines.get(
-                (location.path, location.side, location.start_line)
-            )
+            anchor_text = changed_lines.get((location.path, location.side, location.start_line))
             if location.side == DiffSide.PARENT:
                 # Gerrit anchors deleted-code findings on the PARENT side. The candidate worktree
                 # may no longer contain the file at all, so validate active changed-line ranges
@@ -75,20 +73,21 @@ class FindingValidator:
             else:
                 if not target.is_file():
                     continue
-                try:
-                    lines = target.read_text(encoding="utf-8").splitlines()
-                except (OSError, UnicodeDecodeError):
+                requested_lines = {location.start_line}
+                if location.end_line is not None:
+                    requested_lines.add(location.end_line)
+                line_text = _read_utf8_lines(target, requested_lines)
+                if line_text is None:
                     continue
-                line_count = len(lines)
-                if location.start_line > line_count:
+                start_text = line_text.get(location.start_line)
+                if start_text is None:
                     continue
-                start_text = lines[location.start_line - 1]
                 if location.start_character > len(start_text):
                     continue
-                if location.end_line and location.end_line > line_count:
-                    continue
                 if location.end_line is not None:
-                    end_text = lines[location.end_line - 1]
+                    end_text = line_text.get(location.end_line)
+                    if end_text is None:
+                        continue
                     if location.end_character is None:
                         location.end_character = len(end_text)
                     if location.end_character > len(end_text):
@@ -106,3 +105,28 @@ class FindingValidator:
         severity_order = {Severity.P0: 0, Severity.P1: 1, Severity.P2: 2}
         accepted.sort(key=lambda item: (severity_order[item.severity], -item.confidence))
         return accepted[: self.settings.max_findings]
+
+
+def _read_utf8_lines(target: Path, line_numbers: set[int]) -> dict[int, str] | None:
+    """Read only requested UTF-8 lines while keeping memory independent of file size."""
+
+    if not line_numbers:
+        return {}
+    wanted = {line for line in line_numbers if line > 0}
+    if not wanted:
+        return {}
+    last_line = max(wanted)
+    result: dict[int, str] = {}
+    try:
+        with target.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if line_number in wanted:
+                    try:
+                        result[line_number] = raw_line.rstrip(b"\r\n").decode("utf-8")
+                    except UnicodeDecodeError:
+                        return None
+                if line_number >= last_line:
+                    break
+    except OSError:
+        return None
+    return result

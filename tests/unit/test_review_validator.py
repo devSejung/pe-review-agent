@@ -91,6 +91,59 @@ def test_validator_derives_multiline_end_character_from_file(tmp_path: Path) -> 
     assert accepted[0].location.end_character == len("d")
 
 
+def test_validator_streams_only_needed_lines_from_large_revision_file(tmp_path: Path) -> None:
+    relative = "build/tools/register/LPDDR56_PHY.csv"
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    with target.open("wb") as handle:
+        for index in range(40_000):
+            handle.write(f"REG_{index},0x{index:08x},FIELD_{index}\n".encode())
+        # Old read_text().splitlines() decoded the whole file and rejected this unrelated tail.
+        # Streaming validation must stop once the finding's requested lines have been read.
+        handle.write(b"\xff\xfe\x00\n")
+
+    start_line = 20_001
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=42,
+        patchset_number=2,
+        revision_sha="a" * 40,
+        diff="",
+        changed_files=[relative],
+        changed_lines=[
+            ChangedLine(
+                path=relative,
+                line=start_line,
+                text="REG_20000,0x00004e20,FIELD_20000",
+            )
+        ],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    finding = _finding(line=start_line)
+    finding.location = FindingLocation(
+        path=relative,
+        start_line=start_line,
+        end_line=start_line + 1,
+    )
+
+    accepted = FindingValidator(ReviewSettings()).validate(context, [finding])
+
+    assert len(accepted) == 1
+    assert accepted[0].location.end_character == len("REG_20001,0x00004e21,FIELD_20001")
+
+
+def test_validator_rejects_revision_anchor_past_end_of_file(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    prior = _finding(line=999)
+    prior.semantic_id = "b" * 32
+    context.previous_findings = [prior.model_copy(deep=True)]
+
+    accepted = FindingValidator(ReviewSettings()).validate(context, [prior])
+
+    assert accepted == []
+
+
 def test_previous_semantic_finding_can_persist_on_untouched_line(tmp_path: Path) -> None:
     context = _context(tmp_path)
     prior = _finding(line=2)
