@@ -4,6 +4,450 @@
 
 빠르게 설치만 하려면 `README.md`의 Production quick start를 봐도 되지만, 실제 팀 서비스로 운영할 때는 이 문서를 기준으로 보는 것을 권장합니다.
 
+## 처음 설치하는 사람은 여기만 위에서부터 그대로 따라하세요
+
+이 절은 **Docker는 이미 설치되어 있고**, Linux/Git/Docker에 익숙하지 않은 사람이 새 서버에서 처음
+설치한다는 기준으로 작성했습니다. 중간 단계를 건너뛰지 말고 위에서부터 순서대로 진행하세요.
+
+이 절을 따라가는 동안에는 다음 두 가지를 하지 않습니다.
+
+- `bootstrap-host.sh`를 실행하지 않습니다. 이미 사용할 Linux 계정이 있다면 필요 없습니다.
+- host의 `~/.ssh/id_ed25519_gerrit` 소유자/권한을 임의로 `10001`로 바꾸지 않습니다.
+
+container 내부 UID 처리는 나중에 `sudo ./install.sh`가 배포용 SSH key **복사본만** 알아서 처리합니다.
+
+### 1단계. 홈 디렉터리로 이동
+
+```bash
+cd ~
+pwd
+```
+
+예를 들어 다음처럼 나오면 정상입니다.
+
+```text
+/home/pe-review-agent
+```
+
+### 2단계. 소스 clone
+
+처음 설치하는 경우:
+
+```bash
+cd ~
+git clone https://github.com/devSejung/pe-review-agent.git
+cd pe-review-agent
+```
+
+이미 clone한 적이 있어서 `pe-review-agent` 폴더가 있다면 `git clone`을 다시 하지 말고 다음만 실행합니다.
+
+```bash
+cd ~/pe-review-agent
+git switch main
+git pull --ff-only
+```
+
+현재 위치 확인:
+
+```bash
+pwd
+```
+
+정상 예:
+
+```text
+/home/pe-review-agent/pe-review-agent
+```
+
+### 3단계. Docker가 실제로 동작하는지 확인
+
+Docker가 설치되어 있다는 것과 daemon이 실제로 동작하는 것은 별개입니다. 다음 두 명령을 실행합니다.
+
+```bash
+sudo docker ps
+sudo docker compose version
+```
+
+`sudo docker ps`가 표를 출력하고, `sudo docker compose version`이 버전을 출력하면 다음 단계로 갑니다.
+
+Docker daemon 연결 오류가 날 때만 다음을 실행합니다.
+
+```bash
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo docker ps
+```
+
+### 4단계. reviewer Docker image 만들기
+
+repo root에서 다음을 실행합니다.
+
+```bash
+cd ~/pe-review-agent
+sudo docker build -t gerrit-ai-reviewer:local .
+```
+
+완료 후 image가 생겼는지 확인합니다.
+
+```bash
+sudo docker image ls gerrit-ai-reviewer
+```
+
+`gerrit-ai-reviewer`와 `local` tag가 보이면 정상입니다.
+
+> 이 단계에서 public PyPI/apt/Docker registry 접근이 막혀 build가 실패하는 사내망이라면 억지로
+> 계속 진행하지 말고 아래의 **offline release 설치** 절을 사용하세요.
+
+### 5단계. PostgreSQL image 준비
+
+기본 Compose는 `pe-review-postgres:16.15`라는 local image tag를 사용합니다.
+
+```bash
+sudo docker pull \
+  postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+
+sudo docker tag \
+  postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 \
+  pe-review-postgres:16.15
+```
+
+확인:
+
+```bash
+sudo docker image ls pe-review-postgres
+```
+
+`pe-review-postgres`와 `16.15`가 보이면 정상입니다.
+
+### 6단계. 배포 디렉터리로 이동하고 설정 파일 복사
+
+```bash
+cd ~/pe-review-agent/deploy
+
+cp env.example .env
+cp ../config/config.example.yaml config.yaml
+```
+
+확인:
+
+```bash
+pwd
+ls -al .env config.yaml docker-compose.yml install.sh
+```
+
+현재 위치는 다음이어야 합니다.
+
+```text
+/home/pe-review-agent/pe-review-agent/deploy
+```
+
+### 7단계. `.env` 작성
+
+`.env`는 **현재 `deploy` 디렉터리 안에 그대로 둡니다.** 다른 위치로 옮기지 않습니다.
+
+```bash
+nano .env
+```
+
+기본 내용은 다음 형태입니다.
+
+```dotenv
+POSTGRES_PASSWORD=여기에_DB용_비밀번호
+REVIEWER_IMAGE=gerrit-ai-reviewer:local
+
+PE_REVIEW_LLM_API_KEY=
+PE_REVIEW_GERRIT_HTTP_PASSWORD=여기에_Gerrit_REST용_비밀번호
+PE_REVIEW_GERRIT_TOKEN=
+
+PE_REVIEW_ADMIN_PASSWORD=여기에_Admin웹_비밀번호
+
+ADMIN_BIND_ADDRESS=0.0.0.0
+ADMIN_PORT=8080
+WORKER_HEALTH_PORT=8081
+```
+
+의미는 다음과 같습니다.
+
+- `POSTGRES_PASSWORD`: 이 서비스 내부 PostgreSQL용 비밀번호입니다. 새로 정해서 넣으면 됩니다.
+- `PE_REVIEW_ADMIN_PASSWORD`: `http://서버IP:8080` Admin Web 로그인 비밀번호입니다. 새로 정합니다.
+- `PE_REVIEW_GERRIT_HTTP_PASSWORD`: Gerrit REST Basic 인증에 쓰는 비밀번호/HTTP credential입니다.
+- `PE_REVIEW_LLM_API_KEY`: 사내 Qwen/vLLM이 API key를 요구할 때만 넣습니다. 필요 없으면 비워둡니다.
+- `PE_REVIEW_GERRIT_TOKEN`: Bearer token 방식을 쓸 때만 넣습니다. Basic을 쓰면 비워둡니다.
+
+저장 후 권한을 줄입니다.
+
+```bash
+chmod 600 .env
+```
+
+### 8단계. `config.yaml` 작성
+
+```bash
+nano config.yaml
+```
+
+처음에는 예제 전체를 지우지 말고, 아래 값만 실제 환경에 맞게 수정하는 것이 안전합니다.
+
+```yaml
+gerrit:
+  ssh_host: "GERRIT_HOST"
+  ssh_port: 29418
+  ssh_user: "GERRIT_USER"
+  ssh_key_path: "/run/secrets/gerrit_ssh_key"
+  known_hosts_path: "/run/secrets/gerrit_known_hosts"
+  strict_host_key_checking: true
+  rest_url: "http://GERRIT_WEB_HOST:PORT"
+  rest_auth:
+    mode: "basic"
+    username: "GERRIT_USER"
+    password_env: "PE_REVIEW_GERRIT_HTTP_PASSWORD"
+  projects: []
+
+llm:
+  base_url: "http://QWEN_HOST:PORT/v1"
+  model: "실제_서빙_모델명"
+  api_key_env: "PE_REVIEW_LLM_API_KEY"
+
+review:
+  output_language: "ko-KR"
+```
+
+나머지 `database`, `repos`, `retry`, `service`, `admin` 값은 첫 설치에서는 예제 기본값을 그대로
+유지해도 됩니다.
+
+`projects: []`로 두면 리뷰 대상 project는 나중에 Admin Web에서 추가할 수 있습니다.
+
+### 9단계. Gerrit SSH key를 배포용으로 복사
+
+host에 이미 다음 파일이 있다고 가정합니다.
+
+```text
+~/.ssh/id_ed25519_gerrit
+~/.ssh/known_hosts
+```
+
+배포용 복사본을 만듭니다.
+
+```bash
+cd ~/pe-review-agent/deploy
+mkdir -p secrets
+
+cp ~/.ssh/id_ed25519_gerrit secrets/gerrit_ssh_key
+cp ~/.ssh/known_hosts secrets/gerrit_known_hosts
+```
+
+여기서 `chown 10001` 같은 명령은 직접 실행하지 않습니다.
+
+확인만 합니다.
+
+```bash
+ls -l secrets/gerrit_ssh_key secrets/gerrit_known_hosts
+```
+
+### 10단계. Docker를 띄우기 전에 Gerrit SSH 연결 확인
+
+아래에서 `GERRIT_USER`, `GERRIT_HOST`만 실제 값으로 바꿉니다.
+
+```bash
+ssh -T \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+  -i "$HOME/.ssh/id_ed25519_gerrit" \
+  -p 29418 \
+  GERRIT_USER@GERRIT_HOST \
+  gerrit version
+```
+
+Gerrit 버전이 출력되면 SSH key/user/host/port는 정상입니다.
+
+그 다음 `Stream Events` 권한을 확인합니다.
+
+```bash
+timeout 5 ssh -T \
+  -o BatchMode=yes \
+  -o IdentitiesOnly=yes \
+  -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+  -i "$HOME/.ssh/id_ed25519_gerrit" \
+  -p 29418 \
+  GERRIT_USER@GERRIT_HOST \
+  gerrit stream-events -s patchset-created
+```
+
+5초 동안 별도 오류 없이 기다리다 `timeout`으로 끝나면 정상입니다.
+
+`stream events not permitted`가 나오면 SSH 설정 문제가 아니라 Gerrit의 global `Stream Events`
+권한이 없는 것입니다. 관리자에게 권한을 요청한 뒤 계속 진행하세요.
+
+### 11단계. 서비스 설치 및 Docker Compose 실행
+
+이제 처음으로 실제 서비스를 띄웁니다.
+
+```bash
+cd ~/pe-review-agent/deploy
+sudo ./install.sh
+```
+
+이 명령 하나가 다음을 처리합니다.
+
+```text
+배포용 SSH key 권한 정리
+DB migration
+PostgreSQL 기동
+receiver 기동
+worker 기동
+reconciler 기동
+Admin Web 기동
+```
+
+host Linux 사용자의 UID가 1002여도 그대로 두면 됩니다. `install.sh`가 container가 읽는
+`deploy/secrets/` 복사본만 필요한 권한으로 맞춥니다.
+
+### 12단계. container 상태 확인
+
+```bash
+cd ~/pe-review-agent/deploy
+sudo docker compose ps -a
+```
+
+정상적인 상태는 대략 다음과 같습니다.
+
+```text
+postgres      Up / healthy
+migrate       Exited (0)
+receiver      Up
+worker        Up
+reconciler    Up
+admin         Up
+```
+
+`migrate`가 `Exited (0)`인 것은 실패가 아니라 정상입니다.
+
+### 13단계. Admin Web 접속
+
+브라우저에서 다음 주소를 엽니다.
+
+```text
+http://리뷰봇서버IP:8080/
+```
+
+로그인 정보:
+
+```text
+username: config.yaml의 admin.username (기본 admin)
+password: .env의 PE_REVIEW_ADMIN_PASSWORD
+```
+
+### 14단계. Admin Web에서 연결 확인
+
+Admin Web의 **Connections** 화면에서 다음을 순서대로 확인합니다.
+
+```text
+Gerrit REST
+Gerrit SSH
+Stream Events
+LLM
+```
+
+하나라도 실패하면 바로 project를 활성화하지 말고 해당 연결부터 고칩니다.
+
+### 15단계. 첫 리뷰 project 하나만 추가
+
+리뷰 대상 repo에서 다음 명령으로 Gerrit remote를 확인합니다.
+
+```bash
+git remote get-url origin
+```
+
+예를 들어:
+
+```text
+ssh://developer@gerrit.example.internal:29418/sw_product/example/repo
+```
+
+라면 Admin Web의 **Projects**에 넣을 값은 전체 URL이 아니라 다음 project path만입니다.
+
+```text
+sw_product/example/repo
+```
+
+처음에는 다음처럼 설정하는 것을 권장합니다.
+
+```text
+Scope: From now on
+Enabled: Yes
+```
+
+`From now on`은 이미 열려 있던 수천~수만 개의 Change를 한꺼번에 리뷰하지 않고, 활성화 이후의
+새 Patch Set부터 리뷰합니다.
+
+### 16단계. 첫 Patch Set으로 실제 동작 확인
+
+테스트용 Change에 새 Patch Set 하나를 올린 뒤 Admin Web의 **Jobs**에서 상태가 진행되는지 확인합니다.
+
+정상 흐름은 대략 다음과 같습니다.
+
+```text
+RECEIVED
+→ FETCHING / REVIEWING
+→ READY_TO_PUBLISH / PUBLISHING
+→ PUBLISHED
+```
+
+Gerrit Change 화면에서도 다음 두 가지가 보여야 합니다.
+
+```text
+Change-level review summary
+코드 라인에 붙은 native inline/range comment
+```
+
+### 17단계. 안 되면 먼저 이 로그만 확인
+
+```bash
+cd ~/pe-review-agent/deploy
+
+sudo docker compose logs --tail=200 admin
+sudo docker compose logs --tail=200 receiver
+sudo docker compose logs --tail=200 worker
+sudo docker compose logs --tail=200 reconciler
+```
+
+전체 로그를 실시간으로 보고 싶을 때만 다음을 사용합니다.
+
+```bash
+sudo docker compose logs -f
+```
+
+### 설치가 끝난 뒤 기억할 명령 4개
+
+상태 보기:
+
+```bash
+cd ~/pe-review-agent/deploy
+sudo docker compose ps -a
+```
+
+로그 보기:
+
+```bash
+sudo docker compose logs --tail=200
+```
+
+서비스 재시작:
+
+```bash
+sudo docker compose restart
+```
+
+서비스 내리기:
+
+```bash
+sudo docker compose down
+```
+
+`docker compose down`은 container를 내리지만 named volume의 PostgreSQL 데이터는 기본적으로 삭제하지
+않습니다. 데이터까지 삭제하는 `docker compose down -v`는 운영 중에는 사용하지 마세요.
+
 ---
 
 ## 0. 제일 먼저: 이 서비스는 Docker Compose로 실행합니다
@@ -319,7 +763,7 @@ git remote get-url origin
 예:
 
 ```text
-ssh://seungon.jung@gerrit.example.internal:29418/platform/dmc-fw
+ssh://developer@gerrit.example.internal:29418/platform/dmc-fw
 ```
 
 이 경우 project 이름은:
