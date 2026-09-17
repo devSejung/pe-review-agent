@@ -6,6 +6,86 @@
 
 ---
 
+## 0. 제일 먼저: 이 서비스는 Docker Compose로 실행합니다
+
+이 프로젝트는 기본적으로 bare Python 프로세스를 직접 띄우는 방식이 아니라 **Docker Compose**로
+실행합니다. 즉 운영 서버에는 최소한 다음 두 명령이 동작해야 합니다.
+
+```bash
+docker --version
+docker compose version
+```
+
+둘 다 버전이 출력되면 준비된 상태입니다.
+
+Docker가 설치되어 있지 않다면 회사 패키지 미러/서버 정책에 맞춰 **Docker Engine + Compose v2**를
+먼저 설치해야 합니다. Ubuntu 계열에서 흔히 사용하는 패키지는 `docker.io`와 Compose v2
+plugin이지만, 사내 apt mirror에 따라 정확한 패키지 이름은 다를 수 있습니다.
+
+설치 후에는 daemon 상태도 확인합니다.
+
+```bash
+sudo systemctl enable --now docker
+sudo docker info
+```
+
+### 이 프로젝트에서 Docker가 하는 일
+
+`docker-compose.yml`은 다음 container를 같이 띄웁니다.
+
+```text
+postgres     PostgreSQL durable DB
+migrate      DB migration을 한 번 수행하고 종료
+receiver     Gerrit stream-events 수신
+worker       repo fetch + Qwen review + Gerrit publish
+reconciler   누락 event / ambiguous publish 복구
+admin        :8080 Web UI
+```
+
+`migrate`가 `Exited (0)`으로 보이는 것은 정상입니다. migration을 한 번 끝내고 종료하는 one-shot
+container입니다.
+
+### 이미 `pe-review-agent` Linux 계정이 있는 서버라면
+
+`bootstrap-host.sh`는 **완전히 새 서버에서 UID 10001의 host 계정까지 새로 만드는 경우만** 위한
+선택 스크립트입니다. 이미 `pe-review-agent` 계정이 존재하고 UID가 1002 같은 다른 값이라면
+`bootstrap-host.sh`를 실행하지 마세요.
+
+host 사용자 UID와 container 내부 UID는 같을 필요가 없습니다.
+
+```text
+host Linux account
+pe-review-agent (예: UID 1002)
+
+Docker container 내부 reviewer
+pe-review-agent (UID 10001)
+```
+
+현재 배포에서 UID 10001이 중요한 곳은 container가 읽는 **배포용 SSH key 복사본**입니다.
+host의 `~/.ssh/id_ed25519_gerrit` 원본 ownership을 10001로 바꾸는 것이 아닙니다.
+
+### 가장 단순한 실행 순서
+
+repo를 직접 clone해서 서버에서 build할 수 있는 환경이라면 전체 흐름은 다음입니다.
+
+```text
+1. Docker / docker compose 확인
+2. reviewer Docker image 준비
+3. PostgreSQL Docker image 준비
+4. deploy/.env 작성
+5. deploy/config.yaml 작성
+6. deploy/secrets/에 SSH key 복사
+7. sudo ./install.sh
+8. docker compose ps 확인
+9. http://서버IP:8080 접속
+```
+
+사내 서버가 인터넷에 연결되지 않는다면 2~3번을 target server에서 하지 않고, 인터넷 가능한
+machine에서 release tarball을 만들어 옮기는 방식이 권장됩니다. 아래 15~16장에서 두 방식을 모두
+설명합니다.
+
+---
+
 ## 1. 이 서비스가 하는 일
 
 Gerrit AI Reviewer는 Gerrit에 새로운 Patch Set이 올라오면 자동으로 다음 흐름을 수행합니다.
@@ -438,6 +518,25 @@ JSON schema key, `P0/P1/P2`, `REVISION/PARENT` 같은 enum은 내부 처리 때�
 
 password, token, private key는 Git이나 `config.yaml`에 직접 넣지 않습니다.
 
+`.env`는 **`docker-compose.yml`과 같은 배포 디렉터리**에 둡니다.
+
+source checkout 기준:
+
+```text
+gerrit-ai-reviewer/
+└── deploy/
+    ├── docker-compose.yml
+    ├── install.sh
+    ├── config.yaml
+    ├── .env                  <- 여기
+    └── secrets/
+        ├── gerrit_ssh_key
+        └── gerrit_known_hosts
+```
+
+release tarball을 사용하는 경우에도 동일하게 **압축을 푼 디렉터리의 `install.sh` 옆**에
+`.env`, `config.yaml`, `secrets/`가 위치합니다.
+
 `.env` 예:
 
 ```dotenv
@@ -464,6 +563,21 @@ secrets/
 ```
 
 `install.sh`는 기본적으로 이 파일들을 container UID 10001 기준으로 맞추고 mode `0600`을 요구합니다.
+
+이미 host의 `~/.ssh`에 Gerrit key가 있다면 **원본은 그대로 두고 배포용 복사본을 만듭니다.**
+
+예:
+
+```bash
+cd deploy
+mkdir -p secrets
+
+cp ~/.ssh/id_ed25519_gerrit secrets/gerrit_ssh_key
+cp ~/.ssh/known_hosts secrets/gerrit_known_hosts
+```
+
+그 후 `sudo ./install.sh`를 실행하면 현재 install script가 배포용 복사본의 ownership을 container
+UID 10001로 맞춥니다. `~/.ssh/id_ed25519_gerrit` 원본 ownership은 변경하지 않습니다.
 
 ---
 
@@ -512,40 +626,199 @@ kill switch 오타가 조용히 무시되는 상황을 막기 위한 동작입�
 
 ---
 
-## 15. 인터넷이 되는 곳에서 offline release 만들기
+## 15. Docker image 준비 방법
 
-사내 서버가 인터넷이 안 되는 경우:
+설치 방식은 두 가지입니다.
+
+### 방법 A. 서버에서 직접 source를 build할 수 있는 경우
+
+target server가 public registry/PyPI에 접근 가능하거나 필요한 package/image가 이미 mirror에 있다면
+repo root에서 reviewer image를 직접 build할 수 있습니다.
+
+```bash
+cd ~/gerrit-ai-reviewer
+sudo docker build -t gerrit-ai-reviewer:local .
+```
+
+Compose는 PostgreSQL image를 `pe-review-postgres:16.15`라는 local tag로 사용합니다. 현재 release
+builder와 동일한 pinned PostgreSQL image를 준비하려면:
+
+```bash
+sudo docker pull \
+  postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+
+sudo docker tag \
+  postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 \
+  pe-review-postgres:16.15
+```
+
+이미지가 준비됐는지 확인:
+
+```bash
+sudo docker images | grep -E 'gerrit-ai-reviewer|pe-review-postgres'
+```
+
+최소 다음 두 image가 보여야 합니다.
+
+```text
+gerrit-ai-reviewer   local
+pe-review-postgres   16.15
+```
+
+### 방법 B. 사내 서버가 인터넷이 안 되는 경우 - 권장
+
+인터넷 가능한 machine에서 repo root 기준으로:
 
 ```bash
 ./deploy/build-release.sh 0.1.0
 ```
 
-생성된 release archive를 사내 Linux host로 옮깁니다.
+이 script가 자동으로:
 
-release에는 필요한 Docker image tarball이 포함되어 있으므로 target server가 PyPI나 public registry에 직접 연결될 필요가 없습니다.
+1. reviewer Docker image build
+2. pinned PostgreSQL image pull/tag
+3. 두 image를 tar로 저장
+4. Compose/install/config 예제 포함
+5. SHA256SUMS 생성
+6. release tar.gz 생성
+
+까지 수행합니다.
+
+결과 예:
+
+```text
+release/gerrit-ai-reviewer-0.1.0.tar.gz
+```
+
+이 파일만 사내 Linux host로 옮깁니다.
+
+사내 서버에서:
+
+```bash
+tar xzf gerrit-ai-reviewer-0.1.0.tar.gz
+cd gerrit-ai-reviewer-0.1.0
+```
+
+release 내부는 대략 다음 형태입니다.
+
+```text
+gerrit-ai-reviewer-0.1.0/
+├── docker-compose.yml
+├── install.sh
+├── .env.example
+├── config.example.yaml
+├── docker-images/
+│   ├── gerrit-ai-reviewer.tar
+│   └── postgres-16.tar
+└── secrets/
+```
+
+target server는 PyPI/public Docker registry에 접속할 필요가 없습니다. `install.sh`가 image tar를
+`docker load`합니다.
 
 ---
 
-## 16. 설치 및 실행
+## 16. 실제 설치 및 실행
 
-release 디렉터리에서:
+### A. source checkout에서 직접 실행하는 경우
+
+repo root에서 image 준비를 끝낸 뒤:
 
 ```bash
-./install.sh
+cd deploy
+
+cp env.example .env
+cp ../config/config.example.yaml config.yaml
+
+mkdir -p secrets
+cp ~/.ssh/id_ed25519_gerrit secrets/gerrit_ssh_key
+cp ~/.ssh/known_hosts secrets/gerrit_known_hosts
 ```
 
-정상 기동 시 주요 service는:
+`.env`와 `config.yaml`을 실제 환경에 맞게 수정합니다.
+
+그 다음:
+
+```bash
+sudo ./install.sh
+```
+
+### B. offline release에서 실행하는 경우
+
+압축을 푼 release 디렉터리에서:
+
+```bash
+cp .env.example .env
+cp config.example.yaml config.yaml
+
+mkdir -p secrets
+cp ~/.ssh/id_ed25519_gerrit secrets/gerrit_ssh_key
+cp ~/.ssh/known_hosts secrets/gerrit_known_hosts
+```
+
+`.env`, `config.yaml` 수정 후:
+
+```bash
+sudo ./install.sh
+```
+
+`install.sh`가 수행하는 실제 작업은 다음입니다.
 
 ```text
-postgres
-migrate
-receiver
-worker
-reconciler
-admin
+1. release라면 SHA256SUMS 검증
+2. release라면 Docker image tar를 docker load
+3. config.yaml / .env / SSH secret 존재 확인
+4. 배포용 SSH key ownership/mode 정리
+5. docker compose up -d
 ```
 
-입니다.
+즉 별도로 `docker compose up -d`를 다시 칠 필요는 없습니다.
+
+### 기동 상태 확인
+
+반드시 `docker-compose.yml`이 있는 디렉터리에서:
+
+```bash
+sudo docker compose ps
+```
+
+정상적인 모습은 대략 다음과 같습니다.
+
+```text
+postgres      Up / healthy
+migrate       Exited (0)
+receiver      Up
+worker        Up
+reconciler    Up
+admin         Up
+```
+
+`migrate`의 `Exited (0)`은 정상입니다.
+
+### 처음 기동했는데 문제가 있으면
+
+```bash
+sudo docker compose logs --tail=200 migrate
+sudo docker compose logs --tail=200 admin
+sudo docker compose logs --tail=200 receiver
+sudo docker compose logs --tail=200 worker
+sudo docker compose logs --tail=200 reconciler
+```
+
+전체를 실시간으로 보려면:
+
+```bash
+sudo docker compose logs -f
+```
+
+Admin health 확인:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:8080/readyz
+```
+
+둘 다 정상이라면 브라우저에서 `http://SERVER_IP:8080/`으로 접속하면 됩니다.
 
 ---
 
