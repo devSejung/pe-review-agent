@@ -64,9 +64,43 @@ port 5432 is not published to the host.
 
 When provisioning the Linux host as root, `bootstrap-host.sh` creates the dedicated
 `pe-review-agent` system account with UID **10001**, matching the unprivileged container runtime,
-and creates the recommended directories. If that account already exists with another UID the script
-stops rather than creating an unreadable `0600` SSH-key bind mount. It does not grant interactive
-login or Gerrit permissions.
+and creates the recommended directories. If that account already exists with another host UID, the
+script keeps the existing account unchanged; host UID equality is not required. `install.sh`
+normalizes only the deployment copies of the SSH files to container UID 10001. It does not grant
+interactive login or Gerrit permissions.
+
+## 3.1 Lifecycle and diagnostics scripts
+
+Run these from the deployment directory:
+
+```bash
+./start.sh
+./stop.sh
+./restart.sh
+./status.sh
+./logs.sh worker
+./doctor.sh
+```
+
+`stop.sh` preserves containers and named volumes. `restart.sh` recreates the Compose stack so `.env`
+and configuration changes are re-read while preserving PostgreSQL/repository named volumes.
+`install.sh` is the first-install path: it validates files/images, fixes deployment-secret ownership,
+and automatically remaps a host port if 8080/8081 is already owned by an unrelated process. Later
+start/restart operations fail instead of silently moving an established endpoint.
+
+For a new source checkout, use `configure.sh` to create `.env`, `config.yaml`, random local service
+passwords, and SSH deployment copies. For corporate network setup, copy `corporate.env.example` to
+the gitignored `corporate.env`, fill the company mirror/CA values once, then run:
+
+```bash
+./configure-corporate-host.sh
+./build-local.sh
+```
+
+The corporate-host script accepts PEM or DER X.509 files, installs normalized CA certificates,
+backs up and merges `/etc/docker/daemon.json`, restarts Docker, and leaves unrelated daemon keys
+untouched. The local image builder forwards the configured PyPI and Debian mirror values into the
+Docker build.
 
 ## 4. Offline install
 

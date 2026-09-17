@@ -284,6 +284,32 @@ disabled.
 
 ### 8. Install and start
 
+The deployment ships lifecycle helpers so operators do not need to remember raw Compose commands:
+
+```bash
+./install.sh          # first install; validates inputs and starts the stack
+./start.sh            # start an existing stopped stack
+./stop.sh             # stop without deleting containers or volumes
+./restart.sh          # recreate the stack so config/.env changes take effect
+./status.sh           # show all service states
+./logs.sh worker      # last 200 lines for one service
+./doctor.sh           # diagnose files, images, ports, Docker, and containers
+```
+
+On first install, if the configured Admin Web or worker-health host port is already occupied by an
+unrelated process, `install.sh` automatically selects the next free deployment port and writes it to
+`.env`. Normal `start.sh`/`restart.sh` never silently change an established endpoint.
+
+For a new source checkout, `deploy/configure.sh` can generate `.env`, `config.yaml`, random database
+and Admin Web passwords, and deployment copies of the Gerrit SSH key/known_hosts. It never changes
+the originals under `~/.ssh`.
+
+Corporate hosts can keep mirror and CA details in the gitignored `deploy/corporate.env` (copy it
+from `corporate.env.example`). `configure-corporate-host.sh` installs/normalizes the CA chain and
+merges the Docker registry mirror into `/etc/docker/daemon.json` without replacing unrelated Docker
+daemon settings. `build-local.sh` then reuses the configured PyPI and Debian mirror values for image
+builds.
+
 For an offline target, build the release on an internet-capable machine:
 
 ```bash

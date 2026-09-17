@@ -6,6 +6,41 @@
 
 ## 처음 설치하는 사람은 여기만 위에서부터 그대로 따라하세요
 
+### 먼저 기억할 운영 명령
+
+이제 Docker Compose 명령을 직접 외울 필요가 없습니다. `deploy` 디렉터리에서 다음 스크립트만
+사용하면 됩니다.
+
+```bash
+./start.sh             # 서버 켜기
+./stop.sh              # 서버 끄기 (DB/volume 삭제 안 함)
+./restart.sh           # 서버 재시작 + .env/config 변경 재반영
+./status.sh            # 현재 상태 보기
+./logs.sh              # 전체 최근 로그
+./logs.sh worker       # worker 로그만 보기
+./doctor.sh            # 파일/이미지/포트/Docker 상태 한 번에 진단
+```
+
+최초 설치만 `./install.sh`를 사용합니다. 첫 설치 때 `8080` 또는 worker health 포트가 이미 다른
+프로세스에 의해 사용 중이면 `install.sh`가 빈 포트를 찾아 `.env`에 자동 반영하고 최종 Admin Web
+주소를 출력합니다. 이미 운영 중인 서비스의 주소가 몰래 바뀌면 안 되므로 `start.sh`와
+`restart.sh`는 포트를 자동 변경하지 않습니다.
+
+사내망처럼 Docker registry CA, PyPI mirror, Debian apt mirror가 모두 필요한 환경은 한 번만
+`corporate.env.example`을 `corporate.env`로 복사해 회사 값을 채운 뒤 다음 두 스크립트를 사용합니다.
+
+```bash
+./configure-corporate-host.sh   # Docker mirror + 회사 CA chain 등록
+./build-local.sh                # PyPI/Debian mirror를 사용해 reviewer/Postgres image 준비
+```
+
+`corporate.env`는 Git에 올라가지 않습니다. 회사 내부 주소와 CA 파일 위치를 한 번 적어 두면 매번
+긴 `docker build --build-arg ...` 명령을 다시 입력할 필요가 없습니다.
+
+애플리케이션 설정도 직접 여러 파일을 만들기 싫다면 `./configure.sh`를 사용할 수 있습니다. 이
+스크립트는 `.env`, `config.yaml`, SSH key/known_hosts의 **배포용 복사본**을 만들고 DB/Admin Web
+비밀번호를 자동 생성합니다. `~/.ssh`의 원본 파일은 수정하지 않습니다.
+
 이 절은 **Docker는 이미 설치되어 있고**, Linux/Git/Docker에 익숙하지 않은 사람이 새 서버에서 처음
 설치한다는 기준으로 작성했습니다. 중간 단계를 건너뛰지 말고 위에서부터 순서대로 진행하세요.
 

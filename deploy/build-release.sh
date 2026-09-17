@@ -36,12 +36,16 @@ docker save -o "$release/docker-images/gerrit-ai-reviewer.tar" "$image"
 docker save -o "$release/docker-images/postgres-16.tar" "$postgres_image"
 
 cp "$root/deploy/docker-compose.yml" "$release/docker-compose.yml"
-cp "$root/deploy/install.sh" "$release/install.sh"
-cp "$root/deploy/bootstrap-host.sh" "$release/bootstrap-host.sh"
+for script in \
+  install.sh bootstrap-host.sh lib.sh manage.sh start.sh stop.sh restart.sh status.sh logs.sh doctor.sh \
+  set-admin-port.sh configure.sh configure-corporate-host.sh build-local.sh; do
+  cp "$root/deploy/$script" "$release/$script"
+done
 cp "$root/deploy/env.example" "$release/.env.example"
+cp "$root/deploy/corporate.env.example" "$release/corporate.env.example"
 cp "$root/config/config.example.yaml" "$release/config.example.yaml"
 cp "$root/docs/runbook.md" "$release/RUNBOOK.md"
-chmod +x "$release/install.sh" "$release/bootstrap-host.sh"
+chmod +x "$release"/*.sh
 sed -i "s#^REVIEWER_IMAGE=.*#REVIEWER_IMAGE=${image}#" "$release/.env.example"
 
 (
