@@ -22,6 +22,9 @@ summary plus native inline/range comments.
   Patch Sets remain reviewable and can receive native inline comments.
 - Optional repository review guidance is loaded from the accepted baseline Git revision as bounded
   blobs, never by following files/symlinks from the untrusted candidate worktree.
+- Repository `read_file` tool calls stream only the requested line range and cap the returned bytes,
+  so large text artifacts such as register-map CSV dumps can be inspected without loading the whole
+  file into model context or process memory.
 - Merge commits are currently safe-skipped with a visible Gerrit summary rather than reviewed
   against an incorrect first-parent diff. Gerrit 3.8 uses its auto-merge base for merge diffs; a
   future merge-review path must ingest that Gerrit DiffInfo before native inline comments are safe.

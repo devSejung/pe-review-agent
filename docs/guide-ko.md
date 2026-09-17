@@ -1911,6 +1911,13 @@ job은 PostgreSQL에 남아 있습니다.
 따라서 작은 테스트 commit에서 8/16 round를 반복 소진한다면 단순히 64로 올리기보다 먼저
 Job Audit trace에서 어떤 탐색을 반복했는지 확인합니다.
 
+큰 register dump / CSV도 `read_file`에서 파일 전체를 모델 context로 올리지 않습니다.
+`search_text`로 register/symbol 위치를 찾은 뒤 필요한 line range만 스트리밍해서 읽고,
+한 번의 tool 결과는 `review.max_tool_output_bytes`(기본 256 KB)로 제한됩니다. 따라서 수 MB급
+텍스트 파일이라고 해서 파일 전체 크기만으로 `file exceeds context size limit` 처리하지 않습니다.
+`max_context_file_bytes`는 repository policy/architecture 같은 정적 review guidance를 읽을 때의
+per-file 제한으로 계속 사용됩니다.
+
 ### Gerrit 403
 
 확인:
