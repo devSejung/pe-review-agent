@@ -102,6 +102,7 @@ class RepoSettings(StrictSettingsModel):
 
 class ReviewSettings(StrictSettingsModel):
     policy_version: str = "firmware-v1"
+    output_language: Literal["ko-KR", "en-US"] = "ko-KR"
     max_findings: int = Field(default=8, ge=0, le=50)
     min_confidence: float = Field(default=0.82, ge=0.0, le=1.0)
     max_tool_rounds: int = Field(default=8, ge=0, le=32)

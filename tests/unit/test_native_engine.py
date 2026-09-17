@@ -103,8 +103,35 @@ async def test_two_pass_engine_uses_tools_then_verifies(tmp_path: Path) -> None:
     # Tool result is present in the second candidate request.
     assert any(message.get("role") == "tool" for message in llm.seen_messages[1])
     assert "unrelated/1999.c" not in llm.seen_messages[0][1]["content"]
+    assert "natural Korean" in llm.seen_messages[0][1]["content"]
+    assert "natural Korean" in llm.seen_messages[2][1]["content"]
     assert result.input_tokens == 30
     assert result.output_tokens == 15
+
+
+@pytest.mark.asyncio
+async def test_review_language_can_be_switched_to_english(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    llm = FakeLlm([_completion(json.dumps({"summary": "", "findings": []}))])
+    settings = ReviewSettings(output_language="en-US")
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=12,
+        patchset_number=1,
+        revision_sha="9" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    assert "clear English" in llm.seen_messages[0][1]["content"]
+    assert "natural Korean" not in llm.seen_messages[0][1]["content"]
 
 
 @pytest.mark.asyncio

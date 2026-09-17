@@ -165,6 +165,9 @@ class ControlStore:
         review = base.review.model_copy(
             update={
                 "policy_version": review_cfg.get("policy_version", base.review.policy_version),
+                "output_language": review_cfg.get(
+                    "output_language", base.review.output_language
+                ),
                 "max_findings": review_cfg.get("max_findings", base.review.max_findings),
                 "min_confidence": review_cfg.get("min_confidence", base.review.min_confidence),
             }
@@ -425,6 +428,7 @@ def _defaults_from_settings(settings: Settings) -> dict[str, Any]:
         },
         "review": {
             "policy_version": settings.review.policy_version,
+            "output_language": settings.review.output_language,
             "max_findings": settings.review.max_findings,
             "min_confidence": settings.review.min_confidence,
         },

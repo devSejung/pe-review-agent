@@ -7,6 +7,7 @@ from pe_review_agent.config import (
     AdminSettings,
     DatabaseSettings,
     GerritSettings,
+    ReviewSettings,
     ServiceSettings,
     load_settings,
 )
@@ -65,6 +66,13 @@ def test_gerrit_projects_can_start_empty_for_admin_web_bootstrap(tmp_path: Path)
         rest_url="https://gerrit",
     )
     assert settings.projects == []
+
+
+def test_review_language_defaults_to_korean_and_rejects_unknown_values() -> None:
+    assert ReviewSettings().output_language == "ko-KR"
+    assert ReviewSettings(output_language="en-US").output_language == "en-US"
+    with pytest.raises(ValidationError, match="output_language"):
+        ReviewSettings.model_validate({"output_language": "ja-JP"})
 
 
 def test_unknown_nested_yaml_setting_fails_check_config(monkeypatch, tmp_path: Path) -> None:

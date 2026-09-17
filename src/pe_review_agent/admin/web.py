@@ -617,10 +617,12 @@ def _validated_llm_update(value: dict[str, Any], current: dict[str, Any]) -> dic
 
 
 def _validated_review_update(value: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"policy_version", "max_findings", "min_confidence"}
+    allowed = {"policy_version", "output_language", "max_findings", "min_confidence"}
     result = {**current, **{key: item for key, item in value.items() if key in allowed}}
     if not isinstance(result.get("policy_version"), str) or not result["policy_version"].strip():
         raise HTTPException(status_code=422, detail="Review policy version is required")
+    if result.get("output_language") not in {"ko-KR", "en-US"}:
+        raise HTTPException(status_code=422, detail="Review output language must be ko-KR or en-US")
     try:
         max_findings = int(result.get("max_findings"))
         confidence = float(result.get("min_confidence"))
