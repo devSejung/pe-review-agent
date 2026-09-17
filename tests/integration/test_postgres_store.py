@@ -21,7 +21,12 @@ from pe_review_agent.domain import (
     ReviewResult,
     Severity,
 )
-from pe_review_agent.jobs import JobStore, PublicationStatus, PublishGuardStatus
+from pe_review_agent.jobs import (
+    JobStore,
+    ProjectReviewStartMode,
+    PublicationStatus,
+    PublishGuardStatus,
+)
 from pe_review_agent.retry import TransientError
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
@@ -82,7 +87,7 @@ async def store():
 
 
 @pytest.mark.asyncio
-async def test_disabled_managed_project_is_not_claimed(store) -> None:
+async def test_reenabling_from_now_project_skips_disabled_period_queue(store) -> None:
     jobs, database = store
     control = ControlStore(database.sessions)
     await control.upsert_project("team/fw", enabled=False)
@@ -94,8 +99,55 @@ async def test_disabled_managed_project_is_not_claimed(store) -> None:
     assert await jobs.claim_next(worker_id="worker-disabled", lease_seconds=120) is None
 
     await control.set_project_enabled("team/fw", True)
+    queued_after = await jobs.get(queued.id)
+    assert queued_after is not None and queued_after.state is JobState.SKIPPED_SCOPE
+    assert await jobs.claim_next(worker_id="worker-enabled", lease_seconds=120) is None
+
+
+@pytest.mark.asyncio
+async def test_reenabling_include_open_project_replays_disabled_period_queue(store) -> None:
+    jobs, database = store
+    control = ControlStore(database.sessions)
+    await control.upsert_project(
+        "team/fw",
+        enabled=False,
+        review_start_mode=ProjectReviewStartMode.INCLUDE_OPEN,
+    )
+    queued, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40),
+        review_policy_version="firmware-v1",
+    )
+
+    assert await jobs.claim_next(worker_id="worker-disabled", lease_seconds=120) is None
+
+    await control.set_project_enabled("team/fw", True)
     claimed = await jobs.claim_next(worker_id="worker-enabled", lease_seconds=120)
     assert claimed is not None and claimed.id == queued.id
+
+
+@pytest.mark.asyncio
+async def test_include_open_revives_current_patchset_previously_skipped_by_scope(store) -> None:
+    jobs, database = store
+    control = ControlStore(database.sessions)
+    await control.upsert_project("team/fw", enabled=True)
+    old_event = _event(patchset=1, revision="a" * 40).model_copy(
+        update={"occurred_at": datetime.now(UTC) - timedelta(hours=1)}
+    )
+
+    skipped, created = await jobs.enqueue(old_event, review_policy_version="firmware-v1")
+    assert created is True
+    assert skipped.state is JobState.SKIPPED_SCOPE
+
+    await control.set_project_review_start_mode(
+        "team/fw", ProjectReviewStartMode.INCLUDE_OPEN
+    )
+    revived, created_again = await jobs.enqueue(old_event, review_policy_version="firmware-v1")
+    assert created_again is False
+    assert revived.id == skipped.id
+    assert revived.state is JobState.RECEIVED
+
+    claimed = await jobs.claim_next(worker_id="worker-backfill", lease_seconds=120)
+    assert claimed is not None and claimed.id == skipped.id
 
 
 @pytest.mark.asyncio

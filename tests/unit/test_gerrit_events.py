@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ def _event(*, project: str = "team/fw", revision: str = "a" * 40) -> dict[str, o
             "ref": "refs/changes/23/123/4",
         },
         "uploader": {"username": "alice"},
+        "eventCreatedOn": 1_789_611_600,
     }
 
 
@@ -67,6 +69,7 @@ def test_parse_patchset_created_maps_gerrit_stream_schema() -> None:
     assert parsed.branch == "main"
     assert parsed.change_id == "Ideadbeef"
     assert parsed.uploader == "alice"
+    assert parsed.occurred_at == datetime.fromtimestamp(1_789_611_600, tz=UTC)
 
 
 def test_parse_patchset_created_filters_non_allowlisted_projects() -> None:

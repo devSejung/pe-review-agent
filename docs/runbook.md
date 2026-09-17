@@ -116,6 +116,15 @@ Use **Projects -> Add Gerrit project** for the first test repository. The projec
 exact Gerrit project path (for example `platform/dmc-fw`). Use **Test** to verify REST Read access
 and Git/SSH fetch access before enabling it.
 
+New projects use **From now on** by default. The activation timestamp is stored per project and the
+reconciler applies it in the Gerrit query itself, so a repository with tens of thousands of existing
+open Changes is not scanned or enqueued by default. Selecting **Include current open Changes** opts
+that project into backfill. Switching a `FROM_NOW` project off and back on resets its cutoff to the
+re-enable time, so Patch Sets uploaded while it was disabled are not replayed later. Switching from
+backfill back to **From now on** terminalizes queued, unleased pre-cutoff work as `SKIPPED_SCOPE`.
+Jobs that already have a Gerrit publication intent are never discarded and continue through the
+normal publication-reconciliation safety path.
+
 ### Enable one test project first
 
 Keep only one test repository enabled for the first end-to-end run. Upload a new Patch Set and

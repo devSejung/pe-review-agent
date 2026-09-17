@@ -30,6 +30,7 @@ from pe_review_agent.jobs.models import (
     Attempt,
     Job,
     ManagedProject,
+    ProjectReviewStartMode,
     Publication,
     PublicationStatus,
     ReviewFinding,
@@ -65,7 +66,13 @@ class PublishGuardStatus(StrEnum):
     LEASE_LOST = "LEASE_LOST"
 
 
-def _enqueue_insert(event: GerritPatchsetEvent, policy_version: str):
+def _enqueue_insert(
+    event: GerritPatchsetEvent,
+    policy_version: str,
+    *,
+    initial_state: JobState = JobState.RECEIVED,
+    scope_error: str | None = None,
+):
     return (
         pg_insert(Job)
         .values(
@@ -74,8 +81,10 @@ def _enqueue_insert(event: GerritPatchsetEvent, policy_version: str):
             patchset_number=event.patchset_number,
             revision_sha=event.revision_sha,
             review_policy_version=policy_version,
-            state=JobState.RECEIVED.value,
+            state=initial_state.value,
             event_payload=event.model_dump(mode="json"),
+            last_error_class="ReviewScopeChanged" if scope_error else None,
+            last_error=scope_error,
         )
         .on_conflict_do_nothing(
             index_elements=[
@@ -193,7 +202,32 @@ class JobStore:
         )
         async with self._sessions.begin() as session:
             await session.execute(_change_lock_select(event.project, event.change_number))
-            inserted_id = await session.scalar(_enqueue_insert(event, review_policy_version))
+            project_scope = await session.scalar(
+                select(ManagedProject)
+                .where(ManagedProject.project == event.project)
+                .with_for_update()
+            )
+            initial_state = JobState.RECEIVED
+            scope_error: str | None = None
+            if (
+                project_scope is not None
+                and project_scope.review_start_mode == ProjectReviewStartMode.FROM_NOW.value
+                and project_scope.review_start_at is not None
+                and event.occurred_at is not None
+                and event.occurred_at < project_scope.review_start_at
+            ):
+                initial_state = JobState.SKIPPED_SCOPE
+                scope_error = (
+                    "Skipped because Patch Set predates the project's FROM_NOW review cutoff."
+                )
+            inserted_id = await session.scalar(
+                _enqueue_insert(
+                    event,
+                    review_policy_version,
+                    initial_state=initial_state,
+                    scope_error=scope_error,
+                )
+            )
             created = inserted_id is not None
             if inserted_id is None:
                 job = await session.scalar(
@@ -206,6 +240,22 @@ class JobStore:
                 )
                 if job is None:
                     raise RuntimeError("idempotent enqueue conflict row disappeared")
+                if (
+                    JobState(job.state) is JobState.SKIPPED_SCOPE
+                    and project_scope is not None
+                    and project_scope.enabled
+                    and project_scope.review_start_mode
+                    == ProjectReviewStartMode.INCLUDE_OPEN.value
+                ):
+                    # INCLUDE_OPEN explicitly opts the project back into current open Changes. A
+                    # reconciliation event for a still-open revision can therefore revive a prior
+                    # FROM_NOW scope skip without erasing its durable identity/audit history.
+                    job.state = JobState.RECEIVED.value
+                    job.retry_state = None
+                    job.next_attempt_at = datetime.now(UTC)
+                    job.last_error_class = None
+                    job.last_error = None
+                    job.updated_at = func.now()
             else:
                 job = await session.get(Job, inserted_id)
                 if job is None:
@@ -216,6 +266,8 @@ class JobStore:
             return _record(job), created
 
     async def _apply_patchset_ordering(self, session: AsyncSession, job: Job) -> None:
+        if JobState(job.state) is JobState.SKIPPED_SCOPE:
+            return
         terminal = [state.value for state in TERMINAL_JOB_STATES]
         newer_id = await session.scalar(
             select(Job.id)

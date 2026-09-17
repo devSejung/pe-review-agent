@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from pe_review_agent.config import GerritSettings
@@ -50,6 +51,7 @@ def parse_patchset_created(
         branch=_optional_string(change.get("branch")),
         change_id=_optional_string(change.get("id")),
         uploader=_account_name(uploader),
+        occurred_at=_event_created_at(decoded.get("eventCreatedOn")),
         raw=decoded,
     )
 
@@ -235,3 +237,16 @@ def _account_name(value: Any) -> str | None:
         if isinstance(candidate, str) and candidate:
             return candidate
     return None
+
+
+def _event_created_at(value: Any) -> datetime | None:
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp < 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None

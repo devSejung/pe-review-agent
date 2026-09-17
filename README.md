@@ -328,7 +328,11 @@ The UI has six operational surfaces:
 
 - **Dashboard** — recent job volume, failures, active queue/state counts, and recent Changes.
 - **Projects** — add exact Gerrit project names, test REST Read + Git/SSH fetch access, and
-  enable/disable review.
+  enable/disable review. New projects default to **From now on**, so established repositories with
+  large open-Change histories are not backfilled accidentally. Operators can explicitly switch a
+  project to **Include current open Changes** when a backfill is actually wanted. Switching back to
+  **From now on** stops queued, unleased pre-cutoff backfill jobs as `SKIPPED_SCOPE`; publication
+  intents are preserved for safe Gerrit reconciliation.
 - **Connections** — edit/test Gerrit SSH + REST and the OpenAI-compatible Qwen endpoint.
 - **Jobs** — filter durable jobs, inspect state/failure text, open the full audit trail, and requeue
   `FAILED_PERMANENT` jobs. The audit page shows every durable attempt, the model summary and findings,

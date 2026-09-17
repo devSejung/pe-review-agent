@@ -6,7 +6,7 @@
   <div class="card-body">
     <form method="get" class="row g-2">
       <div class="col-md-4"><select class="form-select" name="project"><option value="">All projects</option>{% for item in projects %}<option value="{{ item.project }}" {% if project_filter == item.project %}selected{% endif %}>{{ item.project }}</option>{% endfor %}</select></div>
-      <div class="col-md-4"><select class="form-select" name="state"><option value="">All states</option>{% for state in ['RECEIVED','FETCHING','REVIEWING','VALIDATING','READY_TO_PUBLISH','PUBLISHING','RETRY_WAIT','DONE','SUPERSEDED','FAILED_PERMANENT'] %}<option value="{{ state }}" {% if state_filter == state %}selected{% endif %}>{{ state }}</option>{% endfor %}</select></div>
+      <div class="col-md-4"><select class="form-select" name="state"><option value="">All states</option>{% for state in ['RECEIVED','FETCHING','REVIEWING','VALIDATING','READY_TO_PUBLISH','PUBLISHING','RETRY_WAIT','DONE','SUPERSEDED','SKIPPED_SCOPE','FAILED_PERMANENT'] %}<option value="{{ state }}" {% if state_filter == state %}selected{% endif %}>{{ state }}</option>{% endfor %}</select></div>
       <div class="col-md-2"><button class="btn btn-outline-primary w-100">Filter</button></div>
       <div class="col-md-2"><a class="btn btn-outline-secondary w-100" href="/jobs">Reset</a></div>
     </form>
@@ -21,7 +21,7 @@
       <tr>
         <td><div class="fw-semibold"><a href="/jobs/{{ job.id }}" class="text-reset">{{ job.project }}</a></div><div class="text-secondary"><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a> · {{ job.revision_sha[:10] }}</div></td>
         <td>{{ job.patchset_number }}</td>
-        <td><span class="badge {% if job.state == 'DONE' %}bg-green-lt{% elif job.state == 'FAILED_PERMANENT' %}bg-red-lt{% elif job.state == 'SUPERSEDED' %}bg-secondary-lt{% else %}bg-blue-lt{% endif %}">{{ job.state }}</span>{% if job.retry_state %}<div class="small text-secondary mt-1">→ {{ job.retry_state }}</div>{% endif %}</td>
+        <td><span class="badge {% if job.state == 'DONE' %}bg-green-lt{% elif job.state == 'FAILED_PERMANENT' %}bg-red-lt{% elif job.state in ['SUPERSEDED','SKIPPED_SCOPE'] %}bg-secondary-lt{% else %}bg-blue-lt{% endif %}">{{ job.state }}</span>{% if job.retry_state %}<div class="small text-secondary mt-1">→ {{ job.retry_state }}</div>{% endif %}</td>
         <td>{{ job.attempt_count }}</td>
         <td class="error-cell"><div class="text-danger small">{{ job.last_error_class or '' }}</div><div class="text-secondary small text-truncate">{{ job.last_error or '' }}</div></td>
         <td class="text-secondary">{{ job.updated_at }}</td>

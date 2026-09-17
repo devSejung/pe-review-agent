@@ -2,7 +2,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from pe_review_agent.admin.store import ManagedProjectRecord
 from pe_review_agent.config import Settings
+from pe_review_agent.jobs import ProjectReviewStartMode
 from pe_review_agent.service import (
     _RECONCILIATION_FULL_SWEEP_KEY,
     _RECONCILIATION_WATERMARK_KEY,
@@ -32,10 +34,31 @@ class _Store:
 class _Gerrit:
     def __init__(self) -> None:
         self.since_values: list[datetime | None] = []
+        self.project_since_values: list[dict[str, datetime | None] | None] = []
 
-    async def reconciliation_events(self, *, since: datetime | None):
+    async def reconciliation_events(
+        self,
+        *,
+        since: datetime | None,
+        project_since: dict[str, datetime | None] | None = None,
+    ):
         self.since_values.append(since)
+        self.project_since_values.append(project_since)
         return []
+
+    def replace_projects(self, _projects) -> None:
+        return None
+
+
+class _Control:
+    def __init__(self, scope: ManagedProjectRecord) -> None:
+        self.scope = scope
+
+    async def service_enabled(self, *, default: bool) -> bool:
+        return default
+
+    async def enabled_project_scopes(self):
+        return (self.scope,)
 
 
 def _settings(tmp_path) -> Settings:
@@ -71,6 +94,7 @@ async def test_reconciler_runs_periodic_full_open_change_sweep(tmp_path, monkeyp
         await run_reconciler(_settings(tmp_path), store, gerrit)  # type: ignore[arg-type]
 
     assert gerrit.since_values == [None]
+    assert gerrit.project_since_values == [None]
     assert any(key == _RECONCILIATION_FULL_SWEEP_KEY for key, _ in store.advanced)
 
 
@@ -89,4 +113,70 @@ async def test_reconciler_uses_overlap_between_full_sweeps(tmp_path, monkeypatch
         await run_reconciler(_settings(tmp_path), store, gerrit)  # type: ignore[arg-type]
 
     assert gerrit.since_values == [watermark - timedelta(seconds=300)]
+    assert gerrit.project_since_values == [None]
     assert not any(key == _RECONCILIATION_FULL_SWEEP_KEY for key, _ in store.advanced)
+
+
+@pytest.mark.asyncio
+async def test_reconciler_full_sweep_still_respects_from_now_project_cutoff(
+    tmp_path, monkeypatch
+) -> None:
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(minutes=2)
+    store = _Store(watermark=now - timedelta(minutes=5), full_sweep=now - timedelta(hours=2))
+    gerrit = _Gerrit()
+    control = _Control(
+        ManagedProjectRecord(
+            project="team/fw",
+            enabled=True,
+            review_start_mode=ProjectReviewStartMode.FROM_NOW,
+            review_start_at=cutoff,
+            created_at=cutoff,
+            updated_at=cutoff,
+        )
+    )
+
+    async def stop_after_pass(_seconds: float) -> None:
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr("pe_review_agent.service.asyncio.sleep", stop_after_pass)
+    with pytest.raises(RuntimeError, match="stop"):
+        await run_reconciler(
+            _settings(tmp_path), store, gerrit, control=control  # type: ignore[arg-type]
+        )
+
+    assert gerrit.since_values == [None]
+    assert gerrit.project_since_values == [{"team/fw": cutoff}]
+
+
+@pytest.mark.asyncio
+async def test_switching_to_include_open_requests_immediate_full_sweep(
+    tmp_path, monkeypatch
+) -> None:
+    now = datetime.now(UTC)
+    last_full = now - timedelta(minutes=10)
+    store = _Store(watermark=now - timedelta(minutes=1), full_sweep=last_full)
+    gerrit = _Gerrit()
+    control = _Control(
+        ManagedProjectRecord(
+            project="team/fw",
+            enabled=True,
+            review_start_mode=ProjectReviewStartMode.INCLUDE_OPEN,
+            review_start_at=None,
+            created_at=now - timedelta(days=1),
+            updated_at=now,
+        )
+    )
+
+    async def stop_after_pass(_seconds: float) -> None:
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr("pe_review_agent.service.asyncio.sleep", stop_after_pass)
+    with pytest.raises(RuntimeError, match="stop"):
+        await run_reconciler(
+            _settings(tmp_path), store, gerrit, control=control  # type: ignore[arg-type]
+        )
+
+    assert gerrit.since_values == [None]
+    assert gerrit.project_since_values == [{"team/fw": None}]
+    assert any(key == _RECONCILIATION_FULL_SWEEP_KEY for key, _ in store.advanced)

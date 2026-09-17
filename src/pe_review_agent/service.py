@@ -21,7 +21,13 @@ from pe_review_agent.gerrit import (
     SupersededRevisionError,
     build_review_input,
 )
-from pe_review_agent.jobs import JobRecord, JobStore, PublicationStatus, PublishGuardStatus
+from pe_review_agent.jobs import (
+    JobRecord,
+    JobStore,
+    ProjectReviewStartMode,
+    PublicationStatus,
+    PublishGuardStatus,
+)
 from pe_review_agent.llm import LlmClient
 from pe_review_agent.observability import METRICS, log_event
 from pe_review_agent.repos import RepositoryManager, RepositoryToolExecutor
@@ -194,7 +200,12 @@ class ReviewWorker:
         if job.state in {JobState.READY_TO_PUBLISH, JobState.PUBLISHING}:
             await self._process_publish(job, worker_id=worker_id, lease=lease)
             return
-        if job.state in {JobState.DONE, JobState.SUPERSEDED, JobState.FAILED_PERMANENT}:
+        if job.state in {
+            JobState.DONE,
+            JobState.SUPERSEDED,
+            JobState.SKIPPED_SCOPE,
+            JobState.FAILED_PERMANENT,
+        }:
             return
         await self._permanent_failure(
             job,
@@ -763,6 +774,17 @@ async def run_receiver(
             event, review_policy_version=settings.review.policy_version
         )
         if created:
+            if job.state is JobState.SKIPPED_SCOPE:
+                log_event(
+                    logger,
+                    "ignored Gerrit Patch Set outside project review scope",
+                    job_id=str(job.id),
+                    project=event.project,
+                    change=event.change_number,
+                    patchset=event.patchset_number,
+                    revision=event.revision_sha,
+                )
+                continue
             METRICS.jobs_total.labels(project=event.project).inc()
             log_event(
                 logger,
@@ -789,15 +811,26 @@ async def run_reconciler(
         seconds=settings.service.reconcile_full_sweep_interval_seconds
     )
     while True:
+        project_cutoffs: dict[str, datetime | None] | None = None
+        project_scopes = ()
         if control is not None:
             if not await control.service_enabled(default=settings.service.enabled):
                 await asyncio.sleep(interval)
                 continue
-            projects = await control.enabled_projects(fallback=tuple(settings.gerrit.projects))
+            project_scopes = await control.enabled_project_scopes()
+            projects = tuple(scope.project for scope in project_scopes)
             if not projects:
                 await asyncio.sleep(interval)
                 continue
             gerrit.replace_projects(projects)
+            project_cutoffs = {
+                scope.project: (
+                    scope.review_start_at
+                    if scope.review_start_mode is ProjectReviewStartMode.FROM_NOW
+                    else None
+                )
+                for scope in project_scopes
+            }
         elif not settings.service.enabled:
             await asyncio.sleep(interval)
             continue
@@ -808,6 +841,12 @@ async def run_reconciler(
             full_sweep_due = (
                 last_full_sweep is None or pass_started - last_full_sweep >= full_sweep_interval
             )
+            if control is not None and not full_sweep_due:
+                full_sweep_due = any(
+                    scope.review_start_mode is ProjectReviewStartMode.INCLUDE_OPEN
+                    and (last_full_sweep is None or scope.updated_at > last_full_sweep)
+                    for scope in project_scopes
+                )
             # First boot scans every current open change in the allowlist. Later passes resume from
             # the durable successful watermark with overlap. Periodic full scans ensure an open
             # Change omitted by a temporarily stale Gerrit secondary index is never aged out
@@ -819,12 +858,17 @@ async def run_reconciler(
                 if watermark is not None
                 else None
             )
-            events = await gerrit.reconciliation_events(since=since)
+            events = await gerrit.reconciliation_events(
+                since=since,
+                project_since=project_cutoffs,
+            )
             for event in events:
                 job, created = await store.enqueue(
                     event, review_policy_version=settings.review.policy_version
                 )
                 if created:
+                    if job.state is JobState.SKIPPED_SCOPE:
+                        continue
                     METRICS.jobs_total.labels(project=event.project).inc()
                     log_event(
                         logger,
