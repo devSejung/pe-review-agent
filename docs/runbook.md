@@ -1,5 +1,7 @@
 # Gerrit AI Reviewer Operations Runbook
 
+한국어 상세 운영 가이드는 [`guide-ko.md`](guide-ko.md)를 참고하세요.
+
 ## 1. Gerrit bot account
 
 Prefer a dedicated Gerrit account named `pe-review-agent` (or the local naming convention) rather
