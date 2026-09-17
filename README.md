@@ -5,6 +5,9 @@ Production-oriented Gerrit 3.8 review service for firmware repositories. It list
 OpenAI-compatible model, verifies findings against repository context, and publishes a Gerrit
 summary plus native inline/range comments.
 
+> 한국어로 설치/권한/설정/Admin Web/프로젝트 범위/E2E/장애 대응까지 자세히 보려면
+> **[`docs/guide-ko.md`](docs/guide-ko.md)** 를 참고하세요.
+
 ## Non-negotiable correctness properties
 
 - Durable job identity: `(project, change_number, revision_sha, review_policy_version)`.
