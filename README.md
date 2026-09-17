@@ -25,6 +25,10 @@ summary plus native inline/range comments.
 - Repository `read_file` tool calls stream only the requested line range and cap the returned bytes,
   so large text artifacts such as register-map CSV dumps can be inspected without loading the whole
   file into model context or process memory.
+- Change-level review text separates a factual change summary from the review verdict. Gerrit
+  subject, branch, and the bounded current commit message are supplied as untrusted intent hints,
+  while the Patch Set diff remains authoritative. The change summary is preserved even when there
+  are zero publishable findings.
 - Merge commits are currently safe-skipped with a visible Gerrit summary rather than reviewed
   against an incorrect first-parent diff. Gerrit 3.8 uses its auto-merge base for merge diffs; a
   future merge-review path must ingest that Gerrit DiffInfo before native inline comments are safe.

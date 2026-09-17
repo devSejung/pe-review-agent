@@ -41,7 +41,9 @@ def _completion(content: str, *calls: ToolCall) -> LlmCompletion:
 def _review_json(confidence: float = 0.96) -> str:
     return json.dumps(
         {
-            "summary": "One timeout bug found.",
+            "summary": "legacy test summary",
+            "change_summary": "- training timeout handling을 변경합니다.",
+            "review_summary": "Timeout handling defect가 확인되었습니다.",
             "findings": [
                 {
                     "severity": "P1",
@@ -88,6 +90,9 @@ async def test_two_pass_engine_uses_tools_then_verifies(tmp_path: Path) -> None:
         change_number=11,
         patchset_number=3,
         revision_sha="a" * 40,
+        subject="Handle training timeout",
+        branch="main",
+        commit_message="Handle training timeout\n\nPropagate poll_done() failures.",
         diff="+advance();",
         changed_files=["fw/train.c", *(f"unrelated/{index}.c" for index in range(2_000))],
         changed_lines=[ChangedLine(path="fw/train.c", line=2, text="advance();")],
@@ -107,6 +112,12 @@ async def test_two_pass_engine_uses_tools_then_verifies(tmp_path: Path) -> None:
     assert "unrelated/1999.c" not in llm.seen_messages[0][1]["content"]
     assert "natural Korean" in llm.seen_messages[0][1]["content"]
     assert "natural Korean" in llm.seen_messages[2][1]["content"]
+    assert '"subject": "Handle training timeout"' in llm.seen_messages[0][1]["content"]
+    assert '"branch": "main"' in llm.seen_messages[0][1]["content"]
+    assert "Propagate poll_done() failures." in llm.seen_messages[0][1]["content"]
+    assert "변경 요약" in result.summary
+    assert "training timeout handling을 변경합니다." in result.summary
+    assert "리뷰 결과" in result.summary
     assert result.input_tokens == 30
     assert result.output_tokens == 15
 
@@ -131,7 +142,9 @@ async def test_tool_round_limit_forces_final_json_instead_of_failing(tmp_path: P
         [
             _completion("", first),
             _completion("", second),
-            _completion(json.dumps({"summary": "done", "findings": []})),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
         ]
     )
     settings = ReviewSettings(max_tool_rounds=1)
@@ -191,7 +204,9 @@ async def test_duplicate_repository_tool_call_is_suppressed_and_finalized(tmp_pa
         [
             _completion("", duplicate),
             _completion("", duplicate_again),
-            _completion(json.dumps({"summary": "done", "findings": []})),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
         ]
     )
     settings = ReviewSettings(max_tool_rounds=8)
@@ -248,7 +263,9 @@ async def test_semantically_equivalent_tool_defaults_are_duplicate_suppressed(
         [
             _completion("", implicit_defaults),
             _completion("", explicit_defaults),
-            _completion(json.dumps({"summary": "done", "findings": []})),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
         ]
     )
     settings = ReviewSettings(max_tool_rounds=8)
@@ -300,7 +317,9 @@ async def test_tool_error_can_be_retried_without_duplicate_suppression(tmp_path:
         [
             _completion("", invalid),
             _completion("", invalid_retry),
-            _completion(json.dumps({"summary": "done", "findings": []})),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
         ]
     )
     settings = ReviewSettings(max_tool_rounds=8)
@@ -336,7 +355,9 @@ async def test_tool_error_can_be_retried_without_duplicate_suppression(tmp_path:
 async def test_review_language_can_be_switched_to_english(tmp_path: Path) -> None:
     target = tmp_path / "fw.c"
     target.write_text("changed();\n", encoding="utf-8")
-    llm = FakeLlm([_completion(json.dumps({"summary": "", "findings": []}))])
+    llm = FakeLlm(
+        [_completion(json.dumps({"change_summary": "- Updates changed().", "findings": []}))]
+    )
     settings = ReviewSettings(output_language="en-US")
     engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
     context = ReviewContext(
@@ -351,10 +372,12 @@ async def test_review_language_can_be_switched_to_english(tmp_path: Path) -> Non
         repository_root=str(tmp_path),
     )
 
-    await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
 
     assert "clear English" in llm.seen_messages[0][1]["content"]
     assert "natural Korean" not in llm.seen_messages[0][1]["content"]
+    assert result.summary.startswith("Change summary\n- Updates changed().")
+    assert "Review result\n- No actionable firmware correctness issues" in result.summary
 
 
 @pytest.mark.asyncio
@@ -363,7 +386,7 @@ async def test_verifier_can_drop_candidate(tmp_path: Path) -> None:
     target.write_text("changed();\n", encoding="utf-8")
     candidate = json.dumps(
         {
-            "summary": "candidate",
+            "change_summary": "- fw.c의 호출 경로를 변경합니다.",
             "findings": [
                 {
                     "severity": "P2",
@@ -378,7 +401,7 @@ async def test_verifier_can_drop_candidate(tmp_path: Path) -> None:
             ],
         }
     )
-    verified = json.dumps({"summary": "", "findings": []})
+    verified = json.dumps({"review_summary": "", "findings": []})
     llm = FakeLlm([_completion(candidate), _completion(verified)])
     settings = ReviewSettings()
     engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
@@ -397,7 +420,44 @@ async def test_verifier_can_drop_candidate(tmp_path: Path) -> None:
     result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
 
     assert result.findings == []
-    assert result.summary.startswith("No actionable")
+    assert "변경 요약" in result.summary
+    assert "fw.c의 호출 경로를 변경합니다." in result.summary
+    assert "리뷰 결과" in result.summary
+    assert "추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다." in result.summary
+
+
+@pytest.mark.asyncio
+async def test_findings_with_empty_verifier_summary_use_korean_fallback(tmp_path: Path) -> None:
+    target = tmp_path / "fw" / "train.c"
+    target.parent.mkdir(parents=True)
+    target.write_text("int rc = poll_done();\nadvance();\n", encoding="utf-8")
+    candidate_payload = json.loads(_review_json())
+    verified_payload = json.loads(_review_json())
+    verified_payload["review_summary"] = ""
+    llm = FakeLlm(
+        [
+            _completion(json.dumps(candidate_payload)),
+            _completion(json.dumps(verified_payload)),
+        ]
+    )
+    settings = ReviewSettings()
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=2,
+        patchset_number=1,
+        revision_sha="c" * 40,
+        diff="+advance();",
+        changed_files=["fw/train.c"],
+        changed_lines=[ChangedLine(path="fw/train.c", line=2, text="advance();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    assert len(result.findings) == 1
+    assert "검증된 조치 필요 이슈 1건이 있습니다 (P1: 1)." in result.summary
 
 
 @pytest.mark.asyncio
@@ -459,8 +519,12 @@ async def test_context_overflow_after_tool_round_keeps_spent_usage(tmp_path: Pat
         [
             _completion("", read),
             ContextLengthError("maximum context length"),
-            _completion(json.dumps({"summary": "done", "findings": []})),
-            _completion(json.dumps({"summary": "done", "findings": []})),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
         ]
     )
     settings = ReviewSettings(max_diff_chunk_chars=20_000)
@@ -544,7 +608,7 @@ async def test_previous_finding_is_forced_through_verifier_when_candidate_pass_m
     previous = json.loads(_review_json())
     previous["findings"][0]["semantic_id"] = semantic_id
     previous_finding = ReviewResult.model_validate(previous).findings[0]
-    missed = json.dumps({"summary": "No candidates", "findings": []})
+    missed = json.dumps({"change_summary": "- training 경로를 수정합니다.", "findings": []})
     verified = _review_json()
     verified_payload = json.loads(verified)
     verified_payload["findings"][0]["semantic_id"] = semantic_id

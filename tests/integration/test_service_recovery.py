@@ -61,6 +61,7 @@ class _FakeRepos:
         patchset_number: int,
         subject: str | None,
         branch: str | None,
+        commit_message: str | None,
         policy_text: str,
     ) -> ReviewContext:
         return ReviewContext(
@@ -71,6 +72,7 @@ class _FakeRepos:
             base_revision_sha=workspace.base_revision_sha,
             subject=subject,
             branch=branch,
+            commit_message=commit_message,
             diff=workspace.diff,
             changed_files=workspace.changed_files,
             changed_lines=workspace.changed_lines,
@@ -167,6 +169,7 @@ class _FakeGerrit:
             ref="refs/changes/01/101/1",
             subject="Test timeout path",
             branch="main",
+            commit_message="Test timeout path\n\nExercise retry recovery.",
         )
 
     async def has_published_review(self, **_kwargs) -> bool:
