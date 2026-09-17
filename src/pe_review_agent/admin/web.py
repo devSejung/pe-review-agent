@@ -698,7 +698,16 @@ def _validated_llm_update(value: dict[str, Any], current: dict[str, Any]) -> dic
 
 
 def _validated_review_update(value: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"policy_version", "output_language", "max_findings", "min_confidence"}
+    allowed = {
+        "policy_version",
+        "output_language",
+        "max_findings",
+        "min_confidence",
+        "max_candidate_chunks",
+        "max_llm_calls_per_job",
+        "max_tool_calls_per_job",
+        "max_input_tokens_per_job",
+    }
     result = {**current, **{key: item for key, item in value.items() if key in allowed}}
     if not isinstance(result.get("policy_version"), str) or not result["policy_version"].strip():
         raise HTTPException(status_code=422, detail="Review policy version is required")
@@ -707,14 +716,39 @@ def _validated_review_update(value: dict[str, Any], current: dict[str, Any]) -> 
     try:
         max_findings = int(result.get("max_findings"))
         confidence = float(result.get("min_confidence"))
+        max_candidate_chunks = int(result.get("max_candidate_chunks"))
+        max_llm_calls = int(result.get("max_llm_calls_per_job"))
+        max_tool_calls = int(result.get("max_tool_calls_per_job"))
+        max_input_tokens = int(result.get("max_input_tokens_per_job"))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid review numeric setting") from exc
     if not 0 <= max_findings <= 50:
         raise HTTPException(status_code=422, detail="max_findings must be between 0 and 50")
     if not 0 <= confidence <= 1:
         raise HTTPException(status_code=422, detail="min_confidence must be between 0 and 1")
+    if not 1 <= max_candidate_chunks <= 512:
+        raise HTTPException(
+            status_code=422, detail="max_candidate_chunks must be between 1 and 512"
+        )
+    if not 1 <= max_llm_calls <= 1_000:
+        raise HTTPException(
+            status_code=422, detail="max_llm_calls_per_job must be between 1 and 1000"
+        )
+    if not 0 <= max_tool_calls <= 5_000:
+        raise HTTPException(
+            status_code=422, detail="max_tool_calls_per_job must be between 0 and 5000"
+        )
+    if not 1_000 <= max_input_tokens <= 20_000_000:
+        raise HTTPException(
+            status_code=422,
+            detail="max_input_tokens_per_job must be between 1000 and 20000000",
+        )
     result["max_findings"] = max_findings
     result["min_confidence"] = confidence
+    result["max_candidate_chunks"] = max_candidate_chunks
+    result["max_llm_calls_per_job"] = max_llm_calls
+    result["max_tool_calls_per_job"] = max_tool_calls
+    result["max_input_tokens_per_job"] = max_input_tokens
     return result
 
 

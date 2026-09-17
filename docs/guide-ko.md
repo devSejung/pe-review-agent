@@ -908,6 +908,11 @@ review:
   min_confidence: 0.82
   # 기본 8. 실제 repo 탐색량이 많으면 16 전후부터 조정하고, 무작정 크게 올리지 않습니다.
   max_tool_rounds: 8
+  # 큰 Change 한 건이 LLM/tool 자원을 무제한 소비하지 않도록 하는 job 전체 budget
+  max_candidate_chunks: 12
+  max_llm_calls_per_job: 30
+  max_tool_calls_per_job: 50
+  max_input_tokens_per_job: 300000
 
 service:
   enabled: true
@@ -925,6 +930,18 @@ admin:
   username: "admin"
   password_env: "PE_REVIEW_ADMIN_PASSWORD"
 ```
+
+`max_candidate_chunks`, `max_llm_calls_per_job`, `max_tool_calls_per_job`,
+`max_input_tokens_per_job`은 **Change 한 건 전체**에 적용되는 안전 상한입니다. budget에 도달해도
+job을 실패시키지 않습니다. 이미 검토가 끝난 chunk의 결과는 유지하고, verifier를 통과한 finding만
+게시하며, 미검토 범위와 stop reason을 Gerrit summary 및 Job Audit에 표시합니다.
+
+`max_input_tokens_per_job`은 provider가 반환한 누적 usage를 기준으로 **다음 LLM 호출을 차단**합니다.
+따라서 이미 시작된 한 호출이 threshold를 조금 넘어갈 수는 있습니다.
+
+Admin Web의 **Settings → Review budget**에서도 같은 값을 저장할 수 있습니다. Review policy/budget은
+worker가 시작될 때 읽으므로 저장 직후에는 기존 process에 적용되지 않으며, 화면의
+**Restart required** 안내대로 `receiver` / `worker` / `reconciler`를 재시작해야 적용됩니다.
 
 ---
 

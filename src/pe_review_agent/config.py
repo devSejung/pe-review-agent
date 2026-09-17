@@ -117,6 +117,13 @@ class ReviewSettings(StrictSettingsModel):
     max_policy_bytes: int = Field(default=128_000, ge=1024, le=1_000_000)
     max_diff_chunk_chars: int = Field(default=70_000, ge=4_000, le=500_000)
     max_candidate_findings_total: int = Field(default=64, ge=1, le=256)
+    # Per-job safety budgets. These cap runaway large-Change/model-tool loops without turning a
+    # partially reviewed Change into a background failure. Partial coverage is disclosed in the
+    # durable review result and Gerrit summary.
+    max_candidate_chunks: int = Field(default=12, ge=1, le=512)
+    max_llm_calls_per_job: int = Field(default=30, ge=1, le=1_000)
+    max_tool_calls_per_job: int = Field(default=50, ge=0, le=5_000)
+    max_input_tokens_per_job: int = Field(default=300_000, ge=1_000, le=20_000_000)
     tool_command_timeout_seconds: float = Field(default=20.0, gt=0, le=300)
     max_tool_output_bytes: int = Field(default=256_000, ge=4096, le=4_000_000)
     generated_path_patterns: list[str] = Field(

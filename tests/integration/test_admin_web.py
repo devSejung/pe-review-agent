@@ -75,6 +75,16 @@ async def _truncate(settings: Settings) -> None:
         await database.close()
 
 
+async def _effective_review_settings(settings: Settings):  # type: ignore[no-untyped-def]
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        effective = await control.effective_settings(settings)
+        return effective.review
+    finally:
+        await database.close()
+
+
 async def _failed_job(settings: Settings):  # type: ignore[no-untyped-def]
     database = Database(settings.database)
     try:
@@ -151,7 +161,30 @@ async def _published_job(settings: Settings):  # type: ignore[no-untyped-def]
             model="Qwen3.6-27B",
             input_tokens=1234,
             output_tokens=321,
-            review_metadata={"lineage_complete": True},
+            review_metadata={
+                "lineage_complete": True,
+                "review_budget": {
+                    "candidate_chunks_reviewed": 2,
+                    "candidate_chunks_total": 2,
+                    "reviewable_files_fully_reviewed": 1,
+                    "reviewable_files_total": 1,
+                    "verification_complete": True,
+                    "complete": True,
+                    "stop_reasons": [],
+                    "llm_calls": 3,
+                    "tool_calls": 1,
+                    "input_tokens": 1234,
+                    "output_tokens": 321,
+                    "uncovered_files": [],
+                    "uncovered_files_truncated": False,
+                    "limits": {
+                        "max_candidate_chunks": 12,
+                        "max_llm_calls_per_job": 30,
+                        "max_tool_calls_per_job": 50,
+                        "max_input_tokens_per_job": 300000,
+                    },
+                },
+            },
             findings=[
                 Finding(
                     severity=Severity.P1,
@@ -323,6 +356,12 @@ async def test_bootstrap_prunes_only_semantics_preserving_legacy_full_snapshot(
             "temperature": settings.llm.temperature,
             "max_output_tokens": settings.llm.max_output_tokens,
         }
+        legacy_full_review = {
+            "policy_version": settings.review.policy_version,
+            "output_language": settings.review.output_language,
+            "max_findings": settings.review.max_findings,
+            "min_confidence": settings.review.min_confidence,
+        }
         async with database.sessions.begin() as session:
             row = await session.get(ServiceState, "admin-runtime-config", with_for_update=True)
             assert row is not None
@@ -330,11 +369,15 @@ async def test_bootstrap_prunes_only_semantics_preserving_legacy_full_snapshot(
                 "service_enabled": True,
                 "gerrit": full_gerrit,
                 "llm": full_llm,
+                "review": legacy_full_review,
             }
 
         await control.ensure_bootstrap(settings)
         assert await control.runtime_override_sections() == set()
         assert await control.legacy_runtime_snapshot_sections(settings) == set()
+        effective_after_upgrade = await control.effective_settings(settings)
+        assert effective_after_upgrade.review.max_candidate_chunks == 12
+        assert effective_after_upgrade.review.max_input_tokens_per_job == 300_000
 
         async with database.sessions.begin() as session:
             row = await session.get(ServiceState, "admin-runtime-config", with_for_update=True)
@@ -563,6 +606,10 @@ def test_admin_live_controls_runtime_config_and_requeue(
                     "output_language": "en-US",
                     "max_findings": 6,
                     "min_confidence": 0.9,
+                    "max_candidate_chunks": 9,
+                    "max_llm_calls_per_job": 24,
+                    "max_tool_calls_per_job": 40,
+                    "max_input_tokens_per_job": 240000,
                 },
             },
         )
@@ -571,9 +618,20 @@ def test_admin_live_controls_runtime_config_and_requeue(
 
         settings_page = client.get("/settings", auth=auth)
         assert 'value="en-US" selected' in settings_page.text
+        assert 'name="review.max_candidate_chunks" value="9"' in settings_page.text
+        assert 'name="review.max_llm_calls_per_job" value="24"' in settings_page.text
+        assert 'name="review.max_tool_calls_per_job" value="40"' in settings_page.text
+        assert 'name="review.max_input_tokens_per_job" value="240000"' in settings_page.text
+        assert "Restart required:" in settings_page.text
         assert 'name="gerrit.ssh_host"' not in settings_page.text
         assert "Saved DB review-policy override is active" in settings_page.text
         assert "snapshot from an earlier release" not in settings_page.text
+
+        effective = asyncio.run(_effective_review_settings(settings))
+        assert effective.max_candidate_chunks == 9
+        assert effective.max_llm_calls_per_job == 24
+        assert effective.max_tool_calls_per_job == 40
+        assert effective.max_input_tokens_per_job == 240000
 
         reset_review = client.post(
             "/api/runtime-config/reset-review",
@@ -635,6 +693,9 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
     assert "Repository tool trace" in response.text
     assert "read_file" in response.text
     assert "fw/train.c" in response.text
+    assert "Review budget / coverage" in response.text
+    assert "3 / 30" in response.text
+    assert "1 / 50" in response.text
 
 
 def test_logs_page_and_api_expose_full_structured_error(

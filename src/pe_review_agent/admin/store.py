@@ -26,6 +26,15 @@ _RUNTIME_CONFIG_KEY = "admin-runtime-config"
 _RUNTIME_STORAGE_VERSION_KEY = "_storage_version"
 _RUNTIME_STORAGE_VERSION = 2
 _LEGACY_SECTIONS_KEY = "_legacy_sections"
+_LEGACY_FULL_SECTION_KEYS: dict[str, frozenset[str]] = {
+    "gerrit": frozenset(
+        {"ssh_host", "ssh_port", "ssh_user", "rest_url", "rest_auth_mode", "rest_username"}
+    ),
+    "llm": frozenset({"base_url", "model", "temperature", "max_output_tokens"}),
+    # v1 snapshots predate the per-job review-budget fields added later. Treat the old complete
+    # review shape as a full snapshot so direct upgrades do not silently lose provenance/warnings.
+    "review": frozenset({"policy_version", "output_language", "max_findings", "min_confidence"}),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,12 +105,11 @@ class ControlStore:
                 legacy_sections: list[str] = []
                 for section in ("gerrit", "llm", "review"):
                     value = stored.get(section)
-                    if (
-                        _looks_like_legacy_full_section(value, defaults[section])
-                        and value == defaults[section]
-                    ):
+                    if _looks_like_legacy_full_section(
+                        section, value, defaults[section]
+                    ) and _legacy_snapshot_matches_defaults(value, defaults[section]):
                         stored.pop(section, None)
-                    elif _looks_like_legacy_full_section(value, defaults[section]):
+                    elif _looks_like_legacy_full_section(section, value, defaults[section]):
                         legacy_sections.append(section)
                 stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
                 if legacy_sections:
@@ -331,6 +339,18 @@ class ControlStore:
                 "output_language": review_cfg.get("output_language", base.review.output_language),
                 "max_findings": review_cfg.get("max_findings", base.review.max_findings),
                 "min_confidence": review_cfg.get("min_confidence", base.review.min_confidence),
+                "max_candidate_chunks": review_cfg.get(
+                    "max_candidate_chunks", base.review.max_candidate_chunks
+                ),
+                "max_llm_calls_per_job": review_cfg.get(
+                    "max_llm_calls_per_job", base.review.max_llm_calls_per_job
+                ),
+                "max_tool_calls_per_job": review_cfg.get(
+                    "max_tool_calls_per_job", base.review.max_tool_calls_per_job
+                ),
+                "max_input_tokens_per_job": review_cfg.get(
+                    "max_input_tokens_per_job", base.review.max_input_tokens_per_job
+                ),
             }
         )
 
@@ -648,6 +668,10 @@ def _defaults_from_settings(settings: Settings) -> dict[str, Any]:
             "output_language": settings.review.output_language,
             "max_findings": settings.review.max_findings,
             "min_confidence": settings.review.min_confidence,
+            "max_candidate_chunks": settings.review.max_candidate_chunks,
+            "max_llm_calls_per_job": settings.review.max_llm_calls_per_job,
+            "max_tool_calls_per_job": settings.review.max_tool_calls_per_job,
+            "max_input_tokens_per_job": settings.review.max_input_tokens_per_job,
         },
     }
 
@@ -664,8 +688,23 @@ def _merge_runtime_defaults(defaults: dict[str, Any], current: dict[str, Any]) -
     return merged
 
 
-def _looks_like_legacy_full_section(value: Any, defaults: dict[str, Any]) -> bool:
-    return isinstance(value, dict) and set(value) >= set(defaults)
+def _looks_like_legacy_full_section(
+    section: str,
+    value: Any,
+    defaults: dict[str, Any],
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = _LEGACY_FULL_SECTION_KEYS.get(section, frozenset(defaults))
+    return set(value) >= required
+
+
+def _legacy_snapshot_matches_defaults(value: Any, defaults: dict[str, Any]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    # Fields introduced after the snapshot are intentionally absent and therefore keep the current
+    # config.yaml/default value. Only fields the legacy snapshot actually stored can mask config.
+    return all(defaults.get(key) == item for key, item in value.items())
 
 
 def _attempt_display_status(job: Job, attempt: Attempt, now: datetime) -> str:

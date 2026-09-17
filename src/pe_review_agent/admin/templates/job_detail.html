@@ -78,8 +78,10 @@
                   {% if event.status == 'ok' %}<span class="badge bg-green-lt">ok</span>
                   {% elif event.status == 'duplicate_suppressed' %}<span class="badge bg-yellow-lt">duplicate suppressed</span>
                   {% elif event.status == 'round_limit_suppressed' %}<span class="badge bg-orange-lt">round limit suppressed</span>
+                  {% elif event.status == 'job_budget_suppressed' %}<span class="badge bg-orange-lt">job budget suppressed</span>
                   {% elif event.status == 'empty' %}<span class="badge bg-secondary-lt">empty</span>
                   {% elif event.status == 'error' %}<span class="badge bg-red-lt">error</span>
+                  {% elif event.event == 'budget_exhausted' %}<span class="badge bg-orange-lt">budget: {{ event.reason }}</span>
                   {% elif event.event == 'forced_finalization' %}<span class="badge bg-azure-lt">finalize: {{ event.reason }}</span>
                   {% else %}<span class="badge bg-secondary-lt">{{ event.status or event.event }}</span>{% endif %}
                 </td>
@@ -108,6 +110,23 @@
       <div class="col-md-4"><div class="subheader">Input tokens</div><div>{{ audit.review.input_tokens or '—' }}</div></div>
       <div class="col-md-4"><div class="subheader">Output tokens</div><div>{{ audit.review.output_tokens or '—' }}</div></div>
     </div>
+    {% set budget = audit.review.metadata.get('review_budget') %}
+    {% if budget %}
+    <div class="card bg-secondary-lt mb-4">
+      <div class="card-body">
+        <div class="fw-semibold mb-2">Review budget / coverage</div>
+        <div class="row g-3 small">
+          <div class="col-md-3"><div class="subheader">Candidate chunks</div><div>{{ budget.candidate_chunks_reviewed }} / {{ budget.candidate_chunks_total }}</div></div>
+          <div class="col-md-3"><div class="subheader">Complete diff coverage</div><div>{{ budget.reviewable_files_fully_reviewed }} / {{ budget.reviewable_files_total }} files</div></div>
+          <div class="col-md-2"><div class="subheader">LLM calls</div><div>{{ budget.llm_calls }} / {{ budget.limits.max_llm_calls_per_job }}</div></div>
+          <div class="col-md-2"><div class="subheader">Tool calls</div><div>{{ budget.tool_calls }} / {{ budget.limits.max_tool_calls_per_job }}</div></div>
+          <div class="col-md-2"><div class="subheader">Verification</div><div>{{ 'complete' if budget.verification_complete else 'incomplete' }}</div></div>
+        </div>
+        {% if budget.stop_reasons %}<div class="text-warning mt-2">Budget stop: <code>{{ budget.stop_reasons | join(', ') }}</code></div>{% endif %}
+        {% if budget.uncovered_files %}<details class="mt-2"><summary>Uncovered files ({{ budget.reviewable_files_total - budget.reviewable_files_fully_reviewed }})</summary><pre class="audit-pre mt-2">{{ budget.uncovered_files | join('\n') }}{% if budget.uncovered_files_truncated %}\n&lt;truncated&gt;{% endif %}</pre></details>{% endif %}
+      </div>
+    </div>
+    {% endif %}
     <div class="subheader mb-2">Change-level summary</div>
     <pre class="audit-pre mb-4">{{ audit.review.summary }}</pre>
     <div class="subheader mb-2">Findings / inline comments</div>
