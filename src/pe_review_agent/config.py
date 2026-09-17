@@ -111,6 +111,8 @@ class ReviewSettings(StrictSettingsModel):
     max_findings: int = Field(default=8, ge=0, le=50)
     min_confidence: float = Field(default=0.82, ge=0.0, le=1.0)
     max_tool_rounds: int = Field(default=8, ge=0, le=64)
+    # Per-file ceiling for static review-policy context. Repository read_file tool calls stream
+    # requested line ranges independently and are bounded by max_tool_output_bytes instead.
     max_context_file_bytes: int = Field(default=256_000, ge=1024)
     max_policy_bytes: int = Field(default=128_000, ge=1024, le=1_000_000)
     max_diff_chunk_chars: int = Field(default=70_000, ge=4_000, le=500_000)

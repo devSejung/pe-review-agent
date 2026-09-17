@@ -22,7 +22,11 @@ class RepositoryToolExecutor:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read a bounded line range from a repository text file.",
+                    "description": (
+                        "Read a bounded line range from a repository text file. Large text files "
+                        "are supported; prefer a targeted range after search_text. Omitting line "
+                        "bounds reads at most 200 lines."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -81,7 +85,8 @@ class RepositoryToolExecutor:
                     return json.dumps({"error": "read_file end_line must be an integer"})
                 if end_line < 1:
                     return json.dumps({"error": "read_file end_line must be positive"})
-            return self.read_file(
+            return await asyncio.to_thread(
+                self.read_file,
                 path,
                 start_line=_bounded_int(arguments.get("start_line", 1), default=1, low=1),
                 end_line=end_line,
@@ -111,23 +116,15 @@ class RepositoryToolExecutor:
         target = self._resolve(path)
         if not target.is_file():
             return json.dumps({"error": "file not found", "path": path})
-        if target.stat().st_size > self.settings.max_context_file_bytes:
-            return json.dumps(
-                {
-                    "error": "file exceeds context size limit",
-                    "path": path,
-                    "size": target.stat().st_size,
-                }
-            )
-        try:
-            text = target.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return json.dumps({"error": "binary/non-UTF8 file", "path": path})
-        lines = text.splitlines()
         start = max(1, start_line)
-        end = min(len(lines), int(end_line) if end_line else start + 199)
-        payload = "\n".join(f"{idx}: {lines[idx - 1]}" for idx in range(start, end + 1))
-        return _truncate_text_bytes(payload or "<empty>", self.settings.max_tool_output_bytes)
+        end = int(end_line) if end_line else start + 199
+        return _read_text_range_bounded(
+            target,
+            path=path,
+            start_line=start,
+            end_line=end,
+            max_output_bytes=self.settings.max_tool_output_bytes,
+        )
 
     async def search_text(
         self, query: str, *, path: str | None = None, max_results: int = 40
@@ -157,9 +154,7 @@ class RepositoryToolExecutor:
         text = stdout.decode("utf-8", errors="replace")
         truncated_by_bytes = "<tool output truncated by byte limit>" in text
         lines = [
-            line
-            for line in text.splitlines()
-            if line != "<tool output truncated by byte limit>"
+            line for line in text.splitlines() if line != "<tool output truncated by byte limit>"
         ][:max_results]
         if truncated_by_bytes:
             lines.append("<tool output truncated by byte limit>")
@@ -181,9 +176,7 @@ class RepositoryToolExecutor:
         text = stdout.decode("utf-8", errors="replace")
         truncated_by_bytes = "<tool output truncated by byte limit>" in text
         lines = [
-            line
-            for line in text.splitlines()
-            if line != "<tool output truncated by byte limit>"
+            line for line in text.splitlines() if line != "<tool output truncated by byte limit>"
         ][:500]
         if truncated_by_bytes:
             lines.append("<tool output truncated by byte limit>")
@@ -267,3 +260,49 @@ def _truncate_text_bytes(value: str, limit: int) -> str:
     keep = max(0, limit - len(marker_bytes))
     prefix = encoded[:keep].decode("utf-8", errors="ignore")
     return prefix + marker
+
+
+def _read_text_range_bounded(
+    target: Path,
+    *,
+    path: str,
+    start_line: int,
+    end_line: int,
+    max_output_bytes: int,
+) -> str:
+    """Read only the requested lines without loading an arbitrarily large file into memory."""
+
+    if end_line < start_line:
+        return "<empty>"
+
+    parts: list[str] = []
+    used_bytes = 0
+    try:
+        with target.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if line_number < start_line:
+                    continue
+                if line_number > end_line:
+                    break
+
+                raw_line = raw_line.rstrip(b"\r\n")
+                if b"\x00" in raw_line:
+                    return json.dumps({"error": "binary/non-UTF8 file", "path": path})
+                try:
+                    text = raw_line.decode("utf-8")
+                except UnicodeDecodeError:
+                    return json.dumps({"error": "binary/non-UTF8 file", "path": path})
+
+                rendered = f"{line_number}: {text}"
+                separator_bytes = 1 if parts else 0
+                rendered_bytes = len(rendered.encode("utf-8"))
+                if used_bytes + separator_bytes + rendered_bytes > max_output_bytes:
+                    candidate = "\n".join([*parts, rendered])
+                    return _truncate_text_bytes(candidate, max_output_bytes)
+
+                parts.append(rendered)
+                used_bytes += separator_bytes + rendered_bytes
+    except OSError as exc:
+        return json.dumps({"error": str(exc), "path": path})
+
+    return "\n".join(parts) if parts else "<empty>"

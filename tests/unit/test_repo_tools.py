@@ -149,9 +149,7 @@ async def test_malformed_tool_arguments_return_error_instead_of_raising(tmp_path
     missing_path = await executor.execute("read_file", {})
     bad_query = await executor.execute("search_text", {"query": 123})
     bad_list_path = await executor.execute("list_files", {"path": ["nope"]})
-    bad_end_line = await executor.execute(
-        "read_file", {"path": "missing", "end_line": [1]}
-    )
+    bad_end_line = await executor.execute("read_file", {"path": "missing", "end_line": [1]})
 
     assert "requires non-empty string path" in missing_path
     assert "requires non-empty string query" in bad_query
@@ -186,6 +184,50 @@ def test_repository_read_file_obeys_tool_output_byte_limit(tmp_path: Path) -> No
     result = executor.read_file("many.txt", start_line=1, end_line=5_000)
 
     assert result.endswith("<tool output truncated by byte limit>")
+    assert len(result.encode("utf-8")) <= 4096
+
+
+def test_repository_read_file_streams_range_from_large_file(tmp_path: Path) -> None:
+    target = tmp_path / "LPDDR56_PHY.csv"
+    target.write_text(
+        "\n".join(f"REG_{index},0x{index:08x},FIELD_{index}" for index in range(40_000)),
+        encoding="utf-8",
+    )
+    assert target.stat().st_size > 256_000
+    executor = RepositoryToolExecutor(
+        tmp_path,
+        ReviewSettings(max_context_file_bytes=4096, max_tool_output_bytes=4096),
+    )
+
+    result = executor.read_file("LPDDR56_PHY.csv", start_line=20_001, end_line=20_003)
+
+    assert result.splitlines() == [
+        "20001: REG_20000,0x00004e20,FIELD_20000",
+        "20002: REG_20001,0x00004e21,FIELD_20001",
+        "20003: REG_20002,0x00004e22,FIELD_20002",
+    ]
+
+
+def test_repository_read_file_stops_at_output_limit_before_rest_of_large_file(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "registers.csv"
+    with target.open("wb") as handle:
+        for index in range(20_000):
+            handle.write(f"REG_{index},".encode() + b"x" * 200 + b"\n")
+        # If read_file unnecessarily scans/decodes the whole file after the output limit is reached,
+        # this invalid UTF-8 tail would turn a valid bounded read into an error.
+        handle.write(b"\xff\xfe\x00\n")
+
+    executor = RepositoryToolExecutor(
+        tmp_path,
+        ReviewSettings(max_context_file_bytes=1024, max_tool_output_bytes=4096),
+    )
+
+    result = executor.read_file("registers.csv", start_line=1, end_line=100_000)
+
+    assert result.endswith("<tool output truncated by byte limit>")
+    assert "binary/non-UTF8" not in result
     assert len(result.encode("utf-8")) <= 4096
 
 
