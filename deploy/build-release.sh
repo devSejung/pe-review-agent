@@ -15,7 +15,15 @@ postgres_image="pe-review-postgres:16.15"
 rm -rf "$release"
 mkdir -p "$release/docker-images" "$release/secrets"
 
-docker build -t "$image" "$root"
+docker_build_args=()
+if [[ -n "${PIP_INDEX_URL:-}" ]]; then
+  docker_build_args+=(--build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}")
+fi
+if [[ -n "${PIP_TRUSTED_HOST:-}" ]]; then
+  docker_build_args+=(--build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}")
+fi
+
+docker build "${docker_build_args[@]}" -t "$image" "$root"
 docker pull "$postgres_ref"
 docker tag "$postgres_ref" "$postgres_image"
 docker save -o "$release/docker-images/gerrit-ai-reviewer.tar" "$image"

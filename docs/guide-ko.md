@@ -82,10 +82,31 @@ sudo docker ps
 
 repo root에서 다음을 실행합니다.
 
+public PyPI에 직접 접근 가능한 환경이면:
+
 ```bash
 cd ~/pe-review-agent
 sudo docker build -t gerrit-ai-reviewer:local .
 ```
+
+사내망에서 public PyPI가 차단되어 있고 사내 PyPI mirror를 사용해야 한다면 아래처럼 build arg를
+추가합니다. `PYPI_MIRROR_URL`과 `PYPI_MIRROR_HOST`는 회사에서 안내한 실제 값으로 바꾸세요.
+
+```bash
+cd ~/pe-review-agent
+
+sudo docker build \
+  --build-arg PIP_INDEX_URL="PYPI_MIRROR_URL" \
+  --build-arg PIP_TRUSTED_HOST="PYPI_MIRROR_HOST" \
+  -t gerrit-ai-reviewer:local .
+```
+
+예를 들어 mirror URL이 `https://repository.example.internal/repository/pypi/simple`이라면 host 값은
+`repository.example.internal`입니다.
+
+이 두 값은 Docker image runtime 설정이 아니라 **image를 만드는 동안 pip가 어느 package index를
+사용할지** 정하는 값입니다. `PIP_INDEX_URL`을 지정하지 않으면 기존과 동일하게 pip 기본 index를
+사용합니다.
 
 완료 후 image가 생겼는지 확인합니다.
 
@@ -95,8 +116,10 @@ sudo docker image ls gerrit-ai-reviewer
 
 `gerrit-ai-reviewer`와 `local` tag가 보이면 정상입니다.
 
-> 이 단계에서 public PyPI/apt/Docker registry 접근이 막혀 build가 실패하는 사내망이라면 억지로
-> 계속 진행하지 말고 아래의 **offline release 설치** 절을 사용하세요.
+> Docker registry는 사내 mirror로 연결됐는데 build 중 `pip ... /simple/...`에서 connection reset이
+> 난다면 Docker 문제가 아니라 pip가 public PyPI로 나가고 있는 경우가 많습니다. 이때 위의
+> `PIP_INDEX_URL` / `PIP_TRUSTED_HOST` build arg를 사용하세요. 사내 mirror 자체가 없으면 아래의
+> **offline release 설치** 절을 사용하세요.
 
 ### 5단계. PostgreSQL image 준비
 
@@ -1139,6 +1162,15 @@ cd ~/gerrit-ai-reviewer
 sudo docker build -t gerrit-ai-reviewer:local .
 ```
 
+사내 PyPI mirror가 필요한 경우:
+
+```bash
+sudo docker build \
+  --build-arg PIP_INDEX_URL="PYPI_MIRROR_URL" \
+  --build-arg PIP_TRUSTED_HOST="PYPI_MIRROR_HOST" \
+  -t gerrit-ai-reviewer:local .
+```
+
 Compose는 PostgreSQL image를 `pe-review-postgres:16.15`라는 local tag로 사용합니다. 현재 release
 builder와 동일한 pinned PostgreSQL image를 준비하려면:
 
@@ -1169,6 +1201,14 @@ pe-review-postgres   16.15
 인터넷 가능한 machine에서 repo root 기준으로:
 
 ```bash
+./deploy/build-release.sh 0.1.0
+```
+
+release를 만드는 machine도 public PyPI 대신 사내 PyPI mirror를 써야 한다면:
+
+```bash
+PIP_INDEX_URL="PYPI_MIRROR_URL" \
+PIP_TRUSTED_HOST="PYPI_MIRROR_HOST" \
 ./deploy/build-release.sh 0.1.0
 ```
 
