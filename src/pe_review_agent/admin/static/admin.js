@@ -76,6 +76,34 @@
     });
   });
 
+  document.querySelectorAll('[data-reset-connections]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (!window.confirm('Clear saved connection overrides and use config.yaml values after restart?')) return;
+      button.disabled = true;
+      try {
+        const result = await api('/api/runtime-config/reset-connections', {
+          method: 'POST', body: '{}',
+        });
+        show(result.detail || 'Connection overrides cleared.', 'warning');
+        window.setTimeout(() => window.location.reload(), 500);
+      } catch (error) { show(error.message, 'danger'); button.disabled = false; }
+    });
+  });
+
+  document.querySelectorAll('[data-reset-review]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      if (!window.confirm('Clear the saved review-policy override and use config.yaml values after restart?')) return;
+      button.disabled = true;
+      try {
+        const result = await api('/api/runtime-config/reset-review', {
+          method: 'POST', body: '{}',
+        });
+        show(result.detail || 'Review policy override cleared.', 'warning');
+        window.setTimeout(() => window.location.reload(), 500);
+      } catch (error) { show(error.message, 'danger'); button.disabled = false; }
+    });
+  });
+
   document.querySelectorAll('[data-project-toggle]').forEach((button) => {
     button.addEventListener('click', async () => {
       button.disabled = true;

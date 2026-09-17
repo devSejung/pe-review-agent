@@ -182,6 +182,13 @@ class LlmClient:
 
 def assistant_message_for_tool_loop(completion: LlmCompletion) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": completion.content or None}
+    # Reasoning-capable OpenAI-compatible servers (including vLLM/Qwen) can return an
+    # interleaved reasoning field alongside tool_calls. Preserve the exact field the provider
+    # emitted so the next tool turn continues the same reasoning trajectory instead of silently
+    # resetting it. reasoning_content is retained for older compatible servers.
+    for key in ("reasoning", "reasoning_content"):
+        if key in completion.raw_message and completion.raw_message[key] is not None:
+            message[key] = completion.raw_message[key]
     if completion.tool_calls:
         message["tool_calls"] = [
             {

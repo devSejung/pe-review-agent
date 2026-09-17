@@ -23,6 +23,9 @@ from pe_review_agent.jobs.models import (
 )
 
 _RUNTIME_CONFIG_KEY = "admin-runtime-config"
+_RUNTIME_STORAGE_VERSION_KEY = "_storage_version"
+_RUNTIME_STORAGE_VERSION = 2
+_LEGACY_SECTIONS_KEY = "_legacy_sections"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,9 +70,46 @@ class ControlStore:
             # ON CONFLICT keeps first boot idempotent even when all four processes seed together.
             await session.execute(
                 pg_insert(ServiceState)
-                .values(key=_RUNTIME_CONFIG_KEY, json_value=_defaults_from_settings(settings))
+                .values(
+                    key=_RUNTIME_CONFIG_KEY,
+                    # Persist only true runtime overrides. Connection/review defaults continue to
+                    # come from config.yaml until an operator explicitly saves them in Admin Web.
+                    json_value={
+                        "service_enabled": settings.service.enabled,
+                        _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                    },
+                )
                 .on_conflict_do_nothing(index_elements=[ServiceState.key])
             )
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY, with_for_update=True)
+            if (
+                row is not None
+                and row.json_value.get(_RUNTIME_STORAGE_VERSION_KEY) != _RUNTIME_STORAGE_VERSION
+            ):
+                # Releases before override-only storage seeded a complete snapshot of config.yaml
+                # into this row. If an old section still exactly matches today's bootstrap config,
+                # dropping it is semantics-preserving and prevents it from becoming a fake
+                # override after upgrade. If it differs, preserve it: the difference may be an
+                # intentional historical Admin edit, and the UI exposes an explicit reset path.
+                defaults = _defaults_from_settings(settings)
+                stored = dict(row.json_value or {})
+                legacy_sections: list[str] = []
+                for section in ("gerrit", "llm", "review"):
+                    value = stored.get(section)
+                    if (
+                        _looks_like_legacy_full_section(value, defaults[section])
+                        and value == defaults[section]
+                    ):
+                        stored.pop(section, None)
+                    elif _looks_like_legacy_full_section(value, defaults[section]):
+                        legacy_sections.append(section)
+                stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
+                if legacy_sections:
+                    stored[_LEGACY_SECTIONS_KEY] = legacy_sections
+                else:
+                    stored.pop(_LEGACY_SECTIONS_KEY, None)
+                row.json_value = stored
+                row.updated_at = datetime.now(UTC)
 
     async def runtime_config(self, settings: Settings) -> dict[str, Any]:
         async with self._sessions() as session:
@@ -92,7 +132,10 @@ class ControlStore:
                     pg_insert(ServiceState)
                     .values(
                         key=_RUNTIME_CONFIG_KEY,
-                        json_value=_defaults_from_settings(settings),
+                        json_value={
+                            "service_enabled": settings.service.enabled,
+                            _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                        },
                     )
                     .on_conflict_do_nothing(index_elements=[ServiceState.key])
                 )
@@ -100,20 +143,120 @@ class ControlStore:
                 if row is None:
                     raise RuntimeError("failed to initialize durable runtime configuration")
 
-            current = _merge_runtime_defaults(
-                _defaults_from_settings(settings),
-                row.json_value,
-            )
+            stored = dict(row.json_value or {})
             for key, value in updates.items():
-                if isinstance(value, dict) and isinstance(current.get(key), dict):
-                    current[key] = {**current[key], **value}
+                if isinstance(value, dict) and isinstance(stored.get(key), dict):
+                    stored[key] = {**stored[key], **value}
                 else:
-                    current[key] = value
-            # Assign a fresh JSON object so SQLAlchemy always detects the mutation.
-            row.json_value = current
+                    stored[key] = value
+            stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
+            # Store only explicit overrides instead of a frozen copy of every config.yaml default.
+            row.json_value = stored
             row.updated_at = datetime.now(UTC)
             await session.flush()
-            return current
+            return _merge_runtime_defaults(_defaults_from_settings(settings), stored)
+
+    async def replace_runtime_sections(
+        self,
+        settings: Settings,
+        updates: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Replace web-managed sections with only values that differ from config.yaml.
+
+        Admin forms submit the complete visible section. Persisting that complete form would freeze
+        unrelated config.yaml fields after the first save. Diffing against the current bootstrap
+        settings keeps only intentional web overrides while still letting a full form validate as a
+        coherent configuration.
+        """
+
+        defaults = _defaults_from_settings(settings)
+        async with self._sessions.begin() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY, with_for_update=True)
+            if row is None:
+                await session.execute(
+                    pg_insert(ServiceState)
+                    .values(
+                        key=_RUNTIME_CONFIG_KEY,
+                        json_value={
+                            "service_enabled": settings.service.enabled,
+                            _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                        },
+                    )
+                    .on_conflict_do_nothing(index_elements=[ServiceState.key])
+                )
+                row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY, with_for_update=True)
+                if row is None:
+                    raise RuntimeError("failed to initialize durable runtime configuration")
+
+            stored = dict(row.json_value or {})
+            legacy_sections = set(stored.get(_LEGACY_SECTIONS_KEY) or [])
+            for section, values in updates.items():
+                section_defaults = defaults.get(section)
+                if not isinstance(section_defaults, dict):
+                    raise ValueError(f"unsupported runtime configuration section: {section}")
+                override = {
+                    key: value
+                    for key, value in values.items()
+                    if value != section_defaults.get(key)
+                }
+                if override:
+                    stored[section] = override
+                else:
+                    stored.pop(section, None)
+                legacy_sections.discard(section)
+
+            stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
+            if legacy_sections:
+                stored[_LEGACY_SECTIONS_KEY] = sorted(legacy_sections)
+            else:
+                stored.pop(_LEGACY_SECTIONS_KEY, None)
+            row.json_value = stored
+            row.updated_at = datetime.now(UTC)
+            await session.flush()
+            return _merge_runtime_defaults(defaults, stored)
+
+    async def runtime_override_sections(self) -> set[str]:
+        async with self._sessions() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY)
+            if row is None:
+                return set()
+            return {
+                key
+                for key in row.json_value
+                if key
+                not in {"service_enabled", _RUNTIME_STORAGE_VERSION_KEY, _LEGACY_SECTIONS_KEY}
+            }
+
+    async def legacy_runtime_snapshot_sections(self, settings: Settings) -> set[str]:
+        """Identify preserved pre-override-only full sections for an operator warning."""
+
+        async with self._sessions() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY)
+            if row is None:
+                return set()
+            return set(row.json_value.get(_LEGACY_SECTIONS_KEY) or [])
+
+    async def reset_runtime_sections(self, settings: Settings, *sections: str) -> dict[str, Any]:
+        """Drop selected Admin Web overrides so config.yaml becomes authoritative again."""
+
+        async with self._sessions.begin() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY, with_for_update=True)
+            if row is None:
+                return _defaults_from_settings(settings)
+            stored = dict(row.json_value or {})
+            legacy_sections = set(stored.get(_LEGACY_SECTIONS_KEY) or [])
+            for section in sections:
+                stored.pop(section, None)
+                legacy_sections.discard(section)
+            stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
+            if legacy_sections:
+                stored[_LEGACY_SECTIONS_KEY] = sorted(legacy_sections)
+            else:
+                stored.pop(_LEGACY_SECTIONS_KEY, None)
+            row.json_value = stored
+            row.updated_at = datetime.now(UTC)
+            await session.flush()
+            return _merge_runtime_defaults(_defaults_from_settings(settings), stored)
 
     async def service_enabled(self, *, default: bool) -> bool:
         # The bootstrap setting is a hard operational kill switch. A stale DB value must never
@@ -140,10 +283,24 @@ class ControlStore:
         )
 
         gerrit_cfg = runtime.get("gerrit") or {}
+        rest_mode = gerrit_cfg.get("rest_auth_mode", base.gerrit.rest_auth.mode)
         rest_auth = base.gerrit.rest_auth.model_copy(
             update={
-                "mode": gerrit_cfg.get("rest_auth_mode", base.gerrit.rest_auth.mode),
+                "mode": rest_mode,
                 "username": gerrit_cfg.get("rest_username", base.gerrit.rest_auth.username),
+                # Admin Web deliberately never stores secrets. If an operator switches from
+                # bootstrap auth=None to Basic/Bearer in the UI, use the standard Compose secret
+                # environment variable names instead of ending up with an unusable None secret.
+                "password_env": (
+                    base.gerrit.rest_auth.password_env or "PE_REVIEW_GERRIT_HTTP_PASSWORD"
+                    if rest_mode == "basic"
+                    else base.gerrit.rest_auth.password_env
+                ),
+                "token_env": (
+                    base.gerrit.rest_auth.token_env or "PE_REVIEW_GERRIT_TOKEN"
+                    if rest_mode == "bearer"
+                    else base.gerrit.rest_auth.token_env
+                ),
             }
         )
         gerrit = base.gerrit.model_copy(
@@ -163,9 +320,7 @@ class ControlStore:
                 "base_url": llm_cfg.get("base_url", base.llm.base_url),
                 "model": llm_cfg.get("model", base.llm.model),
                 "temperature": llm_cfg.get("temperature", base.llm.temperature),
-                "max_output_tokens": llm_cfg.get(
-                    "max_output_tokens", base.llm.max_output_tokens
-                ),
+                "max_output_tokens": llm_cfg.get("max_output_tokens", base.llm.max_output_tokens),
             }
         )
 
@@ -173,9 +328,7 @@ class ControlStore:
         review = base.review.model_copy(
             update={
                 "policy_version": review_cfg.get("policy_version", base.review.policy_version),
-                "output_language": review_cfg.get(
-                    "output_language", base.review.output_language
-                ),
+                "output_language": review_cfg.get("output_language", base.review.output_language),
                 "max_findings": review_cfg.get("max_findings", base.review.max_findings),
                 "min_confidence": review_cfg.get("min_confidence", base.review.min_confidence),
             }
@@ -243,9 +396,10 @@ class ControlStore:
             raise ValueError("project must be between 1 and 512 characters")
         if any(ord(char) < 32 for char in normalized):
             raise ValueError("project cannot contain control characters")
-        now = datetime.now(UTC)
-        review_start_at = now if review_start_mode is ProjectReviewStartMode.FROM_NOW else None
         async with self._sessions.begin() as session:
+            now = await session.scalar(select(func.now()))
+            assert now is not None
+            review_start_at = now if review_start_mode is ProjectReviewStartMode.FROM_NOW else None
             statement = (
                 pg_insert(ManagedProject)
                 .values(
@@ -279,7 +433,8 @@ class ControlStore:
             if enabled and row.review_start_mode == ProjectReviewStartMode.FROM_NOW.value:
                 # Re-enabling FROM_NOW means exactly that: do not backfill Patch Sets uploaded while
                 # the project was disabled.
-                row.review_start_at = datetime.now(UTC)
+                row.review_start_at = await session.scalar(select(func.now()))
+                assert row.review_start_at is not None
                 await _skip_pre_cutoff_jobs(session, row.project, row.review_start_at)
             row.updated_at = datetime.now(UTC)
             await session.flush()
@@ -296,7 +451,9 @@ class ControlStore:
                 raise KeyError(project)
             row.review_start_mode = mode.value
             row.review_start_at = (
-                datetime.now(UTC) if mode is ProjectReviewStartMode.FROM_NOW else None
+                await session.scalar(select(func.now()))
+                if mode is ProjectReviewStartMode.FROM_NOW
+                else None
             )
             if row.review_start_at is not None:
                 await _skip_pre_cutoff_jobs(session, row.project, row.review_start_at)
@@ -398,6 +555,7 @@ class ControlStore:
             )
 
             audit = _job_dict(job)
+            now = datetime.now(UTC)
             audit["attempts"] = [
                 {
                     "attempt_number": attempt.attempt_number,
@@ -406,9 +564,11 @@ class ControlStore:
                     "started_at": attempt.started_at,
                     "finished_at": attempt.finished_at,
                     "success": attempt.success,
+                    "display_status": _attempt_display_status(job, attempt, now),
                     "retryable": attempt.retryable,
                     "error_class": attempt.error_class,
                     "error_message": attempt.error_message,
+                    "tool_events": list(attempt.tool_events or []),
                 }
                 for attempt in attempts
             ]
@@ -495,11 +655,33 @@ def _defaults_from_settings(settings: Settings) -> dict[str, Any]:
 def _merge_runtime_defaults(defaults: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = dict(defaults)
     for key, value in current.items():
+        if key.startswith("_"):
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = {**merged[key], **value}
         else:
             merged[key] = value
     return merged
+
+
+def _looks_like_legacy_full_section(value: Any, defaults: dict[str, Any]) -> bool:
+    return isinstance(value, dict) and set(value) >= set(defaults)
+
+
+def _attempt_display_status(job: Job, attempt: Attempt, now: datetime) -> str:
+    if attempt.success is True:
+        return "success"
+    if attempt.success is False:
+        return "failed"
+    if (
+        attempt.finished_at is None
+        and job.lease_owner == attempt.worker_id
+        and job.lease_expires_at is not None
+        and job.lease_expires_at > now
+        and JobState(job.state) not in TERMINAL_JOB_STATES
+    ):
+        return "running"
+    return "abandoned"
 
 
 def _job_dict(job: Job) -> dict[str, Any]:

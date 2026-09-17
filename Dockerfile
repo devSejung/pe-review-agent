@@ -20,8 +20,8 @@ FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1
 # Optional corporate Debian mirror support. python:3.12-slim is Debian-based,
 # so these must point at Debian repositories, not the Ubuntu repositories used
 # by the host OS. When omitted, the image keeps its normal Debian sources.
-ARG APT_DEBIAN_MIRROR_URL
-ARG APT_DEBIAN_SECURITY_MIRROR_URL
+ARG APT_DEBIAN_MIRROR_URL=""
+ARG APT_DEBIAN_SECURITY_MIRROR_URL=""
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

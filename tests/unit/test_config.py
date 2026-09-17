@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from pe_review_agent.config import (
     AdminSettings,
     DatabaseSettings,
+    GerritRestAuth,
     GerritSettings,
     ReviewSettings,
     ServiceSettings,
@@ -73,6 +74,18 @@ def test_review_language_defaults_to_korean_and_rejects_unknown_values() -> None
     assert ReviewSettings(output_language="en-US").output_language == "en-US"
     with pytest.raises(ValidationError, match="output_language"):
         ReviewSettings.model_validate({"output_language": "ja-JP"})
+
+
+def test_none_gerrit_auth_never_reports_a_secret(monkeypatch) -> None:
+    monkeypatch.setenv("PE_REVIEW_GERRIT_TOKEN", "should-not-be-used")
+    auth = GerritRestAuth(mode="none", token_env="PE_REVIEW_GERRIT_TOKEN")
+    assert auth.secret() is None
+
+
+def test_review_tool_round_limit_allows_operational_headroom() -> None:
+    assert ReviewSettings(max_tool_rounds=64).max_tool_rounds == 64
+    with pytest.raises(ValidationError):
+        ReviewSettings(max_tool_rounds=65)
 
 
 def test_unknown_nested_yaml_setting_fails_check_config(monkeypatch, tmp_path: Path) -> None:

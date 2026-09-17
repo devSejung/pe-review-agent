@@ -383,11 +383,16 @@ The UI has six operational surfaces:
   project to **Include current open Changes** when a backfill is actually wanted. Switching back to
   **From now on** stops queued, unleased pre-cutoff backfill jobs as `SKIPPED_SCOPE`; publication
   intents are preserved for safe Gerrit reconciliation.
-- **Connections** — edit/test Gerrit SSH + REST and the OpenAI-compatible Qwen endpoint.
+- **Connections** — edit/test Gerrit SSH + REST and the OpenAI-compatible Qwen endpoint. The page
+  shows whether connection values come directly from `config.yaml` or from saved Admin overrides;
+  **Use config.yaml values** clears only the saved Gerrit/LLM overrides. Required REST secret state
+  and the effective secret environment variable are shown without exposing the secret value.
 - **Jobs** — filter durable jobs, inspect state/failure text, open the full audit trail, and requeue
   `FAILED_PERMANENT` jobs. The audit page shows every durable attempt, the model summary and findings,
   file/side/line/confidence/evidence/remediation, the exact persisted Gerrit `ReviewInput`, publication
-  status, and Gerrit's response.
+  status, Gerrit's response, and a bounded repository-tool trace for review attempts. An unfinished
+  attempt is shown as **running** only while its worker still owns a live job lease; otherwise it is
+  shown as **abandoned** rather than the ambiguous historical `open/crashed` label.
 - **Logs** — browse receiver/worker/reconciler/admin structured logs, filter by component/level/text,
   auto-refresh every five seconds, and expand the complete JSON/exception traceback instead of a
   truncated one-line error.
@@ -401,10 +406,17 @@ are filtered at event ingestion, reconciliation, **and the PostgreSQL claim quer
 not claimed while a project is disabled. When re-enabled, durable queued jobs become claimable again
 and reconciliation can recover Patch Sets that arrived while disabled.
 
-Gerrit endpoint/auth metadata, LLM endpoint/model, and review-policy edits are persisted in PostgreSQL
-but deliberately require restart of `receiver`, `worker`, and `reconciler`. This avoids mutating
-long-lived HTTP/SSH/model clients in the middle of an active review. On restart the services overlay
-the DB-managed values on top of the bootstrap configuration.
+Gerrit endpoint/auth metadata, LLM endpoint/model, and review-policy edits made in Admin Web are
+persisted in PostgreSQL as explicit overrides and deliberately require restart of `receiver`, `worker`,
+and `reconciler`. Unedited values continue to come from `config.yaml`, so editing the file is no longer
+masked merely because the service booted once. This avoids mutating long-lived HTTP/SSH/model clients
+in the middle of an active review while keeping the bootstrap file authoritative unless an operator
+intentionally saves an override.
+
+On upgrade from a release that stored a complete runtime snapshot, sections that still exactly match
+the current `config.yaml` are pruned automatically. A differing legacy snapshot is preserved rather
+than silently discarding a possible Admin edit; **Connections** and **Settings** warn about it and
+their **Use config.yaml values** controls clear the Gerrit/LLM or review-policy snapshot explicitly.
 
 Secrets remain bootstrap-only:
 

@@ -38,7 +38,12 @@
       <tr>
         <td>{{ attempt.attempt_number }}</td>
         <td><span class="badge bg-blue-lt">{{ attempt.stage }}</span></td>
-        <td>{% if attempt.success is sameas true %}<span class="badge bg-green-lt">success</span>{% elif attempt.success is sameas false %}<span class="badge bg-red-lt">failed</span>{% else %}<span class="badge bg-yellow-lt">open/crashed</span>{% endif %}</td>
+        <td>
+          {% if attempt.display_status == 'success' %}<span class="badge bg-green-lt">success</span>
+          {% elif attempt.display_status == 'failed' %}<span class="badge bg-red-lt">failed</span>
+          {% elif attempt.display_status == 'running' %}<span class="badge bg-blue-lt">running</span>
+          {% else %}<span class="badge bg-yellow-lt">abandoned</span>{% endif %}
+        </td>
         <td class="text-secondary">{{ attempt.started_at }}</td>
         <td class="text-secondary">{{ attempt.finished_at or '—' }}</td>
         <td>{% if attempt.error_message %}<details><summary class="text-danger">{{ attempt.error_class or 'error' }}</summary><pre class="audit-pre mt-2">{{ attempt.error_message }}</pre></details>{% else %}—{% endif %}</td>
@@ -48,6 +53,51 @@
     </table>
   </div>
 </div>
+
+{% set ns = namespace(has_tools=false) %}
+{% for attempt in audit.attempts %}{% if attempt.tool_events %}{% set ns.has_tools = true %}{% endif %}{% endfor %}
+{% if ns.has_tools %}
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Repository tool trace</h3></div>
+  <div class="card-body">
+    <div class="text-secondary small mb-3">Shows what the review model inspected. Result previews are bounded; repeated identical read-only calls are suppressed.</div>
+    {% for attempt in audit.attempts %}
+      {% if attempt.tool_events %}
+      <div class="mb-4">
+        <div class="fw-semibold mb-2">Attempt {{ attempt.attempt_number }} · {{ attempt.stage }}</div>
+        <div class="table-responsive">
+          <table class="table table-sm table-vcenter">
+            <thead><tr><th>Round</th><th>Phase</th><th>Tool / event</th><th>Status</th><th>Arguments / detail</th></tr></thead>
+            <tbody>
+            {% for event in attempt.tool_events %}
+              <tr>
+                <td>{{ event.round or '—' }}</td>
+                <td><span class="badge bg-secondary-lt">{{ event.phase or 'unknown' }}</span></td>
+                <td class="font-monospace">{{ event.tool or event.event }}</td>
+                <td>
+                  {% if event.status == 'ok' %}<span class="badge bg-green-lt">ok</span>
+                  {% elif event.status == 'duplicate_suppressed' %}<span class="badge bg-yellow-lt">duplicate suppressed</span>
+                  {% elif event.status == 'round_limit_suppressed' %}<span class="badge bg-orange-lt">round limit suppressed</span>
+                  {% elif event.status == 'empty' %}<span class="badge bg-secondary-lt">empty</span>
+                  {% elif event.status == 'error' %}<span class="badge bg-red-lt">error</span>
+                  {% elif event.event == 'forced_finalization' %}<span class="badge bg-azure-lt">finalize: {{ event.reason }}</span>
+                  {% else %}<span class="badge bg-secondary-lt">{{ event.status or event.event }}</span>{% endif %}
+                </td>
+                <td>
+                  {% if event.arguments %}<div class="font-monospace small text-break">{{ event.arguments | tojson }}</div>{% endif %}
+                  {% if event.result_preview %}<details class="mt-1"><summary>Result preview · {{ event.result_bytes }} bytes</summary><pre class="audit-pre mt-2">{{ event.result_preview }}</pre></details>{% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
 
 <div class="card mb-4">
   <div class="card-header"><h3 class="card-title">Review result</h3></div>

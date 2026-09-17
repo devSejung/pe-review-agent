@@ -103,7 +103,9 @@ def _claim_select(now: datetime):
     older = aliased(Job)
     any_managed_projects = exists(select(1).select_from(ManagedProject))
     project_is_enabled = exists(
-        select(1).select_from(ManagedProject).where(
+        select(1)
+        .select_from(ManagedProject)
+        .where(
             ManagedProject.project == Job.project,
             ManagedProject.enabled.is_(True),
         )
@@ -244,8 +246,7 @@ class JobStore:
                     JobState(job.state) is JobState.SKIPPED_SCOPE
                     and project_scope is not None
                     and project_scope.enabled
-                    and project_scope.review_start_mode
-                    == ProjectReviewStartMode.INCLUDE_OPEN.value
+                    and project_scope.review_start_mode == ProjectReviewStartMode.INCLUDE_OPEN.value
                 ):
                     # INCLUDE_OPEN explicitly opts the project back into current open Changes. A
                     # reconciliation event for a still-open revision can therefore revive a prior
@@ -697,6 +698,22 @@ class JobStore:
             if result.rowcount != 1:
                 raise RuntimeError(f"attempt {attempt_id} is missing or already finished")
 
+    async def append_attempt_tool_event(self, attempt_id: int, event: dict[str, Any]) -> None:
+        """Append one bounded tool-loop audit event while the review is still running."""
+
+        async with self._sessions.begin() as session:
+            attempt = await session.get(Attempt, attempt_id, with_for_update=True)
+            if attempt is None:
+                raise KeyError(attempt_id)
+            events = list(attempt.tool_events or [])
+            # max_tool_rounds bounds the normal case. Keep a hard DB guard in case a future model
+            # emits very large parallel batches in a single round.
+            if len(events) >= 512:
+                return
+            events.append(event)
+            attempt.tool_events = events
+            await session.flush()
+
     async def save_review_result_and_mark_ready(
         self,
         job_id: uuid.UUID,
@@ -830,9 +847,7 @@ class JobStore:
                     Job.review_policy_version == job.review_policy_version,
                     Job.patchset_number < job.patchset_number,
                     Job.state == JobState.DONE.value,
-                    ReviewResultRow.review_metadata["lineage_complete"]
-                    .as_boolean()
-                    .is_not(False),
+                    ReviewResultRow.review_metadata["lineage_complete"].as_boolean().is_not(False),
                 )
                 .order_by(Job.patchset_number.desc(), Job.created_at.desc())
                 .limit(1)

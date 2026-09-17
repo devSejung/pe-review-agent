@@ -23,6 +23,7 @@ from pe_review_agent.domain import (
     Severity,
 )
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
+from pe_review_agent.jobs.models import ServiceState
 from pe_review_agent.retry import PermanentError
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
@@ -131,6 +132,19 @@ async def _published_job(settings: Settings):  # type: ignore[no-untyped-def]
             stage=AttemptStage.REVIEW,
             worker_id="audit-worker",
         )
+        await store.append_attempt_tool_event(
+            review_attempt,
+            {
+                "event": "tool_call",
+                "phase": "candidate:1",
+                "round": 1,
+                "tool": "read_file",
+                "arguments": {"path": "fw/train.c", "start_line": 40, "end_line": 45},
+                "status": "ok",
+                "result_bytes": 96,
+                "result_preview": "40: int rc = poll_done();\n41: advance();",
+            },
+        )
         claimed = await store.transition(job.id, JobState.VALIDATING, worker_id="audit-worker")
         review = ReviewResult(
             summary="Audit summary: one actionable issue was found.",
@@ -200,6 +214,142 @@ async def test_concurrent_control_plane_bootstrap_is_idempotent(tmp_path: Path) 
         assert projects[0].review_start_at is not None
         runtime = await control.runtime_config(settings)
         assert runtime["gerrit"]["ssh_host"] == "gerrit"
+        assert await control.runtime_override_sections() == set()
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_overrides_can_be_reset_to_current_config_yaml(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        await control.patch_runtime_config(
+            settings,
+            {
+                "gerrit": {
+                    "rest_auth_mode": "basic",
+                    "rest_username": "bot",
+                    "rest_url": "https://override-gerrit",
+                },
+                "llm": {"base_url": "https://override-llm/v1"},
+            },
+        )
+        assert await control.runtime_override_sections() == {"gerrit", "llm"}
+
+        effective = await control.effective_settings(settings)
+        assert effective.gerrit.rest_auth.mode == "basic"
+        assert effective.gerrit.rest_auth.password_env == "PE_REVIEW_GERRIT_HTTP_PASSWORD"
+        assert effective.gerrit.rest_url == "https://override-gerrit"
+
+        await control.reset_runtime_sections(settings, "gerrit", "llm")
+        assert await control.runtime_override_sections() == set()
+        reset = await control.effective_settings(settings)
+        assert reset.gerrit.rest_auth.mode == settings.gerrit.rest_auth.mode
+        assert reset.gerrit.rest_url == settings.gerrit.rest_url
+        assert reset.llm.base_url == settings.llm.base_url
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_full_admin_form_persists_only_fields_different_from_config_yaml(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        await control.replace_runtime_sections(
+            settings,
+            {
+                "gerrit": {
+                    "ssh_host": settings.gerrit.ssh_host,
+                    "ssh_port": settings.gerrit.ssh_port,
+                    "ssh_user": settings.gerrit.ssh_user,
+                    "rest_url": "https://admin-override-gerrit",
+                    "rest_auth_mode": settings.gerrit.rest_auth.mode,
+                    "rest_username": settings.gerrit.rest_auth.username,
+                },
+                "llm": {
+                    "base_url": settings.llm.base_url,
+                    "model": settings.llm.model,
+                    "temperature": settings.llm.temperature,
+                    "max_output_tokens": settings.llm.max_output_tokens,
+                },
+            },
+        )
+
+        changed_base = settings.model_copy(
+            update={
+                "gerrit": settings.gerrit.model_copy(update={"ssh_host": "gerrit-from-new-yaml"}),
+                "llm": settings.llm.model_copy(update={"model": "Qwen3.6-New-Yaml"}),
+            }
+        )
+        effective = await control.effective_settings(changed_base)
+        assert effective.gerrit.rest_url == "https://admin-override-gerrit"
+        assert effective.gerrit.ssh_host == "gerrit-from-new-yaml"
+        assert effective.llm.model == "Qwen3.6-New-Yaml"
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_prunes_only_semantics_preserving_legacy_full_snapshot(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        full_gerrit = {
+            "ssh_host": settings.gerrit.ssh_host,
+            "ssh_port": settings.gerrit.ssh_port,
+            "ssh_user": settings.gerrit.ssh_user,
+            "rest_url": settings.gerrit.rest_url,
+            "rest_auth_mode": settings.gerrit.rest_auth.mode,
+            "rest_username": settings.gerrit.rest_auth.username,
+        }
+        full_llm = {
+            "base_url": settings.llm.base_url,
+            "model": settings.llm.model,
+            "temperature": settings.llm.temperature,
+            "max_output_tokens": settings.llm.max_output_tokens,
+        }
+        async with database.sessions.begin() as session:
+            row = await session.get(ServiceState, "admin-runtime-config", with_for_update=True)
+            assert row is not None
+            row.json_value = {
+                "service_enabled": True,
+                "gerrit": full_gerrit,
+                "llm": full_llm,
+            }
+
+        await control.ensure_bootstrap(settings)
+        assert await control.runtime_override_sections() == set()
+        assert await control.legacy_runtime_snapshot_sections(settings) == set()
+
+        async with database.sessions.begin() as session:
+            row = await session.get(ServiceState, "admin-runtime-config", with_for_update=True)
+            assert row is not None
+            row.json_value = {
+                "service_enabled": True,
+                "gerrit": full_gerrit,
+                "llm": full_llm,
+            }
+        changed_base = settings.model_copy(
+            update={"gerrit": settings.gerrit.model_copy(update={"ssh_host": "new-yaml-host"})}
+        )
+        await control.ensure_bootstrap(changed_base)
+        assert "gerrit" in await control.legacy_runtime_snapshot_sections(changed_base)
+        assert "gerrit" in await control.runtime_override_sections()
     finally:
         await database.close()
 
@@ -421,10 +571,37 @@ def test_admin_live_controls_runtime_config_and_requeue(
 
         settings_page = client.get("/settings", auth=auth)
         assert 'value="en-US" selected' in settings_page.text
+        assert 'name="gerrit.ssh_host"' not in settings_page.text
+        assert "Saved DB review-policy override is active" in settings_page.text
+        assert "snapshot from an earlier release" not in settings_page.text
+
+        reset_review = client.post(
+            "/api/runtime-config/reset-review",
+            auth=auth,
+            headers=headers,
+            json={},
+        )
+        assert reset_review.status_code == 200
+        assert reset_review.json()["restart_required"] is True
+        reset_settings = client.get("/settings", auth=auth)
+        assert 'value="ko-KR" selected' in reset_settings.text
+        assert "Review policy source:</strong> config.yaml" in reset_settings.text
 
         connections = client.get("/connections", auth=auth)
         assert "gerrit-new" in connections.text
         assert "qwen-new" in connections.text
+        assert "Saved DB connection overrides are active" in connections.text
+
+        reset_connections = client.post(
+            "/api/runtime-config/reset-connections",
+            auth=auth,
+            headers=headers,
+            json={},
+        )
+        assert reset_connections.status_code == 200
+        assert reset_connections.json()["restart_required"] is True
+        reset_page = client.get("/connections", auth=auth)
+        assert "config.yaml (no saved Admin connection overrides)" in reset_page.text
 
         requeued = client.post(
             f"/api/jobs/{failed_job_id}/requeue",
@@ -455,6 +632,9 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
     assert "Gerrit publication audit" in response.text
     assert "POSTED" in response.text
     assert "Attempt timeline" in response.text
+    assert "Repository tool trace" in response.text
+    assert "read_file" in response.text
+    assert "fw/train.c" in response.text
 
 
 def test_logs_page_and_api_expose_full_structured_error(

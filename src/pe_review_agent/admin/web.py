@@ -152,6 +152,10 @@ def create_admin_app(settings: Settings) -> FastAPI:
         control: ControlStore = request.app.state.control
         runtime = await control.runtime_config(settings)
         effective = await control.effective_settings(settings)
+        overrides = await control.runtime_override_sections()
+        legacy_snapshots = await control.legacy_runtime_snapshot_sections(settings)
+        auth = effective.gerrit.rest_auth
+        rest_secret_env = auth.password_env if auth.mode == "basic" else auth.token_env
         return _render(
             request,
             "connections.html",
@@ -159,6 +163,9 @@ def create_admin_app(settings: Settings) -> FastAPI:
             runtime=runtime,
             effective=effective,
             secret_status=_secret_status(effective),
+            connection_overrides=overrides,
+            legacy_connection_snapshots=legacy_snapshots & {"gerrit", "llm"},
+            rest_secret_env=rest_secret_env,
         )
 
     @app.get("/jobs", response_class=HTMLResponse)
@@ -229,14 +236,16 @@ def create_admin_app(settings: Settings) -> FastAPI:
     async def settings_page(request: Request, _: str = Depends(auth_dependency)):
         control: ControlStore = request.app.state.control
         runtime = await control.runtime_config(settings)
-        runtime["service_enabled"] = await control.service_enabled(
-            default=settings.service.enabled
-        )
+        runtime["service_enabled"] = await control.service_enabled(default=settings.service.enabled)
+        overrides = await control.runtime_override_sections()
+        legacy_snapshots = await control.legacy_runtime_snapshot_sections(settings)
         return _render(
             request,
             "settings.html",
             page="settings",
             runtime=runtime,
+            review_override_active="review" in overrides,
+            legacy_review_snapshot="review" in legacy_snapshots,
         )
 
     @app.post("/api/projects")
@@ -359,12 +368,42 @@ def create_admin_app(settings: Settings) -> FastAPI:
         if payload.review:
             updates["review"] = _validated_review_update(payload.review, current["review"])
         if updates:
-            await control.patch_runtime_config(settings, updates)
+            await control.replace_runtime_sections(settings, updates)
         return {
             "ok": True,
             "restart_required": True,
             "detail": (
                 "Saved. Restart receiver/worker/reconciler to apply connection/review changes."
+            ),
+        }
+
+    @app.post("/api/runtime-config/reset-connections")
+    async def reset_connection_overrides(
+        request: Request,
+        _: str = Depends(auth_dependency),
+    ):
+        _verify_csrf(request)
+        control: ControlStore = request.app.state.control
+        await control.reset_runtime_sections(settings, "gerrit", "llm")
+        return {
+            "ok": True,
+            "restart_required": True,
+            "detail": "Connection overrides cleared. config.yaml values will apply after restart.",
+        }
+
+    @app.post("/api/runtime-config/reset-review")
+    async def reset_review_override(
+        request: Request,
+        _: str = Depends(auth_dependency),
+    ):
+        _verify_csrf(request)
+        control: ControlStore = request.app.state.control
+        await control.reset_runtime_sections(settings, "review")
+        return {
+            "ok": True,
+            "restart_required": True,
+            "detail": (
+                "Review policy override cleared. config.yaml values will apply after restart."
             ),
         }
 
@@ -376,9 +415,7 @@ def create_admin_app(settings: Settings) -> FastAPI:
         _verify_csrf(request)
         control: ControlStore = request.app.state.control
         effective = await control.effective_settings(settings)
-        enabled_projects = await control.enabled_projects(
-            fallback=tuple(effective.gerrit.projects)
-        )
+        enabled_projects = await control.enabled_projects(fallback=tuple(effective.gerrit.projects))
         gerrit_settings = effective.gerrit.model_copy(
             update={"projects": list(enabled_projects or effective.gerrit.projects)}
         )
@@ -476,11 +513,7 @@ def _log_components(root: Path) -> list[str]:
     if not root.is_dir():
         return []
     return sorted(
-        {
-            path.name.split(".jsonl", 1)[0]
-            for path in root.glob("*.jsonl*")
-            if path.is_file()
-        }
+        {path.name.split(".jsonl", 1)[0] for path in root.glob("*.jsonl*") if path.is_file()}
     )
 
 
@@ -556,7 +589,7 @@ def _auth_dependency(settings: Settings):  # type: ignore[no-untyped-def]
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="invalid admin credentials",
-                headers={"WWW-Authenticate": "Basic realm=\"Gerrit AI Reviewer\""},
+                headers={"WWW-Authenticate": 'Basic realm="Gerrit AI Reviewer"'},
             )
         return credentials.username
 
@@ -630,6 +663,16 @@ def _validated_gerrit_update(value: dict[str, Any], current: dict[str, Any]) -> 
     result["ssh_port"] = port
     if result.get("rest_auth_mode") not in {"none", "basic", "bearer"}:
         raise HTTPException(status_code=422, detail="Unsupported Gerrit REST auth mode")
+    if result.get("rest_auth_mode") == "basic":
+        username = result.get("rest_username")
+        if not isinstance(username, str) or not username.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="Gerrit REST username is required for Basic auth",
+            )
+        result["rest_username"] = username.strip()
+    elif result.get("rest_username") == "":
+        result["rest_username"] = None
     return result
 
 

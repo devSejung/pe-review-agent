@@ -95,7 +95,7 @@ class _FakeEngine:
         self.calls = 0
         self.summary = "Timeout result must be handled before advancing."
 
-    async def review(self, _context, _tools) -> ReviewResult:
+    async def review(self, _context, _tools, *, tool_trace=None) -> ReviewResult:
         self.calls += 1
         return ReviewResult(
             summary=self.summary,
@@ -120,7 +120,7 @@ class _HistoryAwareFakeEngine:
     def __init__(self) -> None:
         self.contexts: list[ReviewContext] = []
 
-    async def review(self, context: ReviewContext, _tools) -> ReviewResult:
+    async def review(self, context: ReviewContext, _tools, *, tool_trace=None) -> ReviewResult:
         self.contexts.append(context)
         semantic_id = (
             context.previous_findings[0].semantic_id if context.previous_findings else None
@@ -494,9 +494,7 @@ async def test_ambiguous_post_reconciliation_survives_transient_get_budget_exhau
         assert waiting is not None and waiting.state == JobState.RETRY_WAIT
         assert waiting.retry_state == JobState.PUBLISHING
 
-    assert await store.count_consumed_retry_attempts(
-        job.id, stage=AttemptStage.RECONCILE
-    ) >= 2
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.RECONCILE) >= 2
     await database.close()
 
 
