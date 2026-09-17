@@ -96,6 +96,53 @@ def test_first_parent_handles_normal_and_root_commits() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repository_probe_read_access_uses_git_remote_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q", str(source)], check=True)
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "-C", str(source), "config", "user.email", "bot@example.com"],
+        check=True,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "-C", str(source), "config", "user.name", "Bot"],
+        check=True,
+    )
+    (source / "fw.c").write_text("int probe;\n", encoding="utf-8")
+    await asyncio.to_thread(subprocess.run, ["git", "-C", str(source), "add", "."], check=True)
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "-C", str(source), "commit", "-q", "-m", "probe"],
+        check=True,
+    )
+    expected = (
+        await asyncio.to_thread(
+            subprocess.check_output,
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            text=True,
+        )
+    ).strip()
+
+    manager = RepositoryManager(
+        RepoSettings(cache_root=tmp_path / "cache", work_root=tmp_path / "work"),
+        GerritSettings(
+            ssh_host="gerrit",
+            ssh_user="bot",
+            ssh_key_path=tmp_path / "key",
+            rest_url="https://gerrit",
+            projects=["team/fw"],
+        ),
+    )
+    monkeypatch.setattr(manager, "_ssh_url", lambda _project: str(source))
+
+    assert await manager.probe_read_access("team/fw") == expected
+
+
+@pytest.mark.asyncio
 async def test_malformed_tool_arguments_return_error_instead_of_raising(tmp_path: Path) -> None:
     executor = RepositoryToolExecutor(tmp_path, ReviewSettings())
 

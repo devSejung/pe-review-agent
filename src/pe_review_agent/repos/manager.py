@@ -96,6 +96,26 @@ class RepositoryManager:
         finally:
             await asyncio.to_thread(_release_worker_lock, handle)
 
+    async def probe_read_access(self, project: str) -> str:
+        """Verify Gerrit Git/SSH read access without mutating the persistent mirror cache."""
+
+        env = {**os.environ, "GIT_SSH_COMMAND": self._ssh_command()}
+        result = await self._git(
+            "ls-remote",
+            "--exit-code",
+            self._ssh_url(project),
+            "HEAD",
+            env=env,
+            transient=True,
+        )
+        first_line = result.stdout.strip().splitlines()
+        if not first_line:
+            raise PermanentError(f"Gerrit project {project!r} returned no HEAD ref over Git/SSH")
+        revision = first_line[0].split(maxsplit=1)[0]
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+            raise PermanentError(f"Gerrit project {project!r} returned an invalid HEAD revision")
+        return revision.lower()
+
     async def ensure_revision(
         self,
         *,

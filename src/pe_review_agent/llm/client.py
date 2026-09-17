@@ -58,6 +58,37 @@ class LlmClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def check_connection(self) -> tuple[str, ...]:
+        """Verify the OpenAI-compatible endpoint without spending generation tokens."""
+
+        try:
+            response = await self._client.get("models")
+        except (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.RemoteProtocolError,
+            httpx.HTTPError,
+        ) as exc:
+            message = f"LLM connection check failed: {type(exc).__name__}: {exc}"
+            raise TransientError(message) from exc
+        if response.status_code >= 400:
+            self._raise_for_status(response)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise TransientError("LLM /models endpoint returned invalid JSON") from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise TransientError(
+                "LLM /models endpoint returned an invalid OpenAI-compatible payload"
+            )
+        models = []
+        for item in data:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                models.append(item["id"])
+        return tuple(models)
+
     async def complete(
         self,
         *,

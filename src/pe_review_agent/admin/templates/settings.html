@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Settings · Gerrit AI Reviewer{% endblock %}
+{% block content %}
+<div class="page-header mb-4"><div class="page-pretitle">Runtime policy</div><h2 class="page-title">Settings</h2></div>
+<div class="row row-cards">
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header"><h3 class="card-title">Emergency control</h3></div>
+      <div class="card-body">
+        <div class="d-flex align-items-center">
+          <div class="flex-fill"><div class="fw-semibold">AI review service</div><div class="text-secondary">Stops new ingest, claims and reconciliation without deleting durable state.</div></div>
+          <label class="form-check form-switch m-0"><input class="form-check-input" type="checkbox" data-service-toggle {% if runtime.service_enabled %}checked{% endif %}></label>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-7">
+    <form class="card" data-runtime-config>
+      <input type="hidden" name="gerrit.ssh_host" value="{{ runtime.gerrit.ssh_host }}"><input type="hidden" name="gerrit.ssh_port" value="{{ runtime.gerrit.ssh_port }}"><input type="hidden" name="gerrit.ssh_user" value="{{ runtime.gerrit.ssh_user }}"><input type="hidden" name="gerrit.rest_url" value="{{ runtime.gerrit.rest_url }}"><input type="hidden" name="gerrit.rest_auth_mode" value="{{ runtime.gerrit.rest_auth_mode }}"><input type="hidden" name="gerrit.rest_username" value="{{ runtime.gerrit.rest_username or '' }}">
+      <input type="hidden" name="llm.base_url" value="{{ runtime.llm.base_url }}"><input type="hidden" name="llm.model" value="{{ runtime.llm.model }}"><input type="hidden" name="llm.temperature" value="{{ runtime.llm.temperature }}"><input type="hidden" name="llm.max_output_tokens" value="{{ runtime.llm.max_output_tokens }}">
+      <div class="card-header"><h3 class="card-title">Review policy</h3><div class="card-actions"><span class="badge bg-yellow-lt">Restart required</span></div></div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-12"><label class="form-label">Policy version</label><input class="form-control" name="review.policy_version" value="{{ runtime.review.policy_version }}" required><div class="form-hint">Changing this creates a new durable job identity for future Patch Sets.</div></div>
+          <div class="col-md-6"><label class="form-label">Max findings</label><input class="form-control" type="number" min="0" max="50" name="review.max_findings" value="{{ runtime.review.max_findings }}"></div>
+          <div class="col-md-6"><label class="form-label">Min confidence</label><input class="form-control" type="number" step="0.01" min="0" max="1" name="review.min_confidence" value="{{ runtime.review.min_confidence }}"></div>
+        </div>
+      </div>
+      <div class="card-footer text-end"><button class="btn btn-primary" type="submit">Save review policy</button></div>
+    </form>
+  </div>
+</div>
+{% endblock %}

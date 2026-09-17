@@ -25,7 +25,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="pe-review-agent")
     parser.add_argument(
         "command",
-        choices=("receiver", "worker", "reconcile", "migrate", "check-config", "requeue"),
+        choices=(
+            "receiver",
+            "worker",
+            "reconcile",
+            "admin",
+            "migrate",
+            "check-config",
+            "requeue",
+        ),
     )
     parser.add_argument("--config", help="path to YAML config (or PE_REVIEW_CONFIG)")
     parser.add_argument("--log-level", default=os.environ.get("PE_REVIEW_LOG_LEVEL", "INFO"))
@@ -53,17 +61,30 @@ def main() -> None:
 
 
 async def _run_async(command_name: str, settings) -> None:  # type: ignore[no-untyped-def]
-    async with service_components(settings) as (database, store, gerrit, _llm, worker):
+    if command_name == "admin":
+        from pe_review_agent.admin.web import run_admin
+
+        await run_admin(settings)
+        return
+    async with service_components(settings) as (
+        database,
+        store,
+        control,
+        effective,
+        gerrit,
+        _llm,
+        worker,
+    ):
         if command_name == "receiver":
-            await run_receiver(settings, store)
+            await run_receiver(effective, store, control)
             return
         if command_name == "reconcile":
-            await run_reconciler(settings, store, gerrit)
+            await run_reconciler(effective, store, gerrit, control)
             return
         if command_name == "worker":
             health = HealthServer(
-                settings.service.health_host,
-                settings.service.health_port,
+                effective.service.health_host,
+                effective.service.health_port,
                 ready_check=lambda: database_ready(database),
             )
             await health.start()

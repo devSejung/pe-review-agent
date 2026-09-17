@@ -89,6 +89,24 @@ class GerritRestClient:
             root = f"{root}/a"
         self._api_root = root
 
+    def replace_projects(self, projects: list[str] | tuple[str, ...]) -> None:
+        """Refresh the exact project allowlist from the durable control-plane configuration."""
+
+        self._allowlist = ProjectAllowlist(projects)
+
+    async def server_version(self) -> str:
+        payload = await self._request_json("GET", "config/server/version")
+        if not isinstance(payload, str) or not payload:
+            raise TransientError("Gerrit server version endpoint returned an invalid response")
+        return payload
+
+    async def project_head(self, project: str) -> str:
+        self._allowlist.require(project)
+        payload = await self._request_json("GET", f"projects/{quote(project, safe='')}/HEAD")
+        if not isinstance(payload, str) or not payload:
+            raise TransientError("Gerrit project HEAD endpoint returned an invalid response")
+        return payload
+
     async def __aenter__(self) -> GerritRestClient:
         return self
 

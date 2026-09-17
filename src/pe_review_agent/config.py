@@ -33,7 +33,8 @@ class GerritSettings(StrictSettingsModel):
     strict_host_key_checking: bool = True
     rest_url: str
     rest_auth: GerritRestAuth = Field(default_factory=GerritRestAuth)
-    projects: list[str] = Field(min_length=1)
+    # Optional bootstrap allowlist. The Admin Web can start from an empty list and persist projects.
+    projects: list[str] = Field(default_factory=list)
     event_reconnect_min_seconds: float = Field(default=1.0, gt=0)
     event_reconnect_max_seconds: float = Field(default=60.0, gt=0)
     request_timeout_seconds: float = Field(default=20.0, gt=0)
@@ -144,7 +145,21 @@ class ServiceSettings(StrictSettingsModel):
     reconcile_interval_seconds: int = Field(default=300, ge=30)
     reconcile_full_sweep_interval_seconds: int = Field(default=3600, ge=60)
     health_host: str = "0.0.0.0"
-    health_port: int = Field(default=8080, ge=1, le=65535)
+    health_port: int = Field(default=8081, ge=1, le=65535)
+
+
+class AdminSettings(StrictSettingsModel):
+    host: str = "0.0.0.0"
+    port: int = Field(default=8080, ge=1, le=65535)
+    auth_mode: Literal["basic", "none"] = "basic"
+    username: str = "admin"
+    password_env: str = "PE_REVIEW_ADMIN_PASSWORD"
+    log_root: Path = Path("/var/lib/pe-review-agent/logs")
+
+    @property
+    def password(self) -> SecretStr | None:
+        value = os.environ.get(self.password_env)
+        return SecretStr(value) if value else None
 
 
 class Settings(StrictSettingsModel):
@@ -155,6 +170,7 @@ class Settings(StrictSettingsModel):
     review: ReviewSettings = Field(default_factory=ReviewSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     service: ServiceSettings = Field(default_factory=ServiceSettings)
+    admin: AdminSettings = Field(default_factory=AdminSettings)
 
 
 def load_settings(path: str | Path | None = None) -> Settings:

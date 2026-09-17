@@ -29,6 +29,7 @@ from pe_review_agent.domain import (
 from pe_review_agent.jobs.models import (
     Attempt,
     Job,
+    ManagedProject,
     Publication,
     PublicationStatus,
     ReviewFinding,
@@ -91,6 +92,13 @@ def _enqueue_insert(event: GerritPatchsetEvent, policy_version: str):
 def _claim_select(now: datetime):
     terminal = [state.value for state in TERMINAL_JOB_STATES]
     older = aliased(Job)
+    any_managed_projects = exists(select(1).select_from(ManagedProject))
+    project_is_enabled = exists(
+        select(1).select_from(ManagedProject).where(
+            ManagedProject.project == Job.project,
+            ManagedProject.enabled.is_(True),
+        )
+    )
     unresolved_older_publication = exists(
         select(1)
         .select_from(older)
@@ -116,6 +124,7 @@ def _claim_select(now: datetime):
                 Job.state != JobState.RETRY_WAIT.value,
                 Job.next_attempt_at <= now,
             ),
+            or_(~any_managed_projects, project_is_enabled),
             ~unresolved_older_publication,
         )
         .order_by(Job.next_attempt_at.asc(), Job.created_at.asc())

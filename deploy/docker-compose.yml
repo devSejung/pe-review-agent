@@ -24,6 +24,8 @@ services:
       PE_REVIEW_LLM_API_KEY: ${PE_REVIEW_LLM_API_KEY:-}
       PE_REVIEW_GERRIT_HTTP_PASSWORD: ${PE_REVIEW_GERRIT_HTTP_PASSWORD:-}
       PE_REVIEW_GERRIT_TOKEN: ${PE_REVIEW_GERRIT_TOKEN:-}
+      PE_REVIEW_COMPONENT: migrate
+      PE_REVIEW_LOG_FILE: /var/lib/pe-review-agent/logs/migrate.jsonl
     volumes: &review-volumes
       - ./config.yaml:/etc/pe-review-agent/config.yaml:ro
       - ./secrets/gerrit_ssh_key:/run/secrets/gerrit_ssh_key:ro
@@ -40,7 +42,10 @@ services:
     image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
     command: ["receiver"]
     restart: unless-stopped
-    environment: *review-env
+    environment:
+      <<: *review-env
+      PE_REVIEW_COMPONENT: receiver
+      PE_REVIEW_LOG_FILE: /var/lib/pe-review-agent/logs/receiver.jsonl
     volumes: *review-volumes
     depends_on:
       migrate:
@@ -50,10 +55,13 @@ services:
     image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
     command: ["worker"]
     restart: unless-stopped
-    environment: *review-env
+    environment:
+      <<: *review-env
+      PE_REVIEW_COMPONENT: worker
+      PE_REVIEW_LOG_FILE: /var/lib/pe-review-agent/logs/worker.jsonl
     volumes: *review-volumes
     ports:
-      - "127.0.0.1:${HEALTH_PORT:-8080}:8080"
+      - "127.0.0.1:${WORKER_HEALTH_PORT:-8081}:8081"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -62,8 +70,27 @@ services:
     image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
     command: ["reconcile"]
     restart: unless-stopped
-    environment: *review-env
+    environment:
+      <<: *review-env
+      PE_REVIEW_COMPONENT: reconciler
+      PE_REVIEW_LOG_FILE: /var/lib/pe-review-agent/logs/reconciler.jsonl
     volumes: *review-volumes
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  admin:
+    image: ${REVIEWER_IMAGE:-gerrit-ai-reviewer:local}
+    command: ["admin"]
+    restart: unless-stopped
+    environment:
+      <<: *review-env
+      PE_REVIEW_ADMIN_PASSWORD: ${PE_REVIEW_ADMIN_PASSWORD:?set PE_REVIEW_ADMIN_PASSWORD}
+      PE_REVIEW_COMPONENT: admin
+      PE_REVIEW_LOG_FILE: /var/lib/pe-review-agent/logs/admin.jsonl
+    volumes: *review-volumes
+    ports:
+      - "${ADMIN_BIND_ADDRESS:-0.0.0.0}:${ADMIN_PORT:-8080}:8080"
     depends_on:
       migrate:
         condition: service_completed_successfully

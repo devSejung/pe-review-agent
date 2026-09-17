@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from pe_review_agent.config import DatabaseSettings, ServiceSettings, load_settings
+from pe_review_agent.config import (
+    AdminSettings,
+    DatabaseSettings,
+    GerritSettings,
+    ServiceSettings,
+    load_settings,
+)
 
 
 def test_nested_env_override(monkeypatch, tmp_path: Path) -> None:
@@ -44,6 +50,21 @@ def test_database_url_structurally_encodes_reserved_password(monkeypatch) -> Non
 def test_unknown_service_setting_is_rejected() -> None:
     with pytest.raises(ValidationError, match="enabld"):
         ServiceSettings.model_validate({"enabld": False})
+
+
+def test_admin_and_worker_ports_do_not_conflict() -> None:
+    assert AdminSettings().port == 8080
+    assert ServiceSettings().health_port == 8081
+
+
+def test_gerrit_projects_can_start_empty_for_admin_web_bootstrap(tmp_path: Path) -> None:
+    settings = GerritSettings(
+        ssh_host="gerrit",
+        ssh_user="bot",
+        ssh_key_path=tmp_path / "key",
+        rest_url="https://gerrit",
+    )
+    assert settings.projects == []
 
 
 def test_unknown_nested_yaml_setting_fails_check_config(monkeypatch, tmp_path: Path) -> None:

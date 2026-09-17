@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def parse_patchset_created(
     payload: str | bytes | Mapping[str, Any],
     *,
-    allowlist: ProjectAllowlist,
+    allowlist: ProjectAllowlist | None,
 ) -> GerritPatchsetEvent | None:
     """Parse one stream-events record, returning None for irrelevant/unallowed events."""
 
@@ -34,7 +34,7 @@ def parse_patchset_created(
     change = _mapping(decoded, "change")
     patchset = _mapping(decoded, "patchSet")
     project = _string(change, "project")
-    if not allowlist.allows(project):
+    if allowlist is not None and not allowlist.allows(project):
         return None
 
     uploader = decoded.get("uploader")
@@ -57,9 +57,15 @@ def parse_patchset_created(
 class GerritEventStream:
     """Reconnect Gerrit's SSH stream-events feed and yield allowlisted patch sets."""
 
-    def __init__(self, settings: GerritSettings, *, sleeper=asyncio.sleep) -> None:  # type: ignore[no-untyped-def]
+    def __init__(
+        self,
+        settings: GerritSettings,
+        *,
+        sleeper=asyncio.sleep,
+        filter_projects: bool = True,
+    ) -> None:  # type: ignore[no-untyped-def]
         self._settings = settings
-        self._allowlist = ProjectAllowlist(settings.projects)
+        self._allowlist = ProjectAllowlist(settings.projects) if filter_projects else None
         self._sleep = sleeper
 
     @property
