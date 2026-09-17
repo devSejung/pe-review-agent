@@ -76,6 +76,17 @@ Build the release on an internet-capable machine:
 ./deploy/build-release.sh 0.1.0
 ```
 
+If the build machine must use an internal PyPI mirror, the release builder forwards the standard
+pip build settings into the Docker build:
+
+```bash
+PIP_INDEX_URL="https://pypi-mirror.example.internal/simple" \
+PIP_TRUSTED_HOST="pypi-mirror.example.internal" \
+./deploy/build-release.sh 0.1.0
+```
+
+Omit these variables on hosts that can use the normal public PyPI index.
+
 Transfer the resulting `release/gerrit-ai-reviewer-0.1.0.tar.gz` to the corporate Linux host.
 Extract it under `/home/pe-review-agent/releases/`, then:
 

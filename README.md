@@ -290,6 +290,15 @@ For an offline target, build the release on an internet-capable machine:
 ./deploy/build-release.sh 0.1.0
 ```
 
+If the build host must use a corporate PyPI mirror, set the standard pip index variables before
+running the release builder. They are forwarded as Docker build arguments:
+
+```bash
+PIP_INDEX_URL="https://pypi-mirror.example.internal/simple" \
+PIP_TRUSTED_HOST="pypi-mirror.example.internal" \
+./deploy/build-release.sh 0.1.0
+```
+
 Transfer and extract the generated release on the corporate Linux host, prepare `config.yaml`,
 `.env`, and `secrets/`, then run:
 

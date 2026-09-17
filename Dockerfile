@@ -1,5 +1,10 @@
 FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS build
 
+# Optional corporate PyPI mirror support. When these build args are omitted,
+# pip keeps its normal default index behavior.
+ARG PIP_INDEX_URL
+ARG PIP_TRUSTED_HOST
+
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
