@@ -22,6 +22,12 @@ fi
 if [[ -n "${PIP_TRUSTED_HOST:-}" ]]; then
   docker_build_args+=(--build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}")
 fi
+if [[ -n "${APT_DEBIAN_MIRROR_URL:-}" ]]; then
+  docker_build_args+=(--build-arg "APT_DEBIAN_MIRROR_URL=${APT_DEBIAN_MIRROR_URL}")
+fi
+if [[ -n "${APT_DEBIAN_SECURITY_MIRROR_URL:-}" ]]; then
+  docker_build_args+=(--build-arg "APT_DEBIAN_SECURITY_MIRROR_URL=${APT_DEBIAN_SECURITY_MIRROR_URL}")
+fi
 
 docker build "${docker_build_args[@]}" -t "$image" "$root"
 docker pull "$postgres_ref"

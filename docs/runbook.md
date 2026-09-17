@@ -87,6 +87,17 @@ PIP_TRUSTED_HOST="pypi-mirror.example.internal" \
 
 Omit these variables on hosts that can use the normal public PyPI index.
 
+If the build machine also cannot reach the public Debian repositories, pass Debian mirror URLs as
+well. These are Docker-image Debian sources, not the Ubuntu host's sources.list entries:
+
+```bash
+PIP_INDEX_URL="https://pypi-mirror.example.internal/simple" \
+PIP_TRUSTED_HOST="pypi-mirror.example.internal" \
+APT_DEBIAN_MIRROR_URL="http://debian-mirror.example.internal/debian" \
+APT_DEBIAN_SECURITY_MIRROR_URL="http://debian-security-mirror.example.internal/debian-security" \
+./deploy/build-release.sh 0.1.0
+```
+
 Transfer the resulting `release/gerrit-ai-reviewer-0.1.0.tar.gz` to the corporate Linux host.
 Extract it under `/home/pe-review-agent/releases/`, then:
 

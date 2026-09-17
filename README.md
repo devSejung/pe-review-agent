@@ -299,6 +299,18 @@ PIP_TRUSTED_HOST="pypi-mirror.example.internal" \
 ./deploy/build-release.sh 0.1.0
 ```
 
+If the build host also cannot reach Debian's public apt repositories, provide corporate mirrors for
+both the normal Debian archive and Debian security archive. The runtime image is Debian-based even
+when the host OS is Ubuntu, so do not substitute Ubuntu suites such as `resolute` here.
+
+```bash
+PIP_INDEX_URL="https://pypi-mirror.example.internal/simple" \
+PIP_TRUSTED_HOST="pypi-mirror.example.internal" \
+APT_DEBIAN_MIRROR_URL="http://debian-mirror.example.internal/debian" \
+APT_DEBIAN_SECURITY_MIRROR_URL="http://debian-security-mirror.example.internal/debian-security" \
+./deploy/build-release.sh 0.1.0
+```
+
 Transfer and extract the generated release on the corporate Linux host, prepare `config.yaml`,
 `.env`, and `secrets/`, then run:
 
