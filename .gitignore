@@ -11,6 +11,9 @@ build/
 *.egg-info/
 .env
 config/local.yaml
+deploy/config.yaml
+deploy/corporate.env
+deploy/secrets/
 data/
 logs/
 .research/
