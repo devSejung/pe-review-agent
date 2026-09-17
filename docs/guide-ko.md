@@ -84,6 +84,61 @@ repo를 직접 clone해서 서버에서 build할 수 있는 환경이라면 전�
 machine에서 release tarball을 만들어 옮기는 방식이 권장됩니다. 아래 15~16장에서 두 방식을 모두
 설명합니다.
 
+### 기존 `pe-review-agent` 계정이 UID 1002인 서버에서 그대로 따라하기
+
+이미 Linux 계정 `pe-review-agent`가 있고 `id -u` 결과가 `1002`라면 **그 값은 정상이며 바꾸지
+않습니다.** `bootstrap-host.sh`도 실행하지 않습니다. 아래 순서대로만 진행하면 됩니다.
+
+먼저 source checkout이 이미 있다면 해당 repo로 이동합니다. 없다면 GitHub에 접근 가능한 환경에서
+clone합니다.
+
+```bash
+cd ~
+git clone https://github.com/devSejung/pe-review-agent.git
+cd pe-review-agent
+git checkout main
+git pull
+```
+
+이미 clone되어 있다면 `git clone`은 생략하고 기존 repo로 들어가면 됩니다.
+
+그 다음 배포 파일을 준비합니다.
+
+```bash
+cd deploy
+cp env.example .env
+cp ../config/config.example.yaml config.yaml
+
+mkdir -p secrets
+cp ~/.ssh/id_ed25519_gerrit secrets/gerrit_ssh_key
+cp ~/.ssh/known_hosts secrets/gerrit_known_hosts
+```
+
+여기까지 한 직후에는 다음 결과가 나와도 정상입니다.
+
+```text
+host user pe-review-agent: UID 1002
+deploy/secrets/gerrit_ssh_key owner: UID 1002
+```
+
+**이 단계에서 직접 `chown 10001`을 하지 않습니다.** 홈의 원본 SSH key도 절대 변경하지 않습니다.
+나중에 `sudo ./install.sh`를 실행할 때 `deploy/secrets/`의 **복사본만** container UID 10001에 맞게
+조정됩니다.
+
+즉 다음 명령으로 현재 상태만 확인합니다.
+
+```bash
+pwd
+ls -al
+ls -ln secrets
+```
+
+이 세 명령 결과를 확인한 다음 `.env`와 `config.yaml`을 채우고 Docker image를 준비하는 다음
+단계로 진행합니다.
+
+처음 설정하는 동안에는 한 번에 모든 단계를 수행하지 말고, 위 세 명령의 출력부터 확인한 뒤
+다음 단계로 넘어갑니다.
+
 ---
 
 ## 1. 이 서비스가 하는 일
