@@ -7,7 +7,7 @@ from pe_review_agent.config import ReviewSettings
 from pe_review_agent.domain import ChangedLine, ReviewContext, ReviewResult
 from pe_review_agent.llm.client import LlmCompletion, ToolCall
 from pe_review_agent.repos.tools import RepositoryToolExecutor
-from pe_review_agent.retry import ContextLengthError
+from pe_review_agent.retry import ContextLengthError, TransientError
 from pe_review_agent.review.native import NativeFirmwareReviewEngine
 
 
@@ -853,3 +853,155 @@ async def test_verifier_budget_exhaustion_never_publishes_unverified_candidate(
     assert budget["stop_reasons"] == ["max_llm_calls_per_job"]
     assert result.review_metadata["lineage_complete"] is False
     assert "finding 검증: 미완료" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_candidate_checkpoint_resume_skips_completed_chunk_after_retry(
+    tmp_path: Path,
+) -> None:
+    def section(path: str, marker: str) -> str:
+        body = "".join(f"+{marker}_{index}_" + "x" * 36 + "\n" for index in range(60))
+        return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,60 @@\n{body}"
+
+    for name in ("a.c", "b.c"):
+        (tmp_path / name).write_text("changed();\n", encoding="utf-8")
+    diff = section("a.c", "A") + section("b.c", "B")
+    settings = ReviewSettings(max_diff_chunk_chars=4_000)
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=25,
+        patchset_number=1,
+        revision_sha="b" * 40,
+        diff=diff,
+        changed_files=["a.c", "b.c"],
+        changed_lines=[
+            ChangedLine(path="a.c", line=1, text="changed();"),
+            ChangedLine(path="b.c", line=1, text="changed();"),
+        ],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    checkpoints = {}
+
+    async def load_checkpoints():
+        return dict(checkpoints)
+
+    async def save_checkpoint(checkpoint):
+        checkpoints[checkpoint.chunk_key] = checkpoint
+
+    first_llm = FakeLlm(
+        [
+            _completion(json.dumps({"change_summary": "- a.c를 수정합니다.", "findings": []})),
+            TransientError("Qwen temporarily unavailable"),
+        ]
+    )
+    first_engine = NativeFirmwareReviewEngine(first_llm, settings)  # type: ignore[arg-type]
+
+    with pytest.raises(TransientError, match="temporarily unavailable"):
+        await first_engine.review(
+            context,
+            RepositoryToolExecutor(tmp_path, settings),
+            checkpoint_load=load_checkpoints,
+            checkpoint_save=save_checkpoint,
+        )
+
+    assert len(first_llm.seen_messages) == 2
+    assert len(checkpoints) == 2
+    assert {checkpoint.status for checkpoint in checkpoints.values()} == {"DONE", "RETRY"}
+
+    second_llm = FakeLlm(
+        [_completion(json.dumps({"change_summary": "- b.c를 수정합니다.", "findings": []}))]
+    )
+    second_engine = NativeFirmwareReviewEngine(second_llm, settings)  # type: ignore[arg-type]
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    result = await second_engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        tool_trace=capture,
+        checkpoint_load=load_checkpoints,
+        checkpoint_save=save_checkpoint,
+    )
+
+    assert len(second_llm.seen_messages) == 1
+    assert len(checkpoints) == 2
+    assert result.input_tokens == 20
+    assert result.output_tokens == 10
+    assert result.review_metadata["review_budget"]["llm_calls"] == 3
+    assert result.review_metadata["candidate_checkpoints"] == {
+        "version": "candidate-v1",
+        "reused": 1,
+        "saved": 1,
+    }
+    assert any(event.get("event") == "checkpoint_reused" for event in trace)
+
+
+@pytest.mark.asyncio
+async def test_context_split_checkpoint_avoids_repeating_oversized_llm_call(tmp_path: Path) -> None:
+    target = tmp_path / "huge.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    body = "".join(f"+LINE_{index}_" + "x" * 42 + "\n" for index in range(110))
+    diff = f"diff --git a/huge.c b/huge.c\n--- a/huge.c\n+++ b/huge.c\n@@ -1 +1,110 @@\n{body}"
+    settings = ReviewSettings(max_diff_chunk_chars=10_000)
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=26,
+        patchset_number=1,
+        revision_sha="c" * 40,
+        diff=diff,
+        changed_files=["huge.c"],
+        changed_lines=[ChangedLine(path="huge.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    checkpoints = {}
+
+    async def load_checkpoints():
+        return dict(checkpoints)
+
+    async def save_checkpoint(checkpoint):
+        checkpoints[checkpoint.chunk_key] = checkpoint
+
+    first_llm = FakeLlm(
+        [
+            ContextLengthError("too large", input_tokens=100, output_tokens=3),
+            _completion(
+                json.dumps({"change_summary": "- huge.c 일부를 검토합니다.", "findings": []})
+            ),
+            TransientError("temporary backend failure"),
+        ]
+    )
+    first_engine = NativeFirmwareReviewEngine(first_llm, settings)  # type: ignore[arg-type]
+    with pytest.raises(TransientError, match="temporary backend failure"):
+        await first_engine.review(
+            context,
+            RepositoryToolExecutor(tmp_path, settings),
+            checkpoint_load=load_checkpoints,
+            checkpoint_save=save_checkpoint,
+        )
+
+    assert {checkpoint.status for checkpoint in checkpoints.values()} == {"SPLIT", "DONE", "RETRY"}
+
+    second_llm = FakeLlm(
+        [
+            _completion(
+                json.dumps({"change_summary": "- huge.c 나머지를 검토합니다.", "findings": []})
+            )
+        ]
+    )
+    second_engine = NativeFirmwareReviewEngine(second_llm, settings)  # type: ignore[arg-type]
+    result = await second_engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        checkpoint_load=load_checkpoints,
+        checkpoint_save=save_checkpoint,
+    )
+
+    assert len(second_llm.seen_messages) == 1
+    assert result.review_metadata["candidate_checkpoints"]["reused"] == 2
+    assert result.review_metadata["review_budget"]["llm_calls"] == 4
+    assert result.input_tokens == 120
+    assert result.output_tokens == 13

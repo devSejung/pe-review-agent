@@ -33,6 +33,12 @@ summary plus native inline/range comments.
   reported input tokens. Reaching a budget does not fail the durable job: only findings that completed
   verification are publishable, finding-lineage resolution is disabled for incomplete reviews, and
   Gerrit/Admin explicitly disclose the reviewed coverage and stop reason.
+- Candidate chunk work is checkpointed in PostgreSQL after each completed chunk (and after deterministic
+  context-limit splits). A retry/restart reuses those compact results instead of rerunning finished LLM
+  work; transient failed-chunk usage is also carried forward so candidate-phase budget accounting does
+  not reset for resumed chunks.
+  Checkpoints store hashes/results/usage rather than full diffs or model transcripts, and old checkpoints
+  for DONE/SUPERSEDED jobs are pruned by retention policy.
 - Merge commits are currently safe-skipped with a visible Gerrit summary rather than reviewed
   against an incorrect first-parent diff. Gerrit 3.8 uses its auto-merge base for merge diffs; a
   future merge-review path must ingest that Gerrit DiffInfo before native inline comments are safe.

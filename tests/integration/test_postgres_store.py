@@ -28,6 +28,7 @@ from pe_review_agent.jobs import (
     PublishGuardStatus,
 )
 from pe_review_agent.retry import TransientError
+from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="PE_REVIEW_TEST_POSTGRES_DSN is not configured")
@@ -547,6 +548,74 @@ async def test_manual_requeue_refuses_stale_failed_patchset(store) -> None:
 
     with pytest.raises(RuntimeError, match="older Patch Set"):
         await jobs.requeue_failed(old.id)
+
+
+@pytest.mark.asyncio
+async def test_candidate_checkpoints_are_durable_and_pruned_only_for_old_terminal_jobs(
+    store,
+) -> None:
+    jobs, database = store
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="f" * 40), review_policy_version="firmware-v1"
+    )
+    claim = await jobs.claim_next(worker_id="checkpoint-worker", lease_seconds=120)
+    assert claim is not None and claim.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="checkpoint-worker")
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id="checkpoint-worker")
+    checkpoint = CandidateChunkCheckpoint(
+        chunk_key="a" * 64,
+        parent_chunk_key=None,
+        status="DONE",
+        paths=("fw/train.c",),
+        change_summary="- training path changed",
+        findings=(),
+        input_tokens=123,
+        output_tokens=17,
+        llm_calls=2,
+        tool_calls=1,
+    )
+    await jobs.save_candidate_chunk_checkpoint(
+        job.id,
+        worker_id="checkpoint-worker",
+        checkpoint_version="candidate-v1",
+        checkpoint=checkpoint,
+    )
+
+    loaded = await jobs.load_candidate_chunk_checkpoints(job.id, checkpoint_version="candidate-v1")
+    assert loaded[checkpoint.chunk_key] == checkpoint
+
+    old_timestamp = datetime.now(UTC) - timedelta(days=40)
+    async with database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE review_chunk_checkpoints SET updated_at = :updated_at "
+                "WHERE job_id = CAST(:job_id AS uuid)"
+            ),
+            {"updated_at": old_timestamp, "job_id": str(job.id)},
+        )
+        await session.execute(
+            text(
+                "UPDATE review_jobs SET state = 'FAILED_PERMANENT', lease_owner = NULL, "
+                "lease_expires_at = NULL WHERE id = CAST(:job_id AS uuid)"
+            ),
+            {"job_id": str(job.id)},
+        )
+        await session.commit()
+
+    assert await jobs.prune_candidate_chunk_checkpoints(retention_days=30) == 0
+    assert await jobs.load_candidate_chunk_checkpoints(job.id, checkpoint_version="candidate-v1")
+
+    async with database.session() as session:
+        await session.execute(
+            text("UPDATE review_jobs SET state = 'DONE' WHERE id = CAST(:job_id AS uuid)"),
+            {"job_id": str(job.id)},
+        )
+        await session.commit()
+
+    assert await jobs.prune_candidate_chunk_checkpoints(retention_days=30) == 1
+    assert (
+        await jobs.load_candidate_chunk_checkpoints(job.id, checkpoint_version="candidate-v1") == {}
+    )
 
 
 async def _save_done_review(

@@ -6,6 +6,7 @@ from pe_review_agent.admin.store import ManagedProjectRecord
 from pe_review_agent.config import Settings
 from pe_review_agent.jobs import ProjectReviewStartMode
 from pe_review_agent.service import (
+    _CHECKPOINT_CLEANUP_WATERMARK_KEY,
     _RECONCILIATION_FULL_SWEEP_KEY,
     _RECONCILIATION_WATERMARK_KEY,
     run_reconciler,
@@ -17,8 +18,10 @@ class _Store:
         self.values = {
             _RECONCILIATION_WATERMARK_KEY: watermark,
             _RECONCILIATION_FULL_SWEEP_KEY: full_sweep,
+            _CHECKPOINT_CLEANUP_WATERMARK_KEY: None,
         }
         self.advanced: list[tuple[str, datetime]] = []
+        self.pruned_retention_days: list[int] = []
 
     async def get_service_watermark(self, key: str):
         return self.values.get(key)
@@ -29,6 +32,10 @@ class _Store:
 
     async def enqueue(self, *_args, **_kwargs):
         raise AssertionError("no events expected")
+
+    async def prune_candidate_chunk_checkpoints(self, *, retention_days: int) -> int:
+        self.pruned_retention_days.append(retention_days)
+        return 0
 
 
 class _Gerrit:
@@ -142,7 +149,10 @@ async def test_reconciler_full_sweep_still_respects_from_now_project_cutoff(
     monkeypatch.setattr("pe_review_agent.service.asyncio.sleep", stop_after_pass)
     with pytest.raises(RuntimeError, match="stop"):
         await run_reconciler(
-            _settings(tmp_path), store, gerrit, control=control  # type: ignore[arg-type]
+            _settings(tmp_path),
+            store,
+            gerrit,
+            control=control,  # type: ignore[arg-type]
         )
 
     assert gerrit.since_values == [None]
@@ -174,7 +184,10 @@ async def test_switching_to_include_open_requests_immediate_full_sweep(
     monkeypatch.setattr("pe_review_agent.service.asyncio.sleep", stop_after_pass)
     with pytest.raises(RuntimeError, match="stop"):
         await run_reconciler(
-            _settings(tmp_path), store, gerrit, control=control  # type: ignore[arg-type]
+            _settings(tmp_path),
+            store,
+            gerrit,
+            control=control,  # type: ignore[arg-type]
         )
 
     assert gerrit.since_values == [None]

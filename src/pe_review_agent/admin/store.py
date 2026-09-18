@@ -17,6 +17,7 @@ from pe_review_agent.jobs.models import (
     ManagedProject,
     ProjectReviewStartMode,
     Publication,
+    ReviewChunkCheckpoint,
     ReviewFinding,
     ReviewResultRow,
     ServiceState,
@@ -573,6 +574,13 @@ class ControlStore:
             publication = await session.scalar(
                 select(Publication).where(Publication.job_id == job_id)
             )
+            checkpoints = (
+                await session.scalars(
+                    select(ReviewChunkCheckpoint)
+                    .where(ReviewChunkCheckpoint.job_id == job_id)
+                    .order_by(ReviewChunkCheckpoint.id.asc())
+                )
+            ).all()
 
             audit = _job_dict(job)
             now = datetime.now(UTC)
@@ -591,6 +599,22 @@ class ControlStore:
                     "tool_events": list(attempt.tool_events or []),
                 }
                 for attempt in attempts
+            ]
+            audit["chunk_checkpoints"] = [
+                {
+                    "checkpoint_version": checkpoint.checkpoint_version,
+                    "chunk_key": checkpoint.chunk_key,
+                    "parent_chunk_key": checkpoint.parent_chunk_key,
+                    "status": checkpoint.status,
+                    "paths": list(checkpoint.paths or []),
+                    "finding_count": len(checkpoint.findings or []),
+                    "input_tokens": checkpoint.input_tokens,
+                    "output_tokens": checkpoint.output_tokens,
+                    "llm_calls": checkpoint.llm_calls,
+                    "tool_calls": checkpoint.tool_calls,
+                    "updated_at": checkpoint.updated_at,
+                }
+                for checkpoint in checkpoints
             ]
             audit["review"] = (
                 {

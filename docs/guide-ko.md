@@ -913,6 +913,8 @@ review:
   max_llm_calls_per_job: 30
   max_tool_calls_per_job: 50
   max_input_tokens_per_job: 300000
+  # DONE/SUPERSEDED job의 candidate checkpoint 보존 기간
+  chunk_checkpoint_retention_days: 30
 
 service:
   enabled: true
@@ -942,6 +944,18 @@ job을 실패시키지 않습니다. 이미 검토가 끝난 chunk의 결과는 
 Admin Web의 **Settings → Review budget**에서도 같은 값을 저장할 수 있습니다. Review policy/budget은
 worker가 시작될 때 읽으므로 저장 직후에는 기존 process에 적용되지 않으며, 화면의
 **Restart required** 안내대로 `receiver` / `worker` / `reconciler`를 재시작해야 적용됩니다.
+
+candidate review는 chunk 하나가 끝날 때마다 PostgreSQL에 compact checkpoint를 남깁니다. 저장되는
+내용은 chunk hash/status, 경로 목록, change summary, candidate findings, token/LLM/tool usage이며 **전체
+diff, prompt, tool result 전문, reasoning transcript를 중복 저장하지 않습니다.** worker가 죽거나 Qwen
+timeout으로 REVIEW retry가 발생하면 같은 durable job(동일 revision + policy version)의 `DONE` chunk는
+LLM을 다시 호출하지 않고 복원합니다. context-limit 때문에 더 잘게 나눈 `SPLIT` 결정도 복원하며,
+실패한 chunk는 결과를 재사용하지 않되 `RETRY` usage를 누적해서 candidate 단계의 budget 사용량이
+retry 때 초기화되지 않게 합니다. verifier 자체는 checkpoint 대상이 아니며 retry 시 다시 실행됩니다.
+
+checkpoint는 장애복구용 cache입니다. 기본 `chunk_checkpoint_retention_days: 30`으로 DONE/SUPERSEDED
+job의 오래된 checkpoint를 reconciler가 정리합니다. `FAILED_PERMANENT`는 manual requeue 가능성이 있으므로
+자동 정리 대상에서 제외합니다. retention 값은 `config.yaml`에서 변경하며 서비스 재시작 후 적용됩니다.
 
 ---
 
@@ -1899,6 +1913,7 @@ Logs
 - attempt가 몇 번 발생했는지
 - exact error text
 - review result가 이미 만들어졌는지
+- candidate chunk checkpoint가 몇 개 저장/재사용됐는지
 - publication intent가 생겼는지
 - Gerrit response가 있는지
 

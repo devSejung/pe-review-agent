@@ -97,7 +97,15 @@ class _FakeEngine:
         self.calls = 0
         self.summary = "Timeout result must be handled before advancing."
 
-    async def review(self, _context, _tools, *, tool_trace=None) -> ReviewResult:
+    async def review(
+        self,
+        _context,
+        _tools,
+        *,
+        tool_trace=None,
+        checkpoint_load=None,
+        checkpoint_save=None,
+    ) -> ReviewResult:
         self.calls += 1
         return ReviewResult(
             summary=self.summary,
@@ -122,7 +130,15 @@ class _HistoryAwareFakeEngine:
     def __init__(self) -> None:
         self.contexts: list[ReviewContext] = []
 
-    async def review(self, context: ReviewContext, _tools, *, tool_trace=None) -> ReviewResult:
+    async def review(
+        self,
+        context: ReviewContext,
+        _tools,
+        *,
+        tool_trace=None,
+        checkpoint_load=None,
+        checkpoint_save=None,
+    ) -> ReviewResult:
         self.contexts.append(context)
         semantic_id = (
             context.previous_findings[0].semantic_id if context.previous_findings else None

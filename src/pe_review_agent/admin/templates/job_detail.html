@@ -28,6 +28,31 @@
 </div>
 {% endif %}
 
+{% if audit.chunk_checkpoints %}
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Candidate chunk checkpoints</h3></div>
+  <div class="card-body">
+    <div class="text-secondary small mb-3">Durable recovery cache. Completed chunks are reused after review retry/restart instead of calling the LLM again. DONE/SUPERSEDED checkpoints expire by retention policy.</div>
+    <div class="table-responsive">
+      <table class="table table-sm table-vcenter">
+        <thead><tr><th>Status</th><th>Chunk</th><th>Paths</th><th>Usage</th><th>Updated</th></tr></thead>
+        <tbody>
+        {% for checkpoint in audit.chunk_checkpoints %}
+          <tr>
+            <td><span class="badge {% if checkpoint.status == 'DONE' %}bg-green-lt{% else %}bg-yellow-lt{% endif %}">{{ checkpoint.status }}</span></td>
+            <td class="font-monospace small">{{ checkpoint.chunk_key[:12] }}{% if checkpoint.parent_chunk_key %}<div class="text-secondary">parent {{ checkpoint.parent_chunk_key[:12] }}</div>{% endif %}</td>
+            <td class="small">{{ checkpoint.paths | join(', ') or '—' }}{% if checkpoint.finding_count %}<div class="text-secondary">{{ checkpoint.finding_count }} candidate finding(s)</div>{% endif %}</td>
+            <td class="small">LLM {{ checkpoint.llm_calls }} · tools {{ checkpoint.tool_calls }} · in {{ checkpoint.input_tokens }} · out {{ checkpoint.output_tokens }}</td>
+            <td class="text-secondary small">{{ checkpoint.updated_at }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <div class="card mb-4">
   <div class="card-header"><h3 class="card-title">Attempt timeline</h3></div>
   <div class="table-responsive">
