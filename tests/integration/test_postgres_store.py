@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -27,8 +28,10 @@ from pe_review_agent.jobs import (
     PublicationStatus,
     PublishGuardStatus,
 )
+from pe_review_agent.jobs.progress import PostgresProgressBackend
 from pe_review_agent.retry import TransientError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
+from pe_review_agent.review.progress import Invocation, ReviewProgress, Usage
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="PE_REVIEW_TEST_POSTGRES_DSN is not configured")
@@ -602,7 +605,7 @@ async def test_candidate_checkpoints_are_durable_and_pruned_only_for_old_termina
         )
         await session.commit()
 
-    assert await jobs.prune_candidate_chunk_checkpoints(retention_days=30) == 0
+    assert await jobs.prune_review_recovery_cache(retention_days=30) == 0
     assert await jobs.load_candidate_chunk_checkpoints(job.id, checkpoint_version="candidate-v1")
 
     async with database.session() as session:
@@ -612,10 +615,135 @@ async def test_candidate_checkpoints_are_durable_and_pruned_only_for_old_termina
         )
         await session.commit()
 
-    assert await jobs.prune_candidate_chunk_checkpoints(retention_days=30) == 1
+    assert await jobs.prune_review_recovery_cache(retention_days=30) == 1
     assert (
         await jobs.load_candidate_chunk_checkpoints(job.id, checkpoint_version="candidate-v1") == {}
     )
+
+
+async def _progress_backend(jobs: JobStore):
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="a" * 40),
+        review_policy_version="firmware-v1",
+    )
+    claim = await jobs.claim_next(worker_id="reviewer", lease_seconds=120)
+    assert claim is not None and claim.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="reviewer")
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id="reviewer")
+    attempt = await jobs.start_attempt(job.id, stage=AttemptStage.REVIEW, worker_id="reviewer")
+    return job, PostgresProgressBackend(
+        jobs._sessions, job_id=job.id, worker_id="reviewer", attempt_id=attempt,
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_manifest_and_invocation_completion_are_immutable_and_idempotent(store):
+    jobs, _ = store
+    _, backend = await _progress_backend(jobs)
+    progress = ReviewProgress(input_key="1" * 64)
+    await backend.save(progress)
+    progress.phase = "verification"
+    progress.candidate_usage = Usage(llm_calls=3, tool_calls=2)
+    progress.frozen_candidates = _review().findings
+    await backend.save(progress)
+    await backend.save(progress)
+    loaded = await backend.load(progress.input_key)
+    assert loaded == progress
+    changed = progress.model_copy(update={"frozen_candidates": []}, deep=True)
+    with pytest.raises(TransientError, match="manifest is immutable"):
+        await backend.save(changed)
+    backward = progress.model_copy(update={"phase": "candidate"}, deep=True)
+    with pytest.raises(TransientError, match="cannot move back"):
+        await backend.save(backward)
+
+    invocation = Invocation(
+        id=str(uuid.uuid4()), input_key=progress.input_key,
+        phase="verification", work_key="2" * 64, kind="llm",
+    )
+    await backend.record_invocation(invocation)
+    await backend.record_invocation(invocation)
+    invocation.status = "completed"
+    invocation.input_tokens = 1234
+    invocation.output_tokens = 50
+    await backend.record_invocation(invocation)
+    await backend.record_invocation(invocation)
+    totals = await backend.totals()
+    assert totals["llm_calls"] == 1 and totals["input_tokens"] == 1234
+    assert totals["unconfirmed_calls"] == 0
+    invocation.input_tokens = 999
+    with pytest.raises(TransientError, match="cannot be rewritten"):
+        await backend.record_invocation(invocation)
+    assert (await backend.totals())["input_tokens"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_lost_lease_cannot_write_progress_or_complete_an_old_invocation(store):
+    jobs, database = store
+    job, backend = await _progress_backend(jobs)
+    progress = ReviewProgress(input_key="1" * 64)
+    await backend.save(progress)
+    invocation = Invocation(
+        id=str(uuid.uuid4()), input_key=progress.input_key,
+        phase="candidate", work_key="2" * 64, kind="llm",
+    )
+    await backend.record_invocation(invocation)
+    await _expire_job_lease(database, job.id)
+    replacement = await jobs.claim_next(worker_id="replacement", lease_seconds=120)
+    assert replacement is not None
+    with pytest.raises(TransientError, match="not leased"):
+        await backend.save(progress)
+    invocation.status = "completed"
+    with pytest.raises(TransientError, match="not leased"):
+        await backend.record_invocation(invocation)
+    assert (await backend.totals())["unconfirmed_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_checkpoint_usage_is_preserved_without_trusting_missing_context(store):
+    jobs, _ = store
+    job, backend = await _progress_backend(jobs)
+    for index, status in enumerate(("DONE", "RETRY", "SPLIT")):
+        checkpoint = CandidateChunkCheckpoint(
+            chunk_key=str(index) * 64, parent_chunk_key=None, status=status,
+            paths=("fw.c",), change_summary="legacy output", findings=(),
+            input_tokens=100, output_tokens=50, llm_calls=3, tool_calls=2,
+        )
+        await jobs.save_candidate_chunk_checkpoint(
+            job.id, worker_id="reviewer", checkpoint_version="candidate-v1", checkpoint=checkpoint,
+        )
+    present, usage = await backend.legacy()
+    assert present and usage.llm_calls == 3 and usage.tool_calls == 2
+    checkpoints = await jobs.load_candidate_chunk_checkpoints(
+        job.id,
+        checkpoint_version="candidate-v1",
+    )
+    assert len(checkpoints) == 3
+
+
+@pytest.mark.asyncio
+async def test_progress_cleanup_keeps_invocation_audit_and_failed_job_recovery(store):
+    jobs, database = store
+    job, backend = await _progress_backend(jobs)
+    progress = ReviewProgress(input_key="1" * 64)
+    await backend.save(progress)
+    await backend.record_invocation(Invocation(
+        id=str(uuid.uuid4()), input_key=progress.input_key,
+        phase="candidate", work_key="2" * 64, kind="llm",
+    ))
+    async with database.session() as session:
+        await session.execute(
+            text("UPDATE review_progress SET updated_at = now() - interval '40 days'")
+        )
+        await session.execute(text("UPDATE review_jobs SET state = 'FAILED_PERMANENT'"))
+        await session.commit()
+    assert await jobs.prune_review_recovery_cache(retention_days=30) == 0
+    assert await backend.load(progress.input_key) is not None
+    async with database.session() as session:
+        await session.execute(text("UPDATE review_jobs SET state = 'DONE'"))
+        await session.commit()
+    assert await jobs.prune_review_recovery_cache(retention_days=30) == 1
+    assert await backend.load(progress.input_key) is None
+    assert (await backend.totals())["llm_calls"] == 1
 
 
 async def _save_done_review(

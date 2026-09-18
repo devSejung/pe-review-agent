@@ -11,6 +11,9 @@ class FindingValidator:
         self.settings = settings
 
     def validate(self, context: ReviewContext, findings: list[Finding]) -> list[Finding]:
+        return self.validate_all(context, findings)[: self.settings.max_findings]
+
+    def validate_all(self, context: ReviewContext, findings: list[Finding]) -> list[Finding]:
         changed_files = set(context.changed_files)
         changed_lines = {
             (line.path, line.side, line.line): line.text for line in context.changed_lines
@@ -104,7 +107,7 @@ class FindingValidator:
 
         severity_order = {Severity.P0: 0, Severity.P1: 1, Severity.P2: 2}
         accepted.sort(key=lambda item: (severity_order[item.severity], -item.confidence))
-        return accepted[: self.settings.max_findings]
+        return accepted
 
 
 def _read_utf8_lines(target: Path, line_numbers: set[int]) -> dict[int, str] | None:

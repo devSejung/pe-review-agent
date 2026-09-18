@@ -19,6 +19,8 @@ from pe_review_agent.jobs.models import (
     Publication,
     ReviewChunkCheckpoint,
     ReviewFinding,
+    ReviewInvocationRow,
+    ReviewProgressRow,
     ReviewResultRow,
     ServiceState,
 )
@@ -349,8 +351,8 @@ class ControlStore:
                 "max_tool_calls_per_job": review_cfg.get(
                     "max_tool_calls_per_job", base.review.max_tool_calls_per_job
                 ),
-                "max_input_tokens_per_job": review_cfg.get(
-                    "max_input_tokens_per_job", base.review.max_input_tokens_per_job
+                "verifier_budget_fraction": review_cfg.get(
+                    "verifier_budget_fraction", base.review.verifier_budget_fraction
                 ),
             }
         )
@@ -582,7 +584,62 @@ class ControlStore:
                 )
             ).all()
 
+            progress_rows = (
+                await session.scalars(
+                    select(ReviewProgressRow)
+                    .where(
+                        ReviewProgressRow.job_id == job_id,
+                    )
+                    .order_by(ReviewProgressRow.updated_at.desc())
+                )
+            ).all()
+            invocations = (
+                await session.scalars(
+                    select(ReviewInvocationRow)
+                    .where(
+                        ReviewInvocationRow.job_id == job_id,
+                    )
+                    .order_by(ReviewInvocationRow.created_at.desc())
+                    .limit(100)
+                )
+            ).all()
+            invocation_totals = (
+                await session.execute(
+                    select(
+                        func.count().filter(ReviewInvocationRow.kind == "llm"),
+                        func.count().filter(ReviewInvocationRow.kind == "tool"),
+                        func.count().filter(ReviewInvocationRow.status == "started"),
+                        func.count().filter(ReviewInvocationRow.status == "failed"),
+                    ).where(ReviewInvocationRow.job_id == job_id)
+                )
+            ).one()
             audit = _job_dict(job)
+            audit["review_progress"] = [
+                {"input_key": row.input_key, "updated_at": row.updated_at, **row.payload}
+                for row in progress_rows
+            ]
+            audit["invocation_totals"] = dict(
+                zip(
+                    ("llm_calls", "tool_calls", "unconfirmed_calls", "failed_calls"),
+                    (int(value) for value in invocation_totals),
+                    strict=True,
+                )
+            )
+            audit["invocations"] = [
+                {
+                    "id": row.id,
+                    "phase": row.phase,
+                    "work_key": row.work_key,
+                    "kind": row.kind,
+                    "status": row.status,
+                    "attempt_id": row.attempt_id,
+                    "input_tokens": row.input_tokens,
+                    "output_tokens": row.output_tokens,
+                    "created_at": row.created_at,
+                    "error": row.error,
+                }
+                for row in invocations
+            ]
             now = datetime.now(UTC)
             audit["attempts"] = [
                 {
@@ -695,7 +752,7 @@ def _defaults_from_settings(settings: Settings) -> dict[str, Any]:
             "max_candidate_chunks": settings.review.max_candidate_chunks,
             "max_llm_calls_per_job": settings.review.max_llm_calls_per_job,
             "max_tool_calls_per_job": settings.review.max_tool_calls_per_job,
-            "max_input_tokens_per_job": settings.review.max_input_tokens_per_job,
+            "verifier_budget_fraction": settings.review.verifier_budget_fraction,
         },
     }
 

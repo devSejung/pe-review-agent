@@ -93,7 +93,10 @@ def test_review_budget_defaults_and_bounds_are_validated() -> None:
     assert settings.max_candidate_chunks == 12
     assert settings.max_llm_calls_per_job == 30
     assert settings.max_tool_calls_per_job == 50
-    assert settings.max_input_tokens_per_job == 300_000
+    assert settings.verifier_budget_fraction == pytest.approx(1 / 3)
+    assert settings.max_input_tokens_per_job is None
+    assert "max_input_tokens_per_job" not in settings.model_dump()
+    assert ReviewSettings(max_input_tokens_per_job=300_000).max_input_tokens_per_job == 300_000
     assert settings.chunk_checkpoint_retention_days == 30
 
     with pytest.raises(ValidationError):
@@ -102,6 +105,10 @@ def test_review_budget_defaults_and_bounds_are_validated() -> None:
         ReviewSettings(max_llm_calls_per_job=0)
     with pytest.raises(ValidationError):
         ReviewSettings(max_tool_calls_per_job=-1)
+    with pytest.raises(ValidationError):
+        ReviewSettings(verifier_budget_fraction=0)
+    with pytest.raises(ValidationError):
+        ReviewSettings(verifier_budget_fraction=1)
     with pytest.raises(ValidationError):
         ReviewSettings(max_input_tokens_per_job=999)
     with pytest.raises(ValidationError):

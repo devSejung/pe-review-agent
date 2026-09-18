@@ -28,11 +28,58 @@
 </div>
 {% endif %}
 
+{% if audit.review_progress %}
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Review progress / checkpoints</h3></div>
+  <div class="card-body">
+    <p class="text-secondary small">Completed results and their operational charges survive restart. Abandoned unfinished sessions restart with a fresh allowance; their requests remain in the invocation audit. Candidate inputs are frozen before verification.</p>
+    {% for progress in audit.review_progress %}
+    <div class="fw-semibold mb-2">{{ progress.phase }} · input {{ progress.input_key[:12] }} · {{ progress.updated_at }}</div>
+    {% if progress.legacy_present %}<div class="alert alert-warning">Legacy v1 checkpoints lack context/completeness proof. Original rows and known usage remain for audit, but old findings are not reused and their usage is not charged to the new operational allowance.</div>{% endif %}
+    <div class="table-responsive mb-3">
+      <table class="table table-sm table-vcenter">
+        <thead><tr><th>Phase / work</th><th>Status</th><th>Paths</th><th>Charged usage</th><th>Limitations</th></tr></thead>
+        <tbody>
+        {% for key, checkpoint in progress.checkpoints.items() %}
+          <tr>
+            <td>{{ checkpoint.phase }}<div class="font-monospace small">{{ key[:12] }}</div></td>
+            <td><span class="badge {% if checkpoint.status == 'DONE' and not checkpoint.limitations %}bg-green-lt{% else %}bg-yellow-lt{% endif %}">{{ checkpoint.status }}</span></td>
+            <td class="small">{{ checkpoint.paths | join(', ') or '—' }}</td>
+            <td class="small">LLM {{ checkpoint.usage.llm_calls }} · tools {{ checkpoint.usage.tool_calls }}</td>
+            <td class="small">{{ checkpoint.limitations | join(', ') or '—' }}</td>
+          </tr>
+        {% else %}<tr><td colspan="5" class="text-secondary">No completed work yet.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% if audit.invocations %}
+<div class="card mb-4">
+  <div class="card-header"><h3 class="card-title">Actual invocation audit</h3></div>
+  <div class="card-body">
+    <div class="mb-2">LLM attempts: <strong>{{ audit.invocation_totals.llm_calls }}</strong> · tool attempts: <strong>{{ audit.invocation_totals.tool_calls }}</strong> · failed: {{ audit.invocation_totals.failed_calls }} · unconfirmed: {{ audit.invocation_totals.unconfirmed_calls }}</div>
+    <p class="text-secondary small">Lifetime attempts include failed/restarted work and may exceed the operational budget. Intent is recorded before dispatch; unconfirmed requests may still be running or may have been interrupted. The latest 100 records are shown. Tokens are informational only.</p>
+    <div class="table-responsive">
+      <table class="table table-sm table-vcenter">
+        <thead><tr><th>Time</th><th>Attempt / phase</th><th>Kind</th><th>Status</th><th>Input / output tokens</th><th>Error</th></tr></thead>
+        <tbody>{% for call in audit.invocations %}
+          <tr><td class="small">{{ call.created_at }}</td><td>{{ call.attempt_id }} · {{ call.phase }}<div class="font-monospace small">{{ call.work_key[:12] }}</div></td><td>{{ call.kind }}</td><td>{{ call.status }}</td><td>{{ call.input_tokens if call.input_tokens is not none else 'unknown' }} / {{ call.output_tokens if call.output_tokens is not none else 'unknown' }}</td><td class="small">{{ call.error or '—' }}</td></tr>
+        {% endfor %}</tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {% if audit.chunk_checkpoints %}
 <div class="card mb-4">
-  <div class="card-header"><h3 class="card-title">Candidate chunk checkpoints</h3></div>
+  <div class="card-header"><h3 class="card-title">Legacy candidate chunk checkpoints</h3></div>
   <div class="card-body">
-    <div class="text-secondary small mb-3">Durable recovery cache. Completed chunks are reused after review retry/restart instead of calling the LLM again. DONE/SUPERSEDED checkpoints expire by retention policy.</div>
+    <div class="text-secondary small mb-3">Historical v1 results and usage, retained for upgrade audit. New reviews use context-bound progress above; v1 lacks the input/quality metadata required for safe automatic result reuse.</div>
     <div class="table-responsive">
       <table class="table table-sm table-vcenter">
         <thead><tr><th>Status</th><th>Chunk</th><th>Paths</th><th>Usage</th><th>Updated</th></tr></thead>
@@ -143,11 +190,12 @@
         <div class="row g-3 small">
           <div class="col-md-3"><div class="subheader">Candidate chunks</div><div>{{ budget.candidate_chunks_reviewed }} / {{ budget.candidate_chunks_total }}</div></div>
           <div class="col-md-3"><div class="subheader">Complete diff coverage</div><div>{{ budget.reviewable_files_fully_reviewed }} / {{ budget.reviewable_files_total }} files</div></div>
-          <div class="col-md-2"><div class="subheader">LLM calls</div><div>{{ budget.llm_calls }} / {{ budget.limits.max_llm_calls_per_job }}</div></div>
-          <div class="col-md-2"><div class="subheader">Tool calls</div><div>{{ budget.tool_calls }} / {{ budget.limits.max_tool_calls_per_job }}</div></div>
+          <div class="col-md-2"><div class="subheader">Charged LLM calls</div><div>{{ budget.llm_calls }} / {{ budget.limits.max_llm_calls_per_job }}</div></div>
+          <div class="col-md-2"><div class="subheader">Charged tool calls</div><div>{{ budget.tool_calls }} / {{ budget.limits.max_tool_calls_per_job }}</div></div>
           <div class="col-md-2"><div class="subheader">Verification</div><div>{{ 'complete' if budget.verification_complete else 'incomplete' }}</div></div>
         </div>
-        {% if budget.stop_reasons %}<div class="text-warning mt-2">Budget stop: <code>{{ budget.stop_reasons | join(', ') }}</code></div>{% endif %}
+        {% if budget.verification_candidates_total is defined %}<div class="mt-2">Verification candidates processed: {{ budget.verification_candidates_processed }} / {{ budget.verification_candidates_total }} · reserve fraction: {{ budget.verifier_budget_fraction }}</div>{% endif %}
+        {% if budget.stop_reasons %}<div class="text-warning mt-2">Review limitations: <code>{{ budget.stop_reasons | join(', ') }}</code></div>{% endif %}
         {% if budget.uncovered_files %}<details class="mt-2"><summary>Uncovered files ({{ budget.reviewable_files_total - budget.reviewable_files_fully_reviewed }})</summary><pre class="audit-pre mt-2">{{ budget.uncovered_files | join('\n') }}{% if budget.uncovered_files_truncated %}\n&lt;truncated&gt;{% endif %}</pre></details>{% endif %}
       </div>
     </div>
@@ -171,7 +219,7 @@
         <details class="mt-3"><summary>Audit identity</summary><div class="font-monospace small mt-2 text-break">fingerprint={{ finding.fingerprint }}<br>semantic_id={{ finding.semantic_id }}</div></details>
       </div>
     </div>
-    {% else %}<div class="text-secondary">No durable review result yet.</div>{% endfor %}
+    {% else %}<div class="text-secondary">No publishable findings. Check the review coverage and verification status above; an incomplete review is not a clean verdict.</div>{% endfor %}
     {% else %}
     <div class="text-secondary">The model has not produced a durable review result for this job.</div>
     {% endif %}

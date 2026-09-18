@@ -395,7 +395,8 @@ async def test_bootstrap_prunes_only_semantics_preserving_legacy_full_snapshot(
         assert await control.legacy_runtime_snapshot_sections(settings) == set()
         effective_after_upgrade = await control.effective_settings(settings)
         assert effective_after_upgrade.review.max_candidate_chunks == 12
-        assert effective_after_upgrade.review.max_input_tokens_per_job == 300_000
+        assert effective_after_upgrade.review.verifier_budget_fraction == pytest.approx(1 / 3)
+        assert effective_after_upgrade.review.max_input_tokens_per_job is None
 
         async with database.sessions.begin() as session:
             row = await session.get(ServiceState, "admin-runtime-config", with_for_update=True)
@@ -627,7 +628,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
                     "max_candidate_chunks": 9,
                     "max_llm_calls_per_job": 24,
                     "max_tool_calls_per_job": 40,
-                    "max_input_tokens_per_job": 240000,
+                    "verifier_budget_fraction": 0.4,
                 },
             },
         )
@@ -639,7 +640,8 @@ def test_admin_live_controls_runtime_config_and_requeue(
         assert 'name="review.max_candidate_chunks" value="9"' in settings_page.text
         assert 'name="review.max_llm_calls_per_job" value="24"' in settings_page.text
         assert 'name="review.max_tool_calls_per_job" value="40"' in settings_page.text
-        assert 'name="review.max_input_tokens_per_job" value="240000"' in settings_page.text
+        assert 'name="review.verifier_budget_fraction" value="0.4"' in settings_page.text
+        assert 'name="review.max_input_tokens_per_job"' not in settings_page.text
         assert "Restart required:" in settings_page.text
         assert 'name="gerrit.ssh_host"' not in settings_page.text
         assert "Saved DB review-policy override is active" in settings_page.text
@@ -649,7 +651,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
         assert effective.max_candidate_chunks == 9
         assert effective.max_llm_calls_per_job == 24
         assert effective.max_tool_calls_per_job == 40
-        assert effective.max_input_tokens_per_job == 240000
+        assert effective.verifier_budget_fraction == 0.4
 
         reset_review = client.post(
             "/api/runtime-config/reset-review",
@@ -714,7 +716,7 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
     assert "Review budget / coverage" in response.text
     assert "3 / 30" in response.text
     assert "1 / 50" in response.text
-    assert "Candidate chunk checkpoints" in response.text
+    assert "Legacy candidate chunk checkpoints" in response.text
     assert "cccccccccccc" in response.text
 
 

@@ -706,7 +706,7 @@ def _validated_review_update(value: dict[str, Any], current: dict[str, Any]) -> 
         "max_candidate_chunks",
         "max_llm_calls_per_job",
         "max_tool_calls_per_job",
-        "max_input_tokens_per_job",
+        "verifier_budget_fraction",
     }
     result = {**current, **{key: item for key, item in value.items() if key in allowed}}
     if not isinstance(result.get("policy_version"), str) or not result["policy_version"].strip():
@@ -719,7 +719,7 @@ def _validated_review_update(value: dict[str, Any], current: dict[str, Any]) -> 
         max_candidate_chunks = int(result.get("max_candidate_chunks"))
         max_llm_calls = int(result.get("max_llm_calls_per_job"))
         max_tool_calls = int(result.get("max_tool_calls_per_job"))
-        max_input_tokens = int(result.get("max_input_tokens_per_job"))
+        verifier_fraction = float(result.get("verifier_budget_fraction", 1 / 3))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid review numeric setting") from exc
     if not 0 <= max_findings <= 50:
@@ -738,17 +738,18 @@ def _validated_review_update(value: dict[str, Any], current: dict[str, Any]) -> 
         raise HTTPException(
             status_code=422, detail="max_tool_calls_per_job must be between 0 and 5000"
         )
-    if not 1_000 <= max_input_tokens <= 20_000_000:
+    if not 0 < verifier_fraction < 1:
         raise HTTPException(
             status_code=422,
-            detail="max_input_tokens_per_job must be between 1000 and 20000000",
+            detail="verifier_budget_fraction must be greater than 0 and less than 1",
         )
     result["max_findings"] = max_findings
     result["min_confidence"] = confidence
     result["max_candidate_chunks"] = max_candidate_chunks
     result["max_llm_calls_per_job"] = max_llm_calls
     result["max_tool_calls_per_job"] = max_tool_calls
-    result["max_input_tokens_per_job"] = max_input_tokens
+    result["verifier_budget_fraction"] = verifier_fraction
+    result.pop("max_input_tokens_per_job", None)
     return result
 
 
