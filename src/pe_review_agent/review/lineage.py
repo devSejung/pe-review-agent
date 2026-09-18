@@ -27,6 +27,7 @@ def reconcile_finding_lineage(
     project: str,
     review: ReviewResult,
     history: FindingHistory,
+    complete: bool = True,
 ) -> LineageReconciliation:
     previous_by_id: dict[str, Finding] = {}
     for finding in history.previous_findings:
@@ -52,11 +53,18 @@ def reconcile_finding_lineage(
             finding.lineage = FindingLineage.NEW
             new_count += 1
 
-    resolved = tuple(
-        finding for semantic_id, finding in previous_by_id.items() if semantic_id not in current_ids
+    resolved = (
+        tuple(
+            finding
+            for semantic_id, finding in previous_by_id.items()
+            if semantic_id not in current_ids
+        )
+        if complete
+        else ()
     )
     tracking = {
         "baseline_patchset": history.baseline_patchset,
+        "complete": complete,
         "new": new_count,
         "persisting": persisting_count,
         "reopened": reopened_count,
@@ -72,6 +80,7 @@ def reconcile_finding_lineage(
         persisting_count=persisting_count,
         reopened_count=reopened_count,
         resolved=resolved,
+        complete=complete,
     )
     reconciled = review.model_copy(
         update={"summary": summary, "review_metadata": metadata},
@@ -101,10 +110,22 @@ def _tracking_summary(
     persisting_count: int,
     reopened_count: int,
     resolved: tuple[Finding, ...],
+    complete: bool,
 ) -> str:
-    if baseline_patchset is None:
+    if baseline_patchset is None and complete:
         header = (
             f"Patch Set tracking: {new_count} new finding(s); no previously published baseline."
+        )
+    elif baseline_patchset is None:
+        header = (
+            f"Patch Set tracking (partial review): {new_count} new finding(s); "
+            "no previously published baseline."
+        )
+    elif not complete:
+        header = (
+            f"Patch Set tracking vs PS {baseline_patchset} (partial review): {new_count} new, "
+            f"{persisting_count} still present, {reopened_count} reopened. "
+            "Unreviewed prior findings were not classified as fixed."
         )
     else:
         header = (

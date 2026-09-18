@@ -635,3 +635,221 @@ async def test_previous_finding_is_forced_through_verifier_when_candidate_pass_m
     assert result.findings[0].semantic_id == semantic_id
     verifier_prompt = llm.seen_messages[1][1]["content"]
     assert semantic_id in verifier_prompt
+
+
+@pytest.mark.asyncio
+async def test_candidate_chunk_budget_returns_partial_coverage_without_failing(
+    tmp_path: Path,
+) -> None:
+    def section(path: str, marker: str) -> str:
+        body = "".join(f"+{marker}_{index}_" + "x" * 36 + "\n" for index in range(60))
+        return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,60 @@\n{body}"
+
+    for name in ("a.c", "b.c"):
+        (tmp_path / name).write_text("changed();\n", encoding="utf-8")
+    diff = section("a.c", "A") + section("b.c", "B")
+    llm = FakeLlm(
+        [_completion(json.dumps({"change_summary": "- a.c를 수정합니다.", "findings": []}))]
+    )
+    settings = ReviewSettings(max_diff_chunk_chars=4_000, max_candidate_chunks=1)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=20,
+        patchset_number=1,
+        revision_sha="6" * 40,
+        diff=diff,
+        changed_files=["a.c", "b.c"],
+        changed_lines=[
+            ChangedLine(path="a.c", line=1, text="changed();"),
+            ChangedLine(path="b.c", line=1, text="changed();"),
+        ],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    budget = result.review_metadata["review_budget"]
+    assert budget["candidate_chunks_reviewed"] == 1
+    assert budget["candidate_chunks_total"] == 2
+    assert budget["reviewable_files_fully_reviewed"] == 1
+    assert budget["reviewable_files_total"] == 2
+    assert budget["stop_reasons"] == ["max_candidate_chunks"]
+    assert result.review_metadata["lineage_complete"] is False
+    assert "리뷰 범위" in result.summary
+    assert "1/2" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_job_llm_call_budget_stops_tool_loop_as_partial_review(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    read = ToolCall(
+        id="call-budget",
+        name="read_file",
+        arguments={"path": "fw.c"},
+        raw_arguments='{"path":"fw.c"}',
+    )
+    llm = FakeLlm([_completion("", read)])
+    settings = ReviewSettings(max_llm_calls_per_job=1)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=21,
+        patchset_number=1,
+        revision_sha="7" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    budget = result.review_metadata["review_budget"]
+    assert budget["llm_calls"] == 1
+    assert budget["tool_calls"] == 1
+    assert budget["candidate_chunks_reviewed"] == 0
+    assert budget["stop_reasons"] == ["max_llm_calls_per_job"]
+    assert result.input_tokens == 10
+    assert result.output_tokens == 5
+    assert result.review_metadata["lineage_complete"] is False
+    assert "검토가 완료된 범위" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_job_input_token_budget_stops_next_llm_call_after_reported_usage(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    read = ToolCall(
+        id="call-token-budget",
+        name="read_file",
+        arguments={"path": "fw.c"},
+        raw_arguments='{"path":"fw.c"}',
+    )
+    first = LlmCompletion(
+        content="",
+        tool_calls=(read,),
+        input_tokens=1200,
+        output_tokens=5,
+        finish_reason="tool_calls",
+        raw_message={},
+    )
+    llm = FakeLlm([first])
+    settings = ReviewSettings(max_input_tokens_per_job=1000)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=24,
+        patchset_number=1,
+        revision_sha="a" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    budget = result.review_metadata["review_budget"]
+    assert budget["llm_calls"] == 1
+    assert budget["input_tokens"] == 1200
+    assert budget["stop_reasons"] == ["max_input_tokens_per_job"]
+    assert result.input_tokens == 1200
+    assert result.review_metadata["lineage_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_job_tool_budget_forces_final_answer_and_discloses_limit(tmp_path: Path) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    read = ToolCall(
+        id="call-tool-budget",
+        name="read_file",
+        arguments={"path": "fw.c"},
+        raw_arguments='{"path":"fw.c"}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", read),
+            _completion(
+                json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
+            ),
+        ]
+    )
+    settings = ReviewSettings(max_tool_calls_per_job=0)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=22,
+        patchset_number=1,
+        revision_sha="8" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    result = await engine.review(
+        context,
+        RepositoryToolExecutor(tmp_path, settings),
+        tool_trace=capture,
+    )
+
+    budget = result.review_metadata["review_budget"]
+    assert budget["llm_calls"] == 2
+    assert budget["tool_calls"] == 0
+    assert budget["candidate_chunks_reviewed"] == 1
+    assert budget["stop_reasons"] == ["max_tool_calls_per_job"]
+    assert result.review_metadata["lineage_complete"] is False
+    assert any(event.get("status") == "job_budget_suppressed" for event in trace)
+    assert any(
+        event.get("event") == "forced_finalization"
+        and event.get("reason") == "max_tool_calls_per_job"
+        for event in trace
+    )
+    assert "리뷰 범위" in result.summary
+
+
+@pytest.mark.asyncio
+async def test_verifier_budget_exhaustion_never_publishes_unverified_candidate(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    candidate = json.loads(_review_json())
+    candidate["findings"][0]["location"] = {"path": "fw.c", "start_line": 1}
+    llm = FakeLlm([_completion(json.dumps(candidate))])
+    settings = ReviewSettings(max_llm_calls_per_job=1)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=23,
+        patchset_number=1,
+        revision_sha="9" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    budget = result.review_metadata["review_budget"]
+    assert result.findings == []
+    assert budget["candidate_chunks_reviewed"] == 1
+    assert budget["verification_complete"] is False
+    assert budget["stop_reasons"] == ["max_llm_calls_per_job"]
+    assert result.review_metadata["lineage_complete"] is False
+    assert "finding 검증: 미완료" in result.summary

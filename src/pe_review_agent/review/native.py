@@ -4,6 +4,7 @@ import json
 import posixpath
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,6 +27,56 @@ class _CandidateReview(BaseModel):
 class _VerificationReview(BaseModel):
     review_summary: str = ""
     findings: list[Finding] = Field(default_factory=list)
+
+
+class _BudgetExhausted(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(slots=True)
+class _ReviewBudget:
+    max_llm_calls: int
+    max_tool_calls: int
+    max_input_tokens: int
+    llm_calls: int = 0
+    tool_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    stop_reasons: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_settings(cls, settings: ReviewSettings) -> _ReviewBudget:
+        return cls(
+            max_llm_calls=settings.max_llm_calls_per_job,
+            max_tool_calls=settings.max_tool_calls_per_job,
+            max_input_tokens=settings.max_input_tokens_per_job,
+        )
+
+    def reserve_llm_call(self) -> None:
+        if self.llm_calls >= self.max_llm_calls:
+            self.mark_stop("max_llm_calls_per_job")
+            raise _BudgetExhausted("max_llm_calls_per_job")
+        if self.input_tokens >= self.max_input_tokens:
+            self.mark_stop("max_input_tokens_per_job")
+            raise _BudgetExhausted("max_input_tokens_per_job")
+        self.llm_calls += 1
+
+    def record_tokens(self, input_tokens: int | None, output_tokens: int | None) -> None:
+        self.input_tokens += input_tokens or 0
+        self.output_tokens += output_tokens or 0
+
+    def reserve_tool_call(self) -> bool:
+        if self.tool_calls >= self.max_tool_calls:
+            self.mark_stop("max_tool_calls_per_job")
+            return False
+        self.tool_calls += 1
+        return True
+
+    def mark_stop(self, reason: str) -> None:
+        if reason not in self.stop_reasons:
+            self.stop_reasons.append(reason)
 
 
 ToolTraceCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -78,45 +129,59 @@ class NativeFirmwareReviewEngine:
                     "published_candidate_count": 0,
                 },
             )
+        budget = _ReviewBudget.from_settings(self.settings)
         candidate_findings: list[Finding] = []
         candidate_change_summaries: list[str] = []
-        candidate_input_tokens = 0
-        candidate_output_tokens = 0
         initial_chunks = chunk_diff(context.diff, max_chars=self.settings.max_diff_chunk_chars)
         pending_chunks = list(initial_chunks)
-        processed_chunks = 0
+        reviewed_chunks: list[DiffChunk] = []
+        budget_stop_reasons: list[str] = []
         while pending_chunks:
+            if len(reviewed_chunks) >= self.settings.max_candidate_chunks:
+                reason = "max_candidate_chunks"
+                budget.mark_stop(reason)
+                budget_stop_reasons.append(reason)
+                await _emit_budget_stop(tool_trace, phase="candidate", reason=reason, budget=budget)
+                break
             chunk = pending_chunks.pop(0)
             candidate_messages = self._candidate_messages(
                 context,
                 chunk,
-                chunk_index=processed_chunks + 1,
-                chunk_count=processed_chunks + 1 + len(pending_chunks),
+                chunk_index=len(reviewed_chunks) + 1,
+                chunk_count=len(reviewed_chunks) + 1 + len(pending_chunks),
             )
             try:
-                candidate, usage = await self._tool_session(
+                candidate, _usage = await self._tool_session(
                     candidate_messages,
                     tools,
-                    phase=f"candidate:{processed_chunks + 1}",
+                    phase=f"candidate:{len(reviewed_chunks) + 1}",
+                    budget=budget,
                     tool_trace=tool_trace,
                 )
-            except ContextLengthError as exc:
-                candidate_input_tokens += exc.input_tokens
-                candidate_output_tokens += exc.output_tokens
+            except _BudgetExhausted as exc:
+                pending_chunks.insert(0, chunk)
+                budget_stop_reasons.append(exc.reason)
+                await _emit_budget_stop(
+                    tool_trace,
+                    phase=f"candidate:{len(reviewed_chunks) + 1}",
+                    reason=exc.reason,
+                    budget=budget,
+                )
+                break
+            except ContextLengthError:
                 pieces = self._split_context_limited_chunk(chunk)
                 pending_chunks[0:0] = pieces
                 continue
-            processed_chunks += 1
+            reviewed_chunks.append(chunk)
             parsed = self._parse_candidate_review(
-                candidate.content, stage=f"candidate chunk {processed_chunks}"
+                candidate.content, stage=f"candidate chunk {len(reviewed_chunks)}"
             )
             if parsed.change_summary.strip():
                 candidate_change_summaries.append(parsed.change_summary.strip())
             candidate_findings.extend(parsed.findings)
-            candidate_input_tokens += usage[0]
-            candidate_output_tokens += usage[1]
 
         change_summary = self._merge_change_summaries(candidate_change_summaries, context)
+        candidate_coverage = self._coverage(context, reviewed_chunks, pending_chunks)
         candidates = _CandidateReview(
             change_summary=change_summary,
             findings=self._include_previous_candidates(
@@ -126,48 +191,85 @@ class NativeFirmwareReviewEngine:
         )
 
         if not candidates.findings:
-            review_summary = self._no_findings_summary()
+            verification_complete = True
+            review_complete = candidate_coverage["complete"] and not budget.stop_reasons
+            review_summary = self._no_findings_summary(complete=review_complete)
+            budget_metadata = self._budget_metadata(
+                budget,
+                candidate_coverage,
+                verification_complete=verification_complete,
+                stop_reasons=budget_stop_reasons,
+            )
             return ReviewResult(
-                summary=self._render_summary(change_summary, review_summary),
+                summary=self._render_summary(
+                    change_summary,
+                    review_summary,
+                    budget_metadata=budget_metadata,
+                ),
                 findings=[],
                 model=self.llm.settings.model,
-                input_tokens=candidate_input_tokens,
-                output_tokens=candidate_output_tokens,
+                input_tokens=budget.input_tokens,
+                output_tokens=budget.output_tokens,
                 review_metadata={
                     "engine": "native-firmware-v1",
-                    "lineage_complete": True,
-                    "diff_chunks": processed_chunks,
+                    "lineage_complete": review_complete,
+                    "diff_chunks": len(reviewed_chunks),
                     "initial_diff_chunks": len(initial_chunks),
                     "candidate_count": 0,
                     "verified_model_count": 0,
                     "published_candidate_count": 0,
                     "change_summary": change_summary,
                     "review_summary": review_summary,
+                    "review_budget": budget_metadata,
                 },
             )
 
-        verified, verified_usage, verification_batches = await self._verify_candidates(
-            context, candidates, tools, tool_trace=tool_trace
+        (
+            verified,
+            verification_batches,
+            verification_complete,
+            verification_stop_reason,
+        ) = await self._verify_candidates(
+            context,
+            candidates,
+            tools,
+            budget=budget,
+            tool_trace=tool_trace,
         )
+        if verification_stop_reason:
+            budget_stop_reasons.append(verification_stop_reason)
         findings = self.validator.validate(context, verified.findings)
+        review_complete = (
+            candidate_coverage["complete"] and verification_complete and not budget.stop_reasons
+        )
 
         if findings:
             review_summary = verified.review_summary.strip() or self._fallback_review_summary(
                 findings
             )
         else:
-            review_summary = self._no_findings_summary()
+            review_summary = self._no_findings_summary(complete=review_complete)
+        budget_metadata = self._budget_metadata(
+            budget,
+            candidate_coverage,
+            verification_complete=verification_complete,
+            stop_reasons=budget_stop_reasons,
+        )
 
         return ReviewResult(
-            summary=self._render_summary(change_summary, review_summary),
+            summary=self._render_summary(
+                change_summary,
+                review_summary,
+                budget_metadata=budget_metadata,
+            ),
             findings=findings,
             model=self.llm.settings.model,
-            input_tokens=candidate_input_tokens + verified_usage[0],
-            output_tokens=candidate_output_tokens + verified_usage[1],
+            input_tokens=budget.input_tokens,
+            output_tokens=budget.output_tokens,
             review_metadata={
                 "engine": "native-firmware-v1",
-                "lineage_complete": True,
-                "diff_chunks": processed_chunks,
+                "lineage_complete": review_complete,
+                "diff_chunks": len(reviewed_chunks),
                 "initial_diff_chunks": len(initial_chunks),
                 "verification_batches": verification_batches,
                 "candidate_count": len(candidates.findings),
@@ -175,6 +277,7 @@ class NativeFirmwareReviewEngine:
                 "published_candidate_count": len(findings),
                 "change_summary": change_summary,
                 "review_summary": review_summary,
+                "review_budget": budget_metadata,
             },
         )
 
@@ -184,6 +287,7 @@ class NativeFirmwareReviewEngine:
         tools: RepositoryToolExecutor,
         *,
         phase: str,
+        budget: _ReviewBudget,
         tool_trace: ToolTraceCallback | None = None,
     ) -> tuple[Any, tuple[int, int]]:
         input_tokens = 0
@@ -191,14 +295,17 @@ class NativeFirmwareReviewEngine:
         transcript = list(messages)
         seen_calls: set[str] = set()
         for round_index in range(self.settings.max_tool_rounds + 1):
+            budget.reserve_llm_call()
             try:
                 completion = await self.llm.complete(messages=transcript, tools=tools.tool_schemas)
             except ContextLengthError as exc:
+                budget.record_tokens(exc.input_tokens, exc.output_tokens)
                 raise ContextLengthError(
                     str(exc),
                     input_tokens=input_tokens + exc.input_tokens,
                     output_tokens=output_tokens + exc.output_tokens,
                 ) from exc
+            budget.record_tokens(completion.input_tokens, completion.output_tokens)
             input_tokens += completion.input_tokens or 0
             output_tokens += completion.output_tokens or 0
             if not completion.tool_calls:
@@ -224,6 +331,7 @@ class NativeFirmwareReviewEngine:
                         transcript,
                         phase=phase,
                         reason="max_tool_rounds",
+                        budget=budget,
                         tool_trace=tool_trace,
                     )
                 except ContextLengthError as exc:
@@ -238,6 +346,7 @@ class NativeFirmwareReviewEngine:
                 )
             transcript.append(assistant_message_for_tool_loop(completion))
             duplicate_only_round = True
+            job_tool_budget_suppressed = False
             for call in completion.tool_calls:
                 call_key = _tool_call_key(call.name, call.arguments)
                 duplicate = call_key in seen_calls
@@ -254,6 +363,19 @@ class NativeFirmwareReviewEngine:
                         }
                     )
                     status = "duplicate_suppressed"
+                elif not budget.reserve_tool_call():
+                    duplicate_only_round = False
+                    job_tool_budget_suppressed = True
+                    result = json.dumps(
+                        {
+                            "error": "repository tool call suppressed by per-job review budget",
+                            "detail": (
+                                "The configured max_tool_calls_per_job has been reached. "
+                                "Finish the review using evidence already gathered."
+                            ),
+                        }
+                    )
+                    status = "job_budget_suppressed"
                 else:
                     duplicate_only_round = False
                     try:
@@ -287,12 +409,32 @@ class NativeFirmwareReviewEngine:
                         "ts": datetime.now(UTC).isoformat(),
                     },
                 )
+            if job_tool_budget_suppressed:
+                try:
+                    final, final_usage = await self._force_final_response(
+                        transcript,
+                        phase=phase,
+                        reason="max_tool_calls_per_job",
+                        budget=budget,
+                        tool_trace=tool_trace,
+                    )
+                except ContextLengthError as exc:
+                    raise ContextLengthError(
+                        str(exc),
+                        input_tokens=input_tokens + exc.input_tokens,
+                        output_tokens=output_tokens + exc.output_tokens,
+                    ) from exc
+                return final, (
+                    input_tokens + final_usage[0],
+                    output_tokens + final_usage[1],
+                )
             if duplicate_only_round:
                 try:
                     final, final_usage = await self._force_final_response(
                         transcript,
                         phase=phase,
                         reason="duplicate_tool_loop",
+                        budget=budget,
                         tool_trace=tool_trace,
                     )
                 except ContextLengthError as exc:
@@ -313,6 +455,7 @@ class NativeFirmwareReviewEngine:
         *,
         phase: str,
         reason: str,
+        budget: _ReviewBudget,
         tool_trace: ToolTraceCallback | None,
     ) -> tuple[Any, tuple[int, int]]:
         """Stop repository browsing and force one bounded final answer from gathered evidence."""
@@ -340,7 +483,13 @@ class NativeFirmwareReviewEngine:
         )
         # Deliberately omit the tools parameter. This is stronger than another auto-tool round and
         # works across OpenAI-compatible servers even when tool_choice="none" support varies.
-        completion = await self.llm.complete(messages=final_messages, tools=None)
+        budget.reserve_llm_call()
+        try:
+            completion = await self.llm.complete(messages=final_messages, tools=None)
+        except ContextLengthError as exc:
+            budget.record_tokens(exc.input_tokens, exc.output_tokens)
+            raise
+        budget.record_tokens(completion.input_tokens, completion.output_tokens)
         if completion.tool_calls:
             raise TransientError(
                 "review model emitted tool calls after repository tools were disabled"
@@ -517,26 +666,35 @@ Return ONLY a JSON object with this shape:
         candidates: _CandidateReview,
         tools: RepositoryToolExecutor,
         *,
+        budget: _ReviewBudget,
         tool_trace: ToolTraceCallback | None = None,
-    ) -> tuple[_VerificationReview, tuple[int, int], int]:
+    ) -> tuple[_VerificationReview, int, bool, str | None]:
         pending = [candidates]
         verified_findings: list[Finding] = []
         summaries: list[str] = []
-        input_tokens = 0
-        output_tokens = 0
         batches = 0
+        budget_stop_reason: str | None = None
         while pending:
             batch = pending.pop(0)
             try:
-                completion, usage = await self._tool_session(
+                completion, _usage = await self._tool_session(
                     self._verification_messages(context, batch),
                     tools,
                     phase=f"verification:{batches + 1}",
+                    budget=budget,
                     tool_trace=tool_trace,
                 )
-            except ContextLengthError as exc:
-                input_tokens += exc.input_tokens
-                output_tokens += exc.output_tokens
+            except _BudgetExhausted as exc:
+                pending.insert(0, batch)
+                budget_stop_reason = exc.reason
+                await _emit_budget_stop(
+                    tool_trace,
+                    phase=f"verification:{batches + 1}",
+                    reason=exc.reason,
+                    budget=budget,
+                )
+                break
+            except ContextLengthError:
                 if len(batch.findings) <= 1:
                     raise PermanentError(
                         "LLM context limit was exceeded while verifying a single finding"
@@ -560,13 +718,12 @@ Return ONLY a JSON object with this shape:
             verified_findings.extend(parsed.findings)
             if parsed.review_summary.strip():
                 summaries.append(parsed.review_summary.strip())
-            input_tokens += usage[0]
-            output_tokens += usage[1]
         summary = summaries[0] if len(summaries) == 1 else ""
         return (
             _VerificationReview(review_summary=summary, findings=verified_findings),
-            (input_tokens, output_tokens),
             batches,
+            not pending,
+            budget_stop_reason,
         )
 
     def _verification_messages(
@@ -715,10 +872,78 @@ Return ONLY a JSON object with this shape:
             return f"검증된 조치 필요 이슈 {len(findings)}건이 있습니다 ({detail})."
         return f"Found {len(findings)} actionable correctness issue(s) ({detail})."
 
-    def _no_findings_summary(self) -> str:
+    def _no_findings_summary(self, *, complete: bool = True) -> str:
         if self.settings.output_language == "ko-KR":
+            if not complete:
+                return (
+                    "검토가 완료된 범위에서는 추가로 조치가 필요한 펌웨어 동작상 문제는 "
+                    "발견되지 않았습니다."
+                )
             return "추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다."
+        if not complete:
+            return "No actionable firmware correctness issues were found in the reviewed portion."
         return "No actionable firmware correctness issues were found in this Patch Set."
+
+    @staticmethod
+    def _coverage(
+        context: ReviewContext,
+        reviewed_chunks: list[DiffChunk],
+        pending_chunks: list[DiffChunk],
+    ) -> dict[str, Any]:
+        total_chunks = len(reviewed_chunks) + len(pending_chunks)
+        complete = not pending_chunks
+        total_files = len(context.changed_files)
+        if complete:
+            fully_reviewed_files = total_files
+            uncovered_files: list[str] = []
+        else:
+            reviewed_paths = {path for chunk in reviewed_chunks for path in chunk.paths}
+            pending_paths = {path for chunk in pending_chunks for path in chunk.paths}
+            fully_reviewed_files = sum(
+                1
+                for path in context.changed_files
+                if path in reviewed_paths and path not in pending_paths
+            )
+            uncovered_files = [
+                path
+                for path in context.changed_files
+                if path not in reviewed_paths or path in pending_paths
+            ]
+        return {
+            "complete": complete,
+            "candidate_chunks_reviewed": len(reviewed_chunks),
+            "candidate_chunks_total": total_chunks,
+            "reviewable_files_fully_reviewed": fully_reviewed_files,
+            "reviewable_files_total": total_files,
+            "uncovered_files": uncovered_files[:100],
+            "uncovered_files_truncated": len(uncovered_files) > 100,
+        }
+
+    def _budget_metadata(
+        self,
+        budget: _ReviewBudget,
+        coverage: dict[str, Any],
+        *,
+        verification_complete: bool,
+        stop_reasons: list[str],
+    ) -> dict[str, Any]:
+        reasons = list(dict.fromkeys([*budget.stop_reasons, *stop_reasons]))
+        return {
+            **coverage,
+            "verification_complete": verification_complete,
+            "complete": bool(coverage["complete"] and verification_complete and not reasons),
+            "stop_reasons": reasons,
+            "llm_calls": budget.llm_calls,
+            "tool_calls": budget.tool_calls,
+            "input_tokens": budget.input_tokens,
+            "output_tokens": budget.output_tokens,
+            "limits": {
+                "max_candidate_chunks": self.settings.max_candidate_chunks,
+                "max_llm_calls_per_job": self.settings.max_llm_calls_per_job,
+                "max_tool_calls_per_job": self.settings.max_tool_calls_per_job,
+                "max_input_tokens_per_job": self.settings.max_input_tokens_per_job,
+            },
+        }
 
     def _merge_change_summaries(
         self,
@@ -760,10 +985,54 @@ Return ONLY a JSON object with this shape:
             )
         return f"- {file_count} reviewable file(s) changed."
 
-    def _render_summary(self, change_summary: str, review_summary: str) -> str:
+    def _render_summary(
+        self,
+        change_summary: str,
+        review_summary: str,
+        *,
+        budget_metadata: dict[str, Any] | None = None,
+    ) -> str:
         if self.settings.output_language == "ko-KR":
-            return f"변경 요약\n{change_summary}\n\n리뷰 결과\n- {review_summary}"
-        return f"Change summary\n{change_summary}\n\nReview result\n- {review_summary}"
+            summary = f"변경 요약\n{change_summary}\n\n리뷰 결과\n- {review_summary}"
+            if budget_metadata is not None and not budget_metadata["complete"]:
+                summary += self._coverage_summary_ko(budget_metadata)
+            return summary
+        summary = f"Change summary\n{change_summary}\n\nReview result\n- {review_summary}"
+        if budget_metadata is not None and not budget_metadata["complete"]:
+            summary += self._coverage_summary_en(budget_metadata)
+        return summary
+
+    @staticmethod
+    def _coverage_summary_ko(metadata: dict[str, Any]) -> str:
+        chunks = f"{metadata['candidate_chunks_reviewed']}/{metadata['candidate_chunks_total']}"
+        files = (
+            f"{metadata['reviewable_files_fully_reviewed']}/{metadata['reviewable_files_total']}"
+        )
+        reasons = ", ".join(metadata["stop_reasons"]) or "verification incomplete"
+        verification = "완료" if metadata["verification_complete"] else "미완료"
+        return (
+            "\n\n리뷰 범위\n"
+            f"- diff chunk {chunks}개 검토\n"
+            f"- diff 기준 변경 파일 {files}개 전체 범위 처리\n"
+            f"- finding 검증: {verification}\n"
+            f"- 제한 도달: `{reasons}`. 미검토 범위에는 추가 이슈가 있을 수 있습니다."
+        )
+
+    @staticmethod
+    def _coverage_summary_en(metadata: dict[str, Any]) -> str:
+        chunks = f"{metadata['candidate_chunks_reviewed']}/{metadata['candidate_chunks_total']}"
+        files = (
+            f"{metadata['reviewable_files_fully_reviewed']}/{metadata['reviewable_files_total']}"
+        )
+        reasons = ", ".join(metadata["stop_reasons"]) or "verification incomplete"
+        verification = "complete" if metadata["verification_complete"] else "incomplete"
+        return (
+            "\n\nReview coverage\n"
+            f"- Diff chunks reviewed: {chunks}\n"
+            f"- Files with complete diff coverage: {files}\n"
+            f"- Finding verification: {verification}\n"
+            f"- Limit reached: `{reasons}`. Unreviewed scope may contain additional issues."
+        )
 
     def _language_instruction(self) -> str:
         if self.settings.output_language == "ko-KR":
@@ -886,3 +1155,25 @@ async def _emit_tool_trace(
 ) -> None:
     if callback is not None:
         await callback(event)
+
+
+async def _emit_budget_stop(
+    callback: ToolTraceCallback | None,
+    *,
+    phase: str,
+    reason: str,
+    budget: _ReviewBudget,
+) -> None:
+    await _emit_tool_trace(
+        callback,
+        {
+            "event": "budget_exhausted",
+            "phase": phase,
+            "reason": reason,
+            "llm_calls": budget.llm_calls,
+            "tool_calls": budget.tool_calls,
+            "input_tokens": budget.input_tokens,
+            "output_tokens": budget.output_tokens,
+            "ts": datetime.now(UTC).isoformat(),
+        },
+    )

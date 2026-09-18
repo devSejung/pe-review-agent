@@ -100,3 +100,34 @@ def test_initial_review_marks_every_verified_finding_new() -> None:
     assert result.review.findings[0].lineage is FindingLineage.NEW
     assert result.review.findings[0].semantic_id is not None
     assert "no previously published baseline" in result.review.summary
+
+
+def test_partial_review_tracks_seen_findings_without_resolving_unseen_prior_findings() -> None:
+    persisting_id = "4" * 32
+    unseen_id = "5" * 32
+    previous_persisting = _finding("Timeout is ignored", semantic_id=persisting_id)
+    previous_unseen = _finding("Clock stays enabled", semantic_id=unseen_id, line=20)
+    current_persisting = _finding("Timeout is ignored", semantic_id=persisting_id, line=14)
+
+    result = reconcile_finding_lineage(
+        project="soc/fw",
+        review=ReviewResult(
+            summary="Partial review result.",
+            findings=[current_persisting],
+            review_metadata={"lineage_complete": False},
+        ),
+        history=FindingHistory(
+            baseline_patchset=4,
+            previous_findings=(previous_persisting, previous_unseen),
+            seen_semantic_ids=frozenset({persisting_id, unseen_id}),
+        ),
+        complete=False,
+    )
+
+    assert result.review.findings[0].lineage is FindingLineage.PERSISTING
+    assert result.resolved_findings == ()
+    assert result.review.review_metadata["finding_lineage"]["complete"] is False
+    assert result.review.review_metadata["finding_lineage"]["resolved"] == 0
+    assert "partial review" in result.review.summary
+    assert "not classified as fixed" in result.review.summary
+    assert findings_for_inline_publication(result.review) == []

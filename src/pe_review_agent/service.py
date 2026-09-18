@@ -297,11 +297,13 @@ class ReviewWorker:
                         )
 
                     review = await self.engine.review(context, tools, tool_trace=tool_trace)
-                    if review.review_metadata.get("lineage_complete", True):
+                    lineage_complete = review.review_metadata.get("lineage_complete", True)
+                    if lineage_complete or "review_budget" in review.review_metadata:
                         review = reconcile_finding_lineage(
                             project=job.project,
                             review=review,
                             history=history,
+                            complete=lineage_complete,
                         ).review
                     lease.ensure()
                     # The engine performs model verification and static location validation. The

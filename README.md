@@ -29,6 +29,10 @@ summary plus native inline/range comments.
   subject, branch, and the bounded current commit message are supplied as untrusted intent hints,
   while the Patch Set diff remains authoritative. The change summary is preserved even when there
   are zero publishable findings.
+- Per-job review budgets cap candidate chunks, LLM calls, repository-tool executions, and cumulative
+  reported input tokens. Reaching a budget does not fail the durable job: only findings that completed
+  verification are publishable, finding-lineage resolution is disabled for incomplete reviews, and
+  Gerrit/Admin explicitly disclose the reviewed coverage and stop reason.
 - Merge commits are currently safe-skipped with a visible Gerrit summary rather than reviewed
   against an incorrect first-parent diff. Gerrit 3.8 uses its auto-merge base for merge diffs; a
   future merge-review path must ingest that Gerrit DiffInfo before native inline comments are safe.
@@ -406,7 +410,8 @@ The UI has six operational surfaces:
 - **Settings** — live global pause/resume plus review-policy controls, including the human-facing
   review language. The default is Korean (`ko-KR`); English (`en-US`) can be selected. The prompt
   explicitly keeps code identifiers, paths, macros, register names, literals, and error codes in
-  their original form.
+  their original form. Review-budget ceilings are configurable here as DB overrides; the page and
+  save response explicitly warn that review-policy/budget changes require service restart.
 
 Project enable/disable and the global service switch are live DB-backed controls. Disabled projects
 are filtered at event ingestion, reconciliation, **and the PostgreSQL claim query**, so queued work is

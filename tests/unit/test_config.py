@@ -88,6 +88,23 @@ def test_review_tool_round_limit_allows_operational_headroom() -> None:
         ReviewSettings(max_tool_rounds=65)
 
 
+def test_review_budget_defaults_and_bounds_are_validated() -> None:
+    settings = ReviewSettings()
+    assert settings.max_candidate_chunks == 12
+    assert settings.max_llm_calls_per_job == 30
+    assert settings.max_tool_calls_per_job == 50
+    assert settings.max_input_tokens_per_job == 300_000
+
+    with pytest.raises(ValidationError):
+        ReviewSettings(max_candidate_chunks=0)
+    with pytest.raises(ValidationError):
+        ReviewSettings(max_llm_calls_per_job=0)
+    with pytest.raises(ValidationError):
+        ReviewSettings(max_tool_calls_per_job=-1)
+    with pytest.raises(ValidationError):
+        ReviewSettings(max_input_tokens_per_job=999)
+
+
 def test_unknown_nested_yaml_setting_fails_check_config(monkeypatch, tmp_path: Path) -> None:
     config = tmp_path / "config.yaml"
     config.write_text(
