@@ -9,6 +9,7 @@ from pe_review_agent.llm.client import LlmCompletion, ToolCall
 from pe_review_agent.repos.tools import RepositoryToolExecutor
 from pe_review_agent.retry import ContextLengthError, TransientError
 from pe_review_agent.review.native import NativeFirmwareReviewEngine
+from pe_review_agent.review.progress import MemoryProgressBackend
 
 
 class FakeLlm:
@@ -132,16 +133,9 @@ async def test_tool_round_limit_forces_final_json_instead_of_failing(tmp_path: P
         arguments={"path": "fw.c"},
         raw_arguments='{"path":"fw.c"}',
     )
-    second = ToolCall(
-        id="call-2",
-        name="search_text",
-        arguments={"query": "changed"},
-        raw_arguments='{"query":"changed"}',
-    )
     llm = FakeLlm(
         [
             _completion("", first),
-            _completion("", second),
             _completion(
                 json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
             ),
@@ -172,12 +166,10 @@ async def test_tool_round_limit_forces_final_json_instead_of_failing(tmp_path: P
     )
 
     assert result.findings == []
-    assert len(llm.seen_messages) == 3
+    assert len(llm.seen_messages) == 2
     assert llm.seen_tools[-1] is None
-    assert any(
-        event.get("tool") == "search_text" and event.get("status") == "round_limit_suppressed"
-        for event in trace
-    )
+    assert not any(event.get("tool") == "search_text" for event in trace)
+    assert result.review_metadata["lineage_complete"] is False
     assert any(
         event.get("event") == "forced_finalization" and event.get("reason") == "max_tool_rounds"
         for event in trace
@@ -236,8 +228,10 @@ async def test_duplicate_repository_tool_call_is_suppressed_and_finalized(tmp_pa
     assert result.findings == []
     statuses = [event.get("status") for event in trace if event.get("event") == "tool_call"]
     assert statuses == ["ok", "duplicate_suppressed"]
-    assert trace[-1]["event"] == "forced_finalization"
-    assert trace[-1]["reason"] == "duplicate_tool_loop"
+    assert any(
+        event.get("event") == "forced_finalization" and event.get("reason") == "duplicate_tool_loop"
+        for event in trace
+    )
     assert llm.seen_tools[-1] is None
 
 
@@ -709,18 +703,18 @@ async def test_job_llm_call_budget_stops_tool_loop_as_partial_review(tmp_path: P
     result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
 
     budget = result.review_metadata["review_budget"]
-    assert budget["llm_calls"] == 1
-    assert budget["tool_calls"] == 1
+    assert budget["llm_calls"] == 0
+    assert budget["tool_calls"] == 0
     assert budget["candidate_chunks_reviewed"] == 0
-    assert budget["stop_reasons"] == ["max_llm_calls_per_job"]
-    assert result.input_tokens == 10
-    assert result.output_tokens == 5
+    assert budget["stop_reasons"] == ["candidate_call_budget"]
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
     assert result.review_metadata["lineage_complete"] is False
-    assert "검토가 완료된 범위" in result.summary
+    assert "결함이 없다는 판정은 아닙니다" in result.summary
 
 
 @pytest.mark.asyncio
-async def test_job_input_token_budget_stops_next_llm_call_after_reported_usage(
+async def test_legacy_token_budget_is_ignored_and_usage_is_informational(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "fw.c"
@@ -739,7 +733,7 @@ async def test_job_input_token_budget_stops_next_llm_call_after_reported_usage(
         finish_reason="tool_calls",
         raw_message={},
     )
-    llm = FakeLlm([first])
+    llm = FakeLlm([first, _completion(json.dumps({"change_summary": "done", "findings": []}))])
     settings = ReviewSettings(max_input_tokens_per_job=1000)
     engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
     context = ReviewContext(
@@ -757,26 +751,19 @@ async def test_job_input_token_budget_stops_next_llm_call_after_reported_usage(
     result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
 
     budget = result.review_metadata["review_budget"]
-    assert budget["llm_calls"] == 1
-    assert budget["input_tokens"] == 1200
-    assert budget["stop_reasons"] == ["max_input_tokens_per_job"]
-    assert result.input_tokens == 1200
-    assert result.review_metadata["lineage_complete"] is False
+    assert budget["llm_calls"] == 2
+    assert budget["input_tokens"] == 1210
+    assert budget["stop_reasons"] == []
+    assert result.input_tokens == 1210
+    assert result.review_metadata["lineage_complete"] is True
 
 
 @pytest.mark.asyncio
 async def test_job_tool_budget_forces_final_answer_and_discloses_limit(tmp_path: Path) -> None:
     target = tmp_path / "fw.c"
     target.write_text("changed();\n", encoding="utf-8")
-    read = ToolCall(
-        id="call-tool-budget",
-        name="read_file",
-        arguments={"path": "fw.c"},
-        raw_arguments='{"path":"fw.c"}',
-    )
     llm = FakeLlm(
         [
-            _completion("", read),
             _completion(
                 json.dumps({"change_summary": "- changed() 호출을 수정합니다.", "findings": []})
             ),
@@ -807,15 +794,15 @@ async def test_job_tool_budget_forces_final_answer_and_discloses_limit(tmp_path:
     )
 
     budget = result.review_metadata["review_budget"]
-    assert budget["llm_calls"] == 2
+    assert budget["llm_calls"] == 1
     assert budget["tool_calls"] == 0
     assert budget["candidate_chunks_reviewed"] == 1
-    assert budget["stop_reasons"] == ["max_tool_calls_per_job"]
+    assert budget["stop_reasons"] == ["candidate_tool_budget"]
     assert result.review_metadata["lineage_complete"] is False
-    assert any(event.get("status") == "job_budget_suppressed" for event in trace)
+    assert llm.seen_tools == [None]
     assert any(
         event.get("event") == "forced_finalization"
-        and event.get("reason") == "max_tool_calls_per_job"
+        and event.get("reason") == "candidate_tool_budget"
         for event in trace
     )
     assert "리뷰 범위" in result.summary
@@ -848,11 +835,12 @@ async def test_verifier_budget_exhaustion_never_publishes_unverified_candidate(
 
     budget = result.review_metadata["review_budget"]
     assert result.findings == []
-    assert budget["candidate_chunks_reviewed"] == 1
-    assert budget["verification_complete"] is False
-    assert budget["stop_reasons"] == ["max_llm_calls_per_job"]
+    assert budget["candidate_chunks_reviewed"] == 0
+    assert budget["verification_complete"] is True  # No candidate was admitted.
+    assert budget["stop_reasons"] == ["candidate_call_budget"]
     assert result.review_metadata["lineage_complete"] is False
-    assert "finding 검증: 미완료" in result.summary
+    assert llm.seen_messages == []
+    assert "0/1" in result.summary
 
 
 @pytest.mark.asyncio
@@ -881,13 +869,7 @@ async def test_candidate_checkpoint_resume_skips_completed_chunk_after_retry(
         policy_text="policy",
         repository_root=str(tmp_path),
     )
-    checkpoints = {}
-
-    async def load_checkpoints():
-        return dict(checkpoints)
-
-    async def save_checkpoint(checkpoint):
-        checkpoints[checkpoint.chunk_key] = checkpoint
+    backend = MemoryProgressBackend()
 
     first_llm = FakeLlm(
         [
@@ -901,13 +883,13 @@ async def test_candidate_checkpoint_resume_skips_completed_chunk_after_retry(
         await first_engine.review(
             context,
             RepositoryToolExecutor(tmp_path, settings),
-            checkpoint_load=load_checkpoints,
-            checkpoint_save=save_checkpoint,
+            backend=backend,
         )
 
     assert len(first_llm.seen_messages) == 2
-    assert len(checkpoints) == 2
-    assert {checkpoint.status for checkpoint in checkpoints.values()} == {"DONE", "RETRY"}
+    checkpoints = next(iter(backend.progress.values())).checkpoints
+    assert len(checkpoints) == 1
+    assert {checkpoint.status for checkpoint in checkpoints.values()} == {"DONE"}
 
     second_llm = FakeLlm(
         [_completion(json.dumps({"change_summary": "- b.c를 수정합니다.", "findings": []}))]
@@ -922,17 +904,18 @@ async def test_candidate_checkpoint_resume_skips_completed_chunk_after_retry(
         context,
         RepositoryToolExecutor(tmp_path, settings),
         tool_trace=capture,
-        checkpoint_load=load_checkpoints,
-        checkpoint_save=save_checkpoint,
+        backend=backend,
     )
 
     assert len(second_llm.seen_messages) == 1
+    checkpoints = next(iter(backend.progress.values())).checkpoints
     assert len(checkpoints) == 2
     assert result.input_tokens == 20
     assert result.output_tokens == 10
-    assert result.review_metadata["review_budget"]["llm_calls"] == 3
+    assert result.review_metadata["review_budget"]["llm_calls"] == 2
+    assert result.review_metadata["actual_usage"]["llm_calls"] == 3
     assert result.review_metadata["candidate_checkpoints"] == {
-        "version": "candidate-v1",
+        "version": "review-v2",
         "reused": 1,
         "saved": 1,
     }
@@ -957,13 +940,7 @@ async def test_context_split_checkpoint_avoids_repeating_oversized_llm_call(tmp_
         policy_text="policy",
         repository_root=str(tmp_path),
     )
-    checkpoints = {}
-
-    async def load_checkpoints():
-        return dict(checkpoints)
-
-    async def save_checkpoint(checkpoint):
-        checkpoints[checkpoint.chunk_key] = checkpoint
+    backend = MemoryProgressBackend()
 
     first_llm = FakeLlm(
         [
@@ -979,11 +956,11 @@ async def test_context_split_checkpoint_avoids_repeating_oversized_llm_call(tmp_
         await first_engine.review(
             context,
             RepositoryToolExecutor(tmp_path, settings),
-            checkpoint_load=load_checkpoints,
-            checkpoint_save=save_checkpoint,
+            backend=backend,
         )
 
-    assert {checkpoint.status for checkpoint in checkpoints.values()} == {"SPLIT", "DONE", "RETRY"}
+    checkpoints = next(iter(backend.progress.values())).checkpoints
+    assert {checkpoint.status for checkpoint in checkpoints.values()} == {"SPLIT", "DONE"}
 
     second_llm = FakeLlm(
         [
@@ -996,12 +973,13 @@ async def test_context_split_checkpoint_avoids_repeating_oversized_llm_call(tmp_
     result = await second_engine.review(
         context,
         RepositoryToolExecutor(tmp_path, settings),
-        checkpoint_load=load_checkpoints,
-        checkpoint_save=save_checkpoint,
+        backend=backend,
     )
 
     assert len(second_llm.seen_messages) == 1
     assert result.review_metadata["candidate_checkpoints"]["reused"] == 2
-    assert result.review_metadata["review_budget"]["llm_calls"] == 4
-    assert result.input_tokens == 120
-    assert result.output_tokens == 13
+    assert result.review_metadata["review_budget"]["llm_calls"] == 2
+    assert result.review_metadata["actual_usage"]["llm_calls"] == 4
+    assert result.input_tokens == 20
+    assert result.output_tokens == 10
+    assert result.review_metadata["actual_usage"]["input_tokens"] == 120

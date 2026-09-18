@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,8 +25,11 @@ from pe_review_agent.domain import (
 )
 from pe_review_agent.gerrit import SupersededRevisionError
 from pe_review_agent.jobs import JobStore, PublicationStatus
+from pe_review_agent.jobs.progress import PostgresProgressBackend
+from pe_review_agent.llm.client import LlmCompletion
 from pe_review_agent.repos.manager import RepositoryWorkspace
 from pe_review_agent.retry import PermanentError, TransientError
+from pe_review_agent.review import NativeFirmwareReviewEngine
 from pe_review_agent.service import ReviewWorker
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
@@ -103,8 +108,7 @@ class _FakeEngine:
         _tools,
         *,
         tool_trace=None,
-        checkpoint_load=None,
-        checkpoint_save=None,
+        backend=None,
     ) -> ReviewResult:
         self.calls += 1
         return ReviewResult(
@@ -136,8 +140,7 @@ class _HistoryAwareFakeEngine:
         _tools,
         *,
         tool_trace=None,
-        checkpoint_load=None,
-        checkpoint_save=None,
+        backend=None,
     ) -> ReviewResult:
         self.contexts.append(context)
         semantic_id = (
@@ -865,6 +868,200 @@ async def test_durable_failed_publication_is_not_reposted_after_restart(tmp_path
     failed = await store.get(job.id)
     assert failed is not None and failed.state == JobState.FAILED_PERMANENT
     assert gerrit.publish_calls == 0
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_real_engine_verifier_retry_uses_postgres_progress_and_refunds_failure(tmp_path):
+    settings = _settings(tmp_path)
+    database = Database(settings.database)
+    await _truncate(database)
+    _write_source(tmp_path)
+    store = JobStore(database.sessions)
+    job = await _enqueue_default(store, settings)
+    template = await _FakeEngine().review(None, None)
+    candidate_text = json.dumps({
+        "change_summary": "Changed timeout handling.",
+        "findings": [finding.model_dump(mode="json") for finding in template.findings],
+    })
+    verifier_text = json.dumps({
+        "review_summary": "Verified timeout defect.",
+        "findings": [finding.model_dump(mode="json") for finding in template.findings],
+    })
+
+    class Llm:
+        def __init__(self):
+            self.settings = settings.llm
+            self.messages = []
+            self.outputs = [
+                candidate_text,
+                TransientError("timeout", retry_after_seconds=0),
+                verifier_text,
+            ]
+
+        async def complete(self, *, messages, tools=None):
+            self.messages.append(messages)
+            value = self.outputs.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return LlmCompletion(value, (), 10, 5, "stop", {})
+
+    llm = Llm()
+    worker = ReviewWorker(
+        settings, store, _FakeGerrit(), _FakeRepos(tmp_path),
+        NativeFirmwareReviewEngine(llm, settings.review),
+    )
+    await _run_review_once(worker, store)
+    failed = await store.get(job.id)
+    assert failed is not None and failed.state is JobState.RETRY_WAIT
+    await _run_review_once(worker, store)
+    ready = await store.get(job.id)
+    assert ready is not None and ready.state is JobState.READY_TO_PUBLISH
+    assert len(llm.messages) == 3
+    assert "independent verifier" in llm.messages[-1][0]["content"]
+    result = await store.load_review_result(job.id)
+    assert result is not None and len(result.findings) == 1
+    assert result.review_metadata["review_budget"]["llm_calls"] == 2
+    assert result.review_metadata["actual_usage"]["llm_calls"] == 3
+    assert result.review_metadata["actual_usage"]["failed_calls"] == 1
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_progress_recovers_after_final_review_attempt_crashes_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path, review_attempts=1)
+    database = Database(settings.database)
+    await _truncate(database)
+    _write_source(tmp_path)
+    store = JobStore(database.sessions)
+    job = await _enqueue_default(store, settings)
+
+    class Llm:
+        def __init__(self) -> None:
+            self.settings = settings.llm
+            self.calls = 0
+
+        async def complete(self, *, messages, tools=None):
+            self.calls += 1
+            return LlmCompletion(
+                json.dumps({"change_summary": "Changed timeout handling.", "findings": []}),
+                (),
+                10,
+                5,
+                "stop",
+                {},
+            )
+
+    llm = Llm()
+    worker = ReviewWorker(
+        settings,
+        store,
+        _FakeGerrit(),
+        _FakeRepos(tmp_path),
+        NativeFirmwareReviewEngine(llm, settings.review),
+    )
+    original_save = store.save_review_result_and_mark_ready
+
+    async def crash_before_ready(*args, **kwargs):
+        raise asyncio.CancelledError("simulated worker crash after complete progress")
+
+    monkeypatch.setattr(store, "save_review_result_and_mark_ready", crash_before_ready)
+    with pytest.raises(asyncio.CancelledError, match="simulated worker crash"):
+        await _run_review_once(worker, store)
+
+    stranded = await store.get(job.id)
+    assert stranded is not None and stranded.state is JobState.VALIDATING
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    assert llm.calls == 1
+
+    monkeypatch.setattr(store, "save_review_result_and_mark_ready", original_save)
+    original_recover = worker.engine.recover_completed
+
+    async def temporary_recovery_read_failure(context, *, backend):
+        raise TransientError("temporary recovery read failure", retry_after_seconds=0)
+
+    monkeypatch.setattr(worker.engine, "recover_completed", temporary_recovery_read_failure)
+    await _expire_lease(database, job.id)
+    await _run_review_once(worker, store)
+
+    retrying = await store.get(job.id)
+    assert retrying is not None and retrying.state is JobState.RETRY_WAIT
+    assert llm.calls == 1
+    assert await store.count_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+
+    monkeypatch.setattr(worker.engine, "recover_completed", original_recover)
+    await _run_review_once(worker, store)
+
+    ready = await store.get(job.id)
+    assert ready is not None and ready.state is JobState.READY_TO_PUBLISH
+    assert llm.calls == 1
+    result = await store.load_review_result(job.id)
+    assert result is not None
+    assert result.review_metadata["actual_usage"]["llm_calls"] == 1
+    assert await store.count_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_lost_complete_progress_commit_ack_recovers_without_new_review_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path, review_attempts=1)
+    database = Database(settings.database)
+    await _truncate(database)
+    _write_source(tmp_path)
+    store = JobStore(database.sessions)
+    job = await _enqueue_default(store, settings)
+
+    class Llm:
+        def __init__(self) -> None:
+            self.settings = settings.llm
+            self.calls = 0
+
+        async def complete(self, *, messages, tools=None):
+            self.calls += 1
+            return LlmCompletion(
+                json.dumps({"change_summary": "Changed timeout handling.", "findings": []}),
+                (),
+                10,
+                5,
+                "stop",
+                {},
+            )
+
+    llm = Llm()
+    worker = ReviewWorker(
+        settings,
+        store,
+        _FakeGerrit(),
+        _FakeRepos(tmp_path),
+        NativeFirmwareReviewEngine(llm, settings.review),
+    )
+    original_save = PostgresProgressBackend.save
+    lost_ack = False
+
+    async def save_then_lose_complete_ack(self, progress):
+        nonlocal lost_ack
+        await original_save(self, progress)
+        if progress.phase == "complete" and not lost_ack:
+            lost_ack = True
+            raise TransientError("simulated lost complete-progress COMMIT acknowledgement")
+
+    monkeypatch.setattr(PostgresProgressBackend, "save", save_then_lose_complete_ack)
+    await _run_review_once(worker, store)
+
+    ready = await store.get(job.id)
+    assert ready is not None and ready.state is JobState.READY_TO_PUBLISH
+    assert lost_ack is True
+    assert llm.calls == 1
+    assert await store.count_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    result = await store.load_review_result(job.id)
+    assert result is not None and result.review_metadata["actual_usage"]["llm_calls"] == 1
     await database.close()
 
 

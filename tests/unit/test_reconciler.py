@@ -33,7 +33,7 @@ class _Store:
     async def enqueue(self, *_args, **_kwargs):
         raise AssertionError("no events expected")
 
-    async def prune_candidate_chunk_checkpoints(self, *, retention_days: int) -> int:
+    async def prune_review_recovery_cache(self, *, retention_days: int) -> int:
         self.pruned_retention_days.append(retention_days)
         return 0
 

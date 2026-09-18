@@ -29,16 +29,28 @@ summary plus native inline/range comments.
   subject, branch, and the bounded current commit message are supplied as untrusted intent hints,
   while the Patch Set diff remains authoritative. The change summary is preserved even when there
   are zero publishable findings.
-- Per-job review budgets cap candidate chunks, LLM calls, repository-tool executions, and cumulative
-  reported input tokens. Reaching a budget does not fail the durable job: only findings that completed
-  verification are publishable, finding-lineage resolution is disabled for incomplete reviews, and
-  Gerrit/Admin explicitly disclose the reviewed coverage and stop reason.
-- Candidate chunk work is checkpointed in PostgreSQL after each completed chunk (and after deterministic
-  context-limit splits). A retry/restart reuses those compact results instead of rerunning finished LLM
-  work; transient failed-chunk usage is also carried forward so candidate-phase budget accounting does
-  not reset for resumed chunks.
-  Checkpoints store hashes/results/usage rather than full diffs or model transcripts, and old checkpoints
-  for DONE/SUPERSEDED jobs are pruned by retention policy.
+- Operational budgets limit candidate chunks, LLM requests and repository-tool executions. A
+  configurable verifier reserve (initially one third) prevents candidate exploration from consuming
+  all verification capacity. Candidate chunks and verifier batches take turns; every active session
+  protects a final response slot, sent without tools. Unused candidate capacity goes to verification.
+- Budgets limit excessive exploration, not lifetime billing. Completed candidate/verifier results
+  remain charged on resume. A failed unfinished session restarts from its initial prompt without its
+  abandoned execution's charges, under the separate durable review retry limit. Actual lifetime
+  request attempts, including failures and unconfirmed in-flight requests, are audited separately and
+  can exceed the operational allowance. Normal budget/round stops never create a fresh allowance.
+- Token usage is informational only. Existing `max_input_tokens_per_job` settings are accepted but
+  ignored; there is no token admission, reservation, or cumulative-token stop.
+- Context-bound progress stores completed results, deterministic context splits, limitations and a
+  frozen verification candidate set in PostgreSQL. No full diff, prompt, tool output or reasoning
+  transcript is duplicated into checkpoints. A restart cannot silently promote partial work to complete
+  work or reopen candidate exploration after verification starts. Incomplete reviews never classify
+  omitted prior findings as fixed. Candidate selection truncation is disclosed after exact deduplication.
+- Result caches for old DONE/SUPERSEDED jobs expire by retention policy; invocation audit stays for the
+  job lifetime. Legacy v1 checkpoints remain visible for upgrade audit. Their missing model/context/
+  completeness identity is not guessed: old findings are not automatically trusted and their known
+  usage is shown only as legacy audit data. Because that work is not reused, it is not charged against
+  the new operational allowance. No deployed FW quality claim or optimal reserve ratio is implied by
+  these recovery guarantees.
 - Merge commits are currently safe-skipped with a visible Gerrit summary rather than reviewed
   against an incorrect first-parent diff. Gerrit 3.8 uses its auto-merge base for merge diffs; a
   future merge-review path must ingest that Gerrit DiffInfo before native inline comments are safe.

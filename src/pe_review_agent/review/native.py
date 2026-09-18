@@ -2,115 +2,40 @@ from __future__ import annotations
 
 import hashlib
 import json
-import posixpath
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
 from pe_review_agent.config import ReviewSettings
 from pe_review_agent.domain import Finding, ReviewContext, ReviewResult
-from pe_review_agent.llm.client import LlmClient, assistant_message_for_tool_loop
+from pe_review_agent.llm.client import LlmClient
 from pe_review_agent.repos.tools import RepositoryToolExecutor
-from pe_review_agent.retry import ContextLengthError, PermanentError, TransientError
-from pe_review_agent.review.checkpoints import (
-    CANDIDATE_CHECKPOINT_VERSION,
-    CandidateChunkCheckpoint,
-)
+from pe_review_agent.retry import PermanentError, TransientError
 from pe_review_agent.review.chunking import DiffChunk, chunk_diff
+from pe_review_agent.review.progress import (
+    PROGRESS_VERSION,
+    MemoryProgressBackend,
+    ProgressBackend,
+    ReviewProgress,
+    Usage,
+)
+from pe_review_agent.review.scheduling import ReviewBudget, RoundRobinReview, WorkItem
 from pe_review_agent.review.validator import FindingValidator
 
 
 class _CandidateReview(BaseModel):
     change_summary: str = ""
-    findings: list[Finding] = Field(default_factory=list)
+    findings: list[Finding]
 
 
 class _VerificationReview(BaseModel):
     review_summary: str = ""
-    findings: list[Finding] = Field(default_factory=list)
-
-
-@dataclass(frozen=True, slots=True)
-class _CandidateChunk:
-    chunk: DiffChunk
-    chunk_key: str
-    parent_chunk_key: str | None = None
-
-
-class _BudgetExhausted(Exception):
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
-@dataclass(slots=True)
-class _ReviewBudget:
-    max_llm_calls: int
-    max_tool_calls: int
-    max_input_tokens: int
-    llm_calls: int = 0
-    tool_calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    stop_reasons: list[str] = field(default_factory=list)
-
-    @classmethod
-    def from_settings(cls, settings: ReviewSettings) -> _ReviewBudget:
-        return cls(
-            max_llm_calls=settings.max_llm_calls_per_job,
-            max_tool_calls=settings.max_tool_calls_per_job,
-            max_input_tokens=settings.max_input_tokens_per_job,
-        )
-
-    def reserve_llm_call(self) -> None:
-        if self.llm_calls >= self.max_llm_calls:
-            self.mark_stop("max_llm_calls_per_job")
-            raise _BudgetExhausted("max_llm_calls_per_job")
-        if self.input_tokens >= self.max_input_tokens:
-            self.mark_stop("max_input_tokens_per_job")
-            raise _BudgetExhausted("max_input_tokens_per_job")
-        self.llm_calls += 1
-
-    def record_tokens(self, input_tokens: int | None, output_tokens: int | None) -> None:
-        self.input_tokens += input_tokens or 0
-        self.output_tokens += output_tokens or 0
-
-    def reserve_tool_call(self) -> bool:
-        if self.tool_calls >= self.max_tool_calls:
-            self.mark_stop("max_tool_calls_per_job")
-            return False
-        self.tool_calls += 1
-        return True
-
-    def mark_stop(self, reason: str) -> None:
-        if reason not in self.stop_reasons:
-            self.stop_reasons.append(reason)
-
-    def snapshot(self) -> tuple[int, int, int, int]:
-        return self.llm_calls, self.tool_calls, self.input_tokens, self.output_tokens
-
-    def delta(self, before: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-        return (
-            self.llm_calls - before[0],
-            self.tool_calls - before[1],
-            self.input_tokens - before[2],
-            self.output_tokens - before[3],
-        )
-
-    def restore_checkpoint(self, checkpoint: CandidateChunkCheckpoint) -> None:
-        self.llm_calls += checkpoint.llm_calls
-        self.tool_calls += checkpoint.tool_calls
-        self.input_tokens += checkpoint.input_tokens
-        self.output_tokens += checkpoint.output_tokens
+    findings: list[Finding]
 
 
 ToolTraceCallback = Callable[[dict[str, Any]], Awaitable[None]]
-CheckpointLoadCallback = Callable[[], Awaitable[dict[str, CandidateChunkCheckpoint]]]
-CheckpointSaveCallback = Callable[[CandidateChunkCheckpoint], Awaitable[None]]
 
 
 class NativeFirmwareReviewEngine:
@@ -121,533 +46,365 @@ class NativeFirmwareReviewEngine:
         self.settings = settings
         self.validator = FindingValidator(settings)
 
+    async def recover_completed(
+        self,
+        context: ReviewContext,
+        *,
+        backend: ProgressBackend,
+    ) -> ReviewResult | None:
+        """Return an exact-input durable result without starting a new model attempt."""
+
+        if context.skip_reason or not context.changed_files or not context.diff.strip():
+            return None
+        progress = await backend.load(self._input_key(context))
+        if progress is None or progress.phase != "complete":
+            return None
+        return self._completed_result(progress)
+
     async def review(
         self,
         context: ReviewContext,
         tools: RepositoryToolExecutor,
         *,
         tool_trace: ToolTraceCallback | None = None,
-        checkpoint_load: CheckpointLoadCallback | None = None,
-        checkpoint_save: CheckpointSaveCallback | None = None,
+        backend: ProgressBackend | None = None,
     ) -> ReviewResult:
-        if context.skip_reason:
+        if context.skip_reason or not context.changed_files or not context.diff.strip():
             return ReviewResult(
-                summary=context.skip_reason,
+                summary=context.skip_reason
+                or "No reviewable text changes were found after generated/binary filtering.",
                 findings=[],
                 model=self.llm.settings.model,
                 input_tokens=0,
                 output_tokens=0,
                 review_metadata={
-                    "engine": "native-firmware-v1",
-                    "skipped_reason": context.skip_reason,
+                    "engine": PROGRESS_VERSION,
                     "lineage_complete": False,
                     "candidate_count": 0,
                     "verified_model_count": 0,
                     "published_candidate_count": 0,
+                    **(
+                        {"skipped_reason": context.skip_reason}
+                        if context.skip_reason
+                        else {"skipped_no_reviewable_text": True}
+                    ),
                 },
             )
-        if not context.changed_files or not context.diff.strip():
-            return ReviewResult(
-                summary="No reviewable text changes were found after generated/binary filtering.",
-                findings=[],
-                model=self.llm.settings.model,
-                input_tokens=0,
-                output_tokens=0,
-                review_metadata={
-                    "engine": "native-firmware-v1",
-                    "skipped_no_reviewable_text": True,
-                    "lineage_complete": False,
-                    "candidate_count": 0,
-                    "verified_model_count": 0,
-                    "published_candidate_count": 0,
-                },
+        backend = backend or MemoryProgressBackend()
+        input_key = self._input_key(context)
+        progress = await backend.load(input_key)
+        if progress is None:
+            legacy_present, legacy_usage = await backend.legacy()
+            progress = ReviewProgress(
+                input_key=input_key,
+                legacy_present=legacy_present,
+                legacy_usage=legacy_usage,
             )
-        budget = _ReviewBudget.from_settings(self.settings)
-        checkpoints = await checkpoint_load() if checkpoint_load is not None else {}
-        for checkpoint in checkpoints.values():
-            budget.restore_checkpoint(checkpoint)
-        checkpoint_hits = 0
-        checkpoint_writes = 0
-        candidate_findings: list[Finding] = []
-        candidate_change_summaries: list[str] = []
+            # v1 rows remain in the audit. They cannot prove prompt/model identity or completeness,
+            # so never silently trust their findings under a new runtime configuration.
+            await backend.save(progress)
+        if progress.phase == "complete":
+            return self._completed_result(progress)
+
+        budget = ReviewBudget(self.settings)
+        if progress.phase == "candidate":
+            for checkpoint in progress.checkpoints.values():
+                if checkpoint.phase == "candidate" and checkpoint.status != "SPLIT":
+                    budget.usage.add(checkpoint.usage)
+        else:
+            budget.usage.add(progress.candidate_usage)
+            for checkpoint in progress.checkpoints.values():
+                if checkpoint.phase == "verification" and checkpoint.status != "SPLIT":
+                    budget.usage.add(checkpoint.usage)
+        runner = RoundRobinReview(
+            llm=self.llm,
+            tools=tools,
+            settings=self.settings,
+            budget=budget,
+            backend=backend,
+            progress=progress,
+            trace=tool_trace,
+        )
         initial_chunks = chunk_diff(context.diff, max_chars=self.settings.max_diff_chunk_chars)
-        pending_chunks = [
-            _candidate_chunk(chunk, ordinal=index)
+        work = [
+            WorkItem(key=_chunk_key(f"initial:{index}", chunk), payload=chunk, paths=chunk.paths)
             for index, chunk in enumerate(initial_chunks, start=1)
         ]
-        reviewed_chunks: list[DiffChunk] = []
-        budget_stop_reasons: list[str] = []
-        while pending_chunks:
-            if len(reviewed_chunks) >= self.settings.max_candidate_chunks:
-                reason = "max_candidate_chunks"
-                budget.mark_stop(reason)
-                budget_stop_reasons.append(reason)
-                await _emit_budget_stop(tool_trace, phase="candidate", reason=reason, budget=budget)
-                break
-            pending = pending_chunks.pop(0)
-            chunk = pending.chunk
-            checkpoint = checkpoints.get(pending.chunk_key)
-            if checkpoint is not None:
-                if checkpoint.status == "SPLIT":
-                    checkpoint_hits += 1
-                    await _emit_checkpoint_event(
-                        tool_trace,
-                        event="checkpoint_reused",
-                        chunk_key=pending.chunk_key,
-                        status=checkpoint.status,
-                    )
-                    pieces = self._split_context_limited_chunk(chunk)
-                    pending_chunks[0:0] = _split_candidate_chunks(pending, pieces)
-                    continue
-                if checkpoint.status == "DONE":
-                    checkpoint_hits += 1
-                    await _emit_checkpoint_event(
-                        tool_trace,
-                        event="checkpoint_reused",
-                        chunk_key=pending.chunk_key,
-                        status=checkpoint.status,
-                    )
-                    reviewed_chunks.append(chunk)
-                    if checkpoint.change_summary.strip():
-                        candidate_change_summaries.append(checkpoint.change_summary.strip())
-                    candidate_findings.extend(
-                        finding.model_copy(deep=True) for finding in checkpoint.findings
-                    )
-                    continue
-                if checkpoint.status == "RETRY":
-                    await _emit_checkpoint_event(
-                        tool_trace,
-                        event="checkpoint_retry_usage_restored",
-                        chunk_key=pending.chunk_key,
-                        status=checkpoint.status,
-                    )
-                else:
-                    raise PermanentError(
-                        f"unsupported candidate checkpoint status {checkpoint.status!r}"
-                    )
-            candidate_messages = self._candidate_messages(
+        if progress.phase == "candidate":
+            ordinals = {item.key: index for index, item in enumerate(work, start=1)}
+
+            def candidate_messages(item: WorkItem) -> list[dict[str, Any]]:
+                ordinal = ordinals.setdefault(item.key, len(ordinals) + 1)
+                return self._candidate_messages(
+                    context,
+                    item.payload,
+                    chunk_index=ordinal,
+                    chunk_count=max(len(initial_chunks), ordinal),
+                )
+
+            def parse_candidate(content: str, item: WorkItem) -> dict[str, Any]:
+                return self._parse_candidate_review(
+                    content,
+                    stage=f"candidate {item.key[:12]}",
+                ).model_dump(mode="json")
+
+            outcome = await runner.run(
+                "candidate",
+                work,
+                messages=candidate_messages,
+                parse=parse_candidate,
+                split=self._split_candidate_work,
+                max_units=self.settings.max_candidate_chunks,
+            )
+            candidates: list[Finding] = []
+            summaries: list[str] = []
+            for item in outcome.completed:
+                parsed = _CandidateReview.model_validate(progress.checkpoints[item.key].result)
+                candidates.extend(parsed.findings)
+                if parsed.change_summary.strip():
+                    summaries.append(parsed.change_summary.strip())
+            observed = len(candidates)
+            candidates = self._deduplicate_candidates(candidates)
+            distinct = len(candidates)
+            selected = self._limit_candidates(candidates)
+            progress.candidate_stats = {
+                "observed": observed,
+                "distinct": distinct,
+                "selected": len(selected),
+                "dropped": distinct - len(selected),
+                "reused": outcome.reused,
+                "saved": outcome.saved,
+            }
+            progress.frozen_candidates = self._include_previous_candidates(
+                selected, context.previous_findings
+            )
+            progress.change_summary = self._merge_change_summaries(summaries, context)
+            progress.coverage = self._coverage(
                 context,
-                chunk,
-                chunk_index=len(reviewed_chunks) + 1,
-                chunk_count=len(reviewed_chunks) + 1 + len(pending_chunks),
+                [item.payload for item in outcome.completed],
+                [item.payload for item in outcome.pending],
             )
-            budget_before = budget.snapshot()
-            try:
-                candidate, _usage = await self._tool_session(
-                    candidate_messages,
-                    tools,
-                    phase=f"candidate:{len(reviewed_chunks) + 1}",
-                    budget=budget,
-                    tool_trace=tool_trace,
-                )
-            except _BudgetExhausted as exc:
-                pending_chunks.insert(0, pending)
-                budget_stop_reasons.append(exc.reason)
-                await _emit_budget_stop(
-                    tool_trace,
-                    phase=f"candidate:{len(reviewed_chunks) + 1}",
-                    reason=exc.reason,
-                    budget=budget,
-                )
-                break
-            except ContextLengthError:
-                pieces = self._split_context_limited_chunk(chunk)
-                split_checkpoint = _checkpoint_from_budget_delta(
-                    pending,
-                    status="SPLIT",
-                    budget=budget,
-                    budget_before=budget_before,
-                    previous=checkpoint,
-                )
-                if checkpoint_save is not None:
-                    await checkpoint_save(split_checkpoint)
-                    checkpoints[pending.chunk_key] = split_checkpoint
-                    checkpoint_writes += 1
-                    await _emit_checkpoint_event(
-                        tool_trace,
-                        event="checkpoint_saved",
-                        chunk_key=pending.chunk_key,
-                        status="SPLIT",
-                    )
-                pending_chunks[0:0] = _split_candidate_chunks(pending, pieces)
-                continue
-            except TransientError:
-                retry_checkpoint = _checkpoint_from_budget_delta(
-                    pending,
-                    status="RETRY",
-                    budget=budget,
-                    budget_before=budget_before,
-                    previous=checkpoint,
-                )
-                if checkpoint_save is not None:
-                    await checkpoint_save(retry_checkpoint)
-                    checkpoints[pending.chunk_key] = retry_checkpoint
-                    checkpoint_writes += 1
-                    await _emit_checkpoint_event(
-                        tool_trace,
-                        event="checkpoint_saved",
-                        chunk_key=pending.chunk_key,
-                        status="RETRY",
-                    )
-                raise
-            parsed = self._parse_candidate_review(
-                candidate.content, stage=f"candidate chunk {len(reviewed_chunks) + 1}"
-            )
-            done_checkpoint = _checkpoint_from_budget_delta(
-                pending,
-                status="DONE",
-                budget=budget,
-                budget_before=budget_before,
-                candidate=parsed,
-                previous=checkpoint,
-            )
-            if checkpoint_save is not None:
-                await checkpoint_save(done_checkpoint)
-                checkpoints[pending.chunk_key] = done_checkpoint
-                checkpoint_writes += 1
-                await _emit_checkpoint_event(
-                    tool_trace,
-                    event="checkpoint_saved",
-                    chunk_key=pending.chunk_key,
-                    status="DONE",
-                )
-            reviewed_chunks.append(chunk)
-            if parsed.change_summary.strip():
-                candidate_change_summaries.append(parsed.change_summary.strip())
-            candidate_findings.extend(parsed.findings)
+            progress.candidate_limitations = list(outcome.limitations)
+            if distinct > len(selected):
+                progress.candidate_limitations.append("max_candidate_findings_total")
+            # Freeze only reusable/normal-stop charges. Context-rejected executions are visible
+            # in actual usage and this attempt's limit, but are not charged again after restart.
+            progress.candidate_usage = Usage()
+            for checkpoint in progress.checkpoints.values():
+                if checkpoint.phase == "candidate" and checkpoint.status != "SPLIT":
+                    progress.candidate_usage.add(checkpoint.usage)
+            # Freeze the candidate set, scope and charged candidate phase BEFORE verifier dispatch.
+            # A retry can never reopen candidate exploration and mix incompatible verifier batches.
+            progress.phase = "verification"
+            await backend.save(progress)
 
-        change_summary = self._merge_change_summaries(candidate_change_summaries, context)
-        candidate_coverage = self._coverage(
-            context,
-            reviewed_chunks,
-            [item.chunk for item in pending_chunks],
-        )
-        candidates = _CandidateReview(
-            change_summary=change_summary,
-            findings=self._include_previous_candidates(
-                self._limit_candidates(candidate_findings),
-                context.previous_findings,
-            ),
-        )
+        verification_work = self._verification_work(progress.frozen_candidates)
 
-        if not candidates.findings:
-            verification_complete = True
-            review_complete = candidate_coverage["complete"] and not budget.stop_reasons
-            review_summary = self._no_findings_summary(complete=review_complete)
-            budget_metadata = self._budget_metadata(
-                budget,
-                candidate_coverage,
-                verification_complete=verification_complete,
-                stop_reasons=budget_stop_reasons,
-            )
-            return ReviewResult(
-                summary=self._render_summary(
-                    change_summary,
-                    review_summary,
-                    budget_metadata=budget_metadata,
+        def verification_messages(item: WorkItem) -> list[dict[str, Any]]:
+            return self._verification_messages(
+                context,
+                _CandidateReview(
+                    change_summary=progress.change_summary,
+                    findings=item.payload,
                 ),
-                findings=[],
-                model=self.llm.settings.model,
-                input_tokens=budget.input_tokens,
-                output_tokens=budget.output_tokens,
-                review_metadata={
-                    "engine": "native-firmware-v1",
-                    "lineage_complete": review_complete,
-                    "diff_chunks": len(reviewed_chunks),
-                    "initial_diff_chunks": len(initial_chunks),
-                    "candidate_count": 0,
-                    "verified_model_count": 0,
-                    "published_candidate_count": 0,
-                    "change_summary": change_summary,
-                    "review_summary": review_summary,
-                    "review_budget": budget_metadata,
-                    "candidate_checkpoints": {
-                        "version": CANDIDATE_CHECKPOINT_VERSION,
-                        "reused": checkpoint_hits,
-                        "saved": checkpoint_writes,
-                    },
-                },
             )
 
-        (
-            verified,
-            verification_batches,
-            verification_complete,
-            verification_stop_reason,
-        ) = await self._verify_candidates(
-            context,
-            candidates,
-            tools,
-            budget=budget,
-            tool_trace=tool_trace,
-        )
-        if verification_stop_reason:
-            budget_stop_reasons.append(verification_stop_reason)
-        findings = self.validator.validate(context, verified.findings)
-        review_complete = (
-            candidate_coverage["complete"] and verification_complete and not budget.stop_reasons
-        )
+        def parse_verification(content: str, item: WorkItem) -> dict[str, Any]:
+            return self._parse_verification_review(
+                content,
+                stage=f"verification {item.key[:12]}",
+            ).model_dump(mode="json")
 
-        if findings:
-            review_summary = verified.review_summary.strip() or self._fallback_review_summary(
-                findings
+        verified = await runner.run(
+            "verification",
+            verification_work,
+            messages=verification_messages,
+            parse=parse_verification,
+            split=self._split_verification_work,
+            max_units=max(1, len(progress.frozen_candidates)),
+        )
+        model_findings: list[Finding] = []
+        review_summaries: list[str] = []
+        for item in verified.completed:
+            result = _VerificationReview.model_validate(progress.checkpoints[item.key].result)
+            model_findings.extend(result.findings)
+            if result.review_summary.strip():
+                review_summaries.append(result.review_summary.strip())
+        validated_findings = self.validator.validate_all(context, model_findings)
+        findings = validated_findings[: self.settings.max_findings]
+        limits = list(dict.fromkeys([*progress.candidate_limitations, *verified.limitations]))
+        if len(validated_findings) > len(findings):
+            limits.append("max_findings")
+        # A prior finding rejected by deterministic validation is not evidence of a fix either.
+        previous_ids = {finding.semantic_id for finding in context.previous_findings}
+        validated_ids = {finding.semantic_id for finding in validated_findings}
+        if any(finding.semantic_id in previous_ids - validated_ids for finding in model_findings):
+            limits.append("prior_finding_validation_incomplete")
+        verification_complete = not verified.pending and not verified.limitations
+        complete = bool(progress.coverage["complete"] and verification_complete and not limits)
+        metadata = {
+            **progress.coverage,
+            "complete": complete,
+            "verification_complete": verification_complete,
+            "verification_candidates_total": len(progress.frozen_candidates),
+            "verification_candidates_processed": sum(
+                len(item.payload) for item in verified.completed
+            ),
+            "stop_reasons": limits,
+            **budget.usage.model_dump(),
+            "verifier_budget_fraction": self.settings.verifier_budget_fraction,
+            "limits": {
+                "max_candidate_chunks": self.settings.max_candidate_chunks,
+                "max_llm_calls_per_job": self.settings.max_llm_calls_per_job,
+                "max_tool_calls_per_job": self.settings.max_tool_calls_per_job,
+            },
+        }
+        if validated_findings:
+            review_summary = (
+                review_summaries[0]
+                if len(review_summaries) == 1
+                else self._fallback_review_summary(validated_findings)
             )
         else:
-            review_summary = self._no_findings_summary(complete=review_complete)
-        budget_metadata = self._budget_metadata(
-            budget,
-            candidate_coverage,
-            verification_complete=verification_complete,
-            stop_reasons=budget_stop_reasons,
-        )
-
-        return ReviewResult(
+            review_summary = self._no_findings_summary(complete=complete)
+        result = ReviewResult(
             summary=self._render_summary(
-                change_summary,
-                review_summary,
-                budget_metadata=budget_metadata,
+                progress.change_summary, review_summary, budget_metadata=metadata
             ),
             findings=findings,
             model=self.llm.settings.model,
-            input_tokens=budget.input_tokens,
-            output_tokens=budget.output_tokens,
+            input_tokens=budget.usage.input_tokens,
+            output_tokens=budget.usage.output_tokens,
             review_metadata={
-                "engine": "native-firmware-v1",
-                "lineage_complete": review_complete,
-                "diff_chunks": len(reviewed_chunks),
+                "engine": PROGRESS_VERSION,
+                "lineage_complete": complete,
+                "diff_chunks": progress.coverage["candidate_chunks_reviewed"],
                 "initial_diff_chunks": len(initial_chunks),
-                "verification_batches": verification_batches,
-                "candidate_count": len(candidates.findings),
-                "verified_model_count": len(verified.findings),
-                "published_candidate_count": len(findings),
-                "change_summary": change_summary,
+                "verification_batches": len(verified.completed),
+                "candidate_count": len(progress.frozen_candidates),
+                "verified_model_count": len(model_findings),
+                "validated_finding_count": len(validated_findings),
+                "published_candidate_count": min(len(findings), self.settings.max_findings),
+                "change_summary": progress.change_summary,
                 "review_summary": review_summary,
-                "review_budget": budget_metadata,
+                "review_budget": metadata,
+                "actual_usage": await backend.totals(),
+                "candidate_selection": progress.candidate_stats,
                 "candidate_checkpoints": {
-                    "version": CANDIDATE_CHECKPOINT_VERSION,
-                    "reused": checkpoint_hits,
-                    "saved": checkpoint_writes,
+                    "version": PROGRESS_VERSION,
+                    "reused": progress.candidate_stats.get("reused", 0),
+                    "saved": progress.candidate_stats.get("saved", 0),
                 },
+                "verifier_checkpoints": {
+                    "version": PROGRESS_VERSION,
+                    "reused": verified.reused,
+                    "saved": verified.saved,
+                },
+                "legacy_v1_checkpoint_present": progress.legacy_present,
+                "legacy_v1_usage": progress.legacy_usage.model_dump(),
             },
         )
+        progress.phase = "complete"
+        progress.result = result.model_dump(mode="json")
+        await backend.save(progress)
+        return result
 
-    async def _tool_session(
-        self,
-        messages: list[dict[str, Any]],
-        tools: RepositoryToolExecutor,
-        *,
-        phase: str,
-        budget: _ReviewBudget,
-        tool_trace: ToolTraceCallback | None = None,
-    ) -> tuple[Any, tuple[int, int]]:
-        input_tokens = 0
-        output_tokens = 0
-        transcript = list(messages)
-        seen_calls: set[str] = set()
-        for round_index in range(self.settings.max_tool_rounds + 1):
-            budget.reserve_llm_call()
-            try:
-                completion = await self.llm.complete(messages=transcript, tools=tools.tool_schemas)
-            except ContextLengthError as exc:
-                budget.record_tokens(exc.input_tokens, exc.output_tokens)
-                raise ContextLengthError(
-                    str(exc),
-                    input_tokens=input_tokens + exc.input_tokens,
-                    output_tokens=output_tokens + exc.output_tokens,
-                ) from exc
-            budget.record_tokens(completion.input_tokens, completion.output_tokens)
-            input_tokens += completion.input_tokens or 0
-            output_tokens += completion.output_tokens or 0
-            if not completion.tool_calls:
-                return completion, (input_tokens, output_tokens)
-            if round_index >= self.settings.max_tool_rounds:
-                for call in completion.tool_calls:
-                    await _emit_tool_trace(
-                        tool_trace,
-                        {
-                            "event": "tool_call",
-                            "phase": phase,
-                            "round": round_index + 1,
-                            "tool": call.name,
-                            "arguments": call.arguments,
-                            "status": "round_limit_suppressed",
-                            "result_bytes": 0,
-                            "result_preview": "",
-                            "ts": datetime.now(UTC).isoformat(),
-                        },
-                    )
-                try:
-                    final, final_usage = await self._force_final_response(
-                        transcript,
-                        phase=phase,
-                        reason="max_tool_rounds",
-                        budget=budget,
-                        tool_trace=tool_trace,
-                    )
-                except ContextLengthError as exc:
-                    raise ContextLengthError(
-                        str(exc),
-                        input_tokens=input_tokens + exc.input_tokens,
-                        output_tokens=output_tokens + exc.output_tokens,
-                    ) from exc
-                return final, (
-                    input_tokens + final_usage[0],
-                    output_tokens + final_usage[1],
-                )
-            transcript.append(assistant_message_for_tool_loop(completion))
-            duplicate_only_round = True
-            job_tool_budget_suppressed = False
-            for call in completion.tool_calls:
-                call_key = _tool_call_key(call.name, call.arguments)
-                duplicate = call_key in seen_calls
-                if duplicate:
-                    result = json.dumps(
-                        {
-                            "error": "duplicate repository tool call suppressed",
-                            "detail": (
-                                "This exact read-only tool call already ran in this review "
-                                "session. "
-                                "Its previous result remains in the transcript; use different "
-                                "evidence or finish the review."
-                            ),
-                        }
-                    )
-                    status = "duplicate_suppressed"
-                elif not budget.reserve_tool_call():
-                    duplicate_only_round = False
-                    job_tool_budget_suppressed = True
-                    result = json.dumps(
-                        {
-                            "error": "repository tool call suppressed by per-job review budget",
-                            "detail": (
-                                "The configured max_tool_calls_per_job has been reached. "
-                                "Finish the review using evidence already gathered."
-                            ),
-                        }
-                    )
-                    status = "job_budget_suppressed"
-                else:
-                    duplicate_only_round = False
-                    try:
-                        result = await tools.execute(call.name, call.arguments)
-                    except (ValueError, OSError) as exc:
-                        result = json.dumps({"error": str(exc)})
-                    status = _tool_result_status(result)
-                    # Repository tool failures may be transient (for example a bounded command
-                    # timeout). Do not turn a legitimate exact retry into a duplicate loop. The
-                    # global round budget still bounds repeated failures.
-                    if status != "error":
-                        seen_calls.add(call_key)
-                transcript.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": result,
-                    }
-                )
-                await _emit_tool_trace(
-                    tool_trace,
-                    {
-                        "event": "tool_call",
-                        "phase": phase,
-                        "round": round_index + 1,
-                        "tool": call.name,
-                        "arguments": call.arguments,
-                        "status": status,
-                        "result_bytes": len(result.encode("utf-8", errors="replace")),
-                        "result_preview": _bounded_preview(result),
-                        "ts": datetime.now(UTC).isoformat(),
-                    },
-                )
-            if job_tool_budget_suppressed:
-                try:
-                    final, final_usage = await self._force_final_response(
-                        transcript,
-                        phase=phase,
-                        reason="max_tool_calls_per_job",
-                        budget=budget,
-                        tool_trace=tool_trace,
-                    )
-                except ContextLengthError as exc:
-                    raise ContextLengthError(
-                        str(exc),
-                        input_tokens=input_tokens + exc.input_tokens,
-                        output_tokens=output_tokens + exc.output_tokens,
-                    ) from exc
-                return final, (
-                    input_tokens + final_usage[0],
-                    output_tokens + final_usage[1],
-                )
-            if duplicate_only_round:
-                try:
-                    final, final_usage = await self._force_final_response(
-                        transcript,
-                        phase=phase,
-                        reason="duplicate_tool_loop",
-                        budget=budget,
-                        tool_trace=tool_trace,
-                    )
-                except ContextLengthError as exc:
-                    raise ContextLengthError(
-                        str(exc),
-                        input_tokens=input_tokens + exc.input_tokens,
-                        output_tokens=output_tokens + exc.output_tokens,
-                    ) from exc
-                return final, (
-                    input_tokens + final_usage[0],
-                    output_tokens + final_usage[1],
-                )
-        raise AssertionError("unreachable")
+    @staticmethod
+    def _completed_result(progress: ReviewProgress) -> ReviewResult:
+        if progress.result is None:
+            raise PermanentError("completed review progress is missing its result")
+        # actual_usage was captured immediately before the complete progress row was persisted.
+        # Recovery performs no new LLM/tool invocation, so refreshing audit totals here adds a new
+        # failure dependency without changing the value.
+        return ReviewResult.model_validate(progress.result)
 
-    async def _force_final_response(
-        self,
-        transcript: list[dict[str, Any]],
-        *,
-        phase: str,
-        reason: str,
-        budget: _ReviewBudget,
-        tool_trace: ToolTraceCallback | None,
-    ) -> tuple[Any, tuple[int, int]]:
-        """Stop repository browsing and force one bounded final answer from gathered evidence."""
-
-        final_messages = [
-            *transcript,
-            {
-                "role": "user",
-                "content": (
-                    "Repository exploration is now complete. Do not request or describe any more "
-                    "tools. Using only the diff and repository evidence already present in this "
-                    "conversation, return the requested final review JSON now. If the gathered "
-                    "evidence does not support a concrete defect, return an empty findings list."
-                ),
-            },
-        ]
-        await _emit_tool_trace(
-            tool_trace,
-            {
-                "event": "forced_finalization",
-                "phase": phase,
-                "reason": reason,
-                "ts": datetime.now(UTC).isoformat(),
+    def _input_key(self, context: ReviewContext) -> str:
+        settings = self.settings.model_dump(
+            mode="json",
+            exclude={
+                "max_llm_calls_per_job",
+                "max_tool_calls_per_job",
+                "max_input_tokens_per_job",
+                "max_candidate_chunks",
+                "verifier_budget_fraction",
+                "chunk_checkpoint_retention_days",
             },
         )
-        # Deliberately omit the tools parameter. This is stronger than another auto-tool round and
-        # works across OpenAI-compatible servers even when tool_choice="none" support varies.
-        budget.reserve_llm_call()
-        try:
-            completion = await self.llm.complete(messages=final_messages, tools=None)
-        except ContextLengthError as exc:
-            budget.record_tokens(exc.input_tokens, exc.output_tokens)
-            raise
-        budget.record_tokens(completion.input_tokens, completion.output_tokens)
-        if completion.tool_calls:
-            raise TransientError(
-                "review model emitted tool calls after repository tools were disabled"
+        llm = {
+            name: getattr(self.llm.settings, name, None)
+            for name in (
+                "model",
+                "base_url",
+                "temperature",
+                "max_output_tokens",
             )
-        return completion, (
-            completion.input_tokens or 0,
-            completion.output_tokens or 0,
-        )
+        }
+        value = {
+            "version": PROGRESS_VERSION,
+            "context": context.model_dump(mode="json", exclude={"repository_root"}),
+            "review": settings,
+            "llm": llm,
+        }
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+
+    def _split_candidate_work(self, parent: WorkItem) -> list[WorkItem]:
+        return [
+            WorkItem(
+                key=_chunk_key(f"{parent.key}:split:{index}", piece),
+                payload=piece,
+                paths=piece.paths,
+                parent_key=parent.key,
+            )
+            for index, piece in enumerate(
+                self._split_context_limited_chunk(parent.payload), start=1
+            )
+        ]
+
+    @staticmethod
+    def _verification_work(findings: list[Finding]) -> list[WorkItem]:
+        # Bound both candidate count and JSON size before dispatch. Context errors still split
+        # deterministically, since policy/history/changed-line context may dominate the prompt.
+        batches: list[list[Finding]] = []
+        current: list[Finding] = []
+        size = 0
+        for finding in findings:
+            length = len(finding.model_dump_json())
+            if current and (len(current) >= 8 or size + length > 32_000):
+                batches.append(current)
+                current, size = [], 0
+            current.append(finding)
+            size += length
+        if current:
+            batches.append(current)
+        return [
+            _verification_item(batch, f"verification:{index}")
+            for index, batch in enumerate(batches)
+        ]
+
+    @staticmethod
+    def _split_verification_work(parent: WorkItem) -> list[WorkItem]:
+        if len(parent.payload) <= 1:
+            raise PermanentError("LLM context limit was exceeded while verifying a single finding")
+        midpoint = len(parent.payload) // 2
+        return [
+            _verification_item(batch, f"{parent.key}:split:{index}", parent.key)
+            for index, batch in enumerate((parent.payload[:midpoint], parent.payload[midpoint:]))
+        ]
+
+    @staticmethod
+    def _deduplicate_candidates(findings: list[Finding]) -> list[Finding]:
+        seen: set[str] = set()
+        result: list[Finding] = []
+        for finding in findings:
+            key = json.dumps(
+                finding.model_dump(mode="json", exclude={"fingerprint", "lineage"}), sort_keys=True
+            )
+            if key not in seen:
+                seen.add(key)
+                result.append(finding)
+        return result
 
     def _candidate_messages(
         self,
@@ -810,72 +567,6 @@ Return ONLY a JSON object with this shape:
             raise PermanentError("unable to reduce an LLM context-limited diff chunk")
         return [DiffChunk(text=piece.text, paths=piece.paths or chunk.paths) for piece in pieces]
 
-    async def _verify_candidates(
-        self,
-        context: ReviewContext,
-        candidates: _CandidateReview,
-        tools: RepositoryToolExecutor,
-        *,
-        budget: _ReviewBudget,
-        tool_trace: ToolTraceCallback | None = None,
-    ) -> tuple[_VerificationReview, int, bool, str | None]:
-        pending = [candidates]
-        verified_findings: list[Finding] = []
-        summaries: list[str] = []
-        batches = 0
-        budget_stop_reason: str | None = None
-        while pending:
-            batch = pending.pop(0)
-            try:
-                completion, _usage = await self._tool_session(
-                    self._verification_messages(context, batch),
-                    tools,
-                    phase=f"verification:{batches + 1}",
-                    budget=budget,
-                    tool_trace=tool_trace,
-                )
-            except _BudgetExhausted as exc:
-                pending.insert(0, batch)
-                budget_stop_reason = exc.reason
-                await _emit_budget_stop(
-                    tool_trace,
-                    phase=f"verification:{batches + 1}",
-                    reason=exc.reason,
-                    budget=budget,
-                )
-                break
-            except ContextLengthError:
-                if len(batch.findings) <= 1:
-                    raise PermanentError(
-                        "LLM context limit was exceeded while verifying a single finding"
-                    ) from None
-                midpoint = len(batch.findings) // 2
-                pending[0:0] = [
-                    _CandidateReview(
-                        change_summary=batch.change_summary,
-                        findings=batch.findings[:midpoint],
-                    ),
-                    _CandidateReview(
-                        change_summary=batch.change_summary,
-                        findings=batch.findings[midpoint:],
-                    ),
-                ]
-                continue
-            parsed = self._parse_verification_review(
-                completion.content, stage=f"verification batch {batches + 1}"
-            )
-            batches += 1
-            verified_findings.extend(parsed.findings)
-            if parsed.review_summary.strip():
-                summaries.append(parsed.review_summary.strip())
-        summary = summaries[0] if len(summaries) == 1 else ""
-        return (
-            _VerificationReview(review_summary=summary, findings=verified_findings),
-            batches,
-            not pending,
-            budget_stop_reason,
-        )
-
     def _verification_messages(
         self, context: ReviewContext, candidates: _CandidateReview
     ) -> list[dict[str, Any]]:
@@ -1026,12 +717,15 @@ Return ONLY a JSON object with this shape:
         if self.settings.output_language == "ko-KR":
             if not complete:
                 return (
-                    "검토가 완료된 범위에서는 추가로 조치가 필요한 펌웨어 동작상 문제는 "
-                    "발견되지 않았습니다."
+                    "검토 또는 검증이 미완료입니다. 현재 게시 가능한 검증 결과는 0건이며, "
+                    "결함이 없다는 판정은 아닙니다."
                 )
             return "추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다."
         if not complete:
-            return "No actionable firmware correctness issues were found in the reviewed portion."
+            return (
+                "Review or verification is incomplete. No verified findings are publishable; "
+                "this is not a clean verdict."
+            )
         return "No actionable firmware correctness issues were found in this Patch Set."
 
     @staticmethod
@@ -1067,32 +761,6 @@ Return ONLY a JSON object with this shape:
             "reviewable_files_total": total_files,
             "uncovered_files": uncovered_files[:100],
             "uncovered_files_truncated": len(uncovered_files) > 100,
-        }
-
-    def _budget_metadata(
-        self,
-        budget: _ReviewBudget,
-        coverage: dict[str, Any],
-        *,
-        verification_complete: bool,
-        stop_reasons: list[str],
-    ) -> dict[str, Any]:
-        reasons = list(dict.fromkeys([*budget.stop_reasons, *stop_reasons]))
-        return {
-            **coverage,
-            "verification_complete": verification_complete,
-            "complete": bool(coverage["complete"] and verification_complete and not reasons),
-            "stop_reasons": reasons,
-            "llm_calls": budget.llm_calls,
-            "tool_calls": budget.tool_calls,
-            "input_tokens": budget.input_tokens,
-            "output_tokens": budget.output_tokens,
-            "limits": {
-                "max_candidate_chunks": self.settings.max_candidate_chunks,
-                "max_llm_calls_per_job": self.settings.max_llm_calls_per_job,
-                "max_tool_calls_per_job": self.settings.max_tool_calls_per_job,
-                "max_input_tokens_per_job": self.settings.max_input_tokens_per_job,
-            },
         }
 
     def _merge_change_summaries(
@@ -1213,111 +881,11 @@ def _extract_json_object(content: str) -> str:
     return value
 
 
-def _tool_call_key(name: str, arguments: dict[str, Any]) -> str:
-    canonical = _canonical_tool_arguments(name, arguments)
-    return json.dumps(
-        {"name": name, "arguments": canonical},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-
-
-def _canonical_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Normalize executor defaults so equivalent read-only operations share a duplicate key."""
-
-    if name == "read_file":
-        path = arguments.get("path")
-        start = _canonical_int(arguments.get("start_line", 1), default=1, low=1)
-        end_value = arguments.get("end_line")
-        end = (
-            _canonical_int(end_value, default=start + 199, low=1)
-            if end_value is not None
-            else start + 199
-        )
-        return {"path": _canonical_path(path), "start_line": start, "end_line": end}
-    if name == "search_text":
-        path = arguments.get("path")
-        return {
-            "query": arguments.get("query"),
-            "path": _canonical_path(path) if path else None,
-            "max_results": _canonical_int(
-                arguments.get("max_results", 40), default=40, low=1, high=100
-            ),
-        }
-    if name == "list_files":
-        path = arguments.get("path")
-        return {"path": _canonical_path(path) if path else None}
-    return arguments
-
-
-def _canonical_path(value: Any) -> Any:
-    if not isinstance(value, str):
-        return value
-    normalized = posixpath.normpath(value.replace("\\", "/").lstrip("/"))
-    return normalized if normalized != "." else ""
-
-
-def _canonical_int(
-    value: Any,
-    *,
-    default: int,
-    low: int,
-    high: int | None = None,
-) -> int | Any:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return value if value is not None else default
-    parsed = max(low, parsed)
-    return min(parsed, high) if high is not None else parsed
-
-
-def _tool_result_status(result: str) -> str:
-    stripped = result.strip()
-    if stripped in {"<no matches>", "<empty>", "<no tracked files>"}:
-        return "empty"
-    if stripped.startswith("{"):
-        try:
-            payload = json.loads(stripped)
-        except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict) and payload.get("error"):
-            return "error"
-    return "ok"
-
-
-def _bounded_preview(value: str, limit: int = 1200) -> str:
-    normalized = value.replace("\x00", "")
-    return normalized if len(normalized) <= limit else normalized[:limit] + "\n<truncated>"
-
-
 def _bounded_metadata(value: str | None, limit: int) -> str | None:
     if value is None:
         return None
     normalized = value.replace("\x00", "")
     return normalized if len(normalized) <= limit else normalized[:limit] + "\n<truncated>"
-
-
-def _candidate_chunk(chunk: DiffChunk, *, ordinal: int) -> _CandidateChunk:
-    return _CandidateChunk(
-        chunk=chunk,
-        chunk_key=_chunk_key(f"initial:{ordinal}", chunk),
-    )
-
-
-def _split_candidate_chunks(
-    parent: _CandidateChunk,
-    pieces: list[DiffChunk],
-) -> list[_CandidateChunk]:
-    return [
-        _CandidateChunk(
-            chunk=piece,
-            chunk_key=_chunk_key(f"{parent.chunk_key}:split:{index}", piece),
-            parent_chunk_key=parent.chunk_key,
-        )
-        for index, piece in enumerate(pieces, start=1)
-    ]
 
 
 def _chunk_key(identity: str, chunk: DiffChunk) -> str:
@@ -1332,83 +900,14 @@ def _chunk_key(identity: str, chunk: DiffChunk) -> str:
     return digest.hexdigest()
 
 
-def _checkpoint_from_budget_delta(
-    pending: _CandidateChunk,
-    *,
-    status: str,
-    budget: _ReviewBudget,
-    budget_before: tuple[int, int, int, int],
-    candidate: _CandidateReview | None = None,
-    previous: CandidateChunkCheckpoint | None = None,
-) -> CandidateChunkCheckpoint:
-    llm_calls, tool_calls, input_tokens, output_tokens = budget.delta(budget_before)
-    if previous is not None:
-        llm_calls += previous.llm_calls
-        tool_calls += previous.tool_calls
-        input_tokens += previous.input_tokens
-        output_tokens += previous.output_tokens
-    return CandidateChunkCheckpoint(
-        chunk_key=pending.chunk_key,
-        parent_chunk_key=pending.parent_chunk_key,
-        status=status,
-        paths=pending.chunk.paths,
-        change_summary=candidate.change_summary if candidate is not None else "",
-        findings=(
-            tuple(finding.model_copy(deep=True) for finding in candidate.findings)
-            if candidate is not None
-            else ()
-        ),
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        llm_calls=llm_calls,
-        tool_calls=tool_calls,
-    )
-
-
-async def _emit_tool_trace(
-    callback: ToolTraceCallback | None,
-    event: dict[str, Any],
-) -> None:
-    if callback is not None:
-        await callback(event)
-
-
-async def _emit_checkpoint_event(
-    callback: ToolTraceCallback | None,
-    *,
-    event: str,
-    chunk_key: str,
-    status: str,
-) -> None:
-    await _emit_tool_trace(
-        callback,
-        {
-            "event": event,
-            "phase": "candidate",
-            "status": status.lower(),
-            "chunk_key": chunk_key,
-            "ts": datetime.now(UTC).isoformat(),
-        },
-    )
-
-
-async def _emit_budget_stop(
-    callback: ToolTraceCallback | None,
-    *,
-    phase: str,
-    reason: str,
-    budget: _ReviewBudget,
-) -> None:
-    await _emit_tool_trace(
-        callback,
-        {
-            "event": "budget_exhausted",
-            "phase": phase,
-            "reason": reason,
-            "llm_calls": budget.llm_calls,
-            "tool_calls": budget.tool_calls,
-            "input_tokens": budget.input_tokens,
-            "output_tokens": budget.output_tokens,
-            "ts": datetime.now(UTC).isoformat(),
-        },
+def _verification_item(
+    findings: list[Finding], identity: str, parent: str | None = None
+) -> WorkItem:
+    payload = json.dumps([item.model_dump(mode="json") for item in findings], sort_keys=True)
+    key = hashlib.sha256(f"{identity}\0{payload}".encode()).hexdigest()
+    return WorkItem(
+        key=key,
+        payload=findings,
+        paths=tuple(dict.fromkeys(item.location.path for item in findings)),
+        parent_key=parent,
     )

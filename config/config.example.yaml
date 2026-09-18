@@ -49,12 +49,14 @@ review:
   max_policy_bytes: 128000
   max_diff_chunk_chars: 70000
   max_candidate_findings_total: 64
-  # Per-review safety budgets. Large Changes stop cleanly with explicit partial-coverage disclosure.
+  # Operational limits: completed work remains charged after restart; failed unfinished work
+  # may restart under retry.review_attempts. Lifetime actual requests can exceed these limits.
   max_candidate_chunks: 12
   max_llm_calls_per_job: 30
   max_tool_calls_per_job: 50
-  max_input_tokens_per_job: 300000
-  # DONE/SUPERSEDED candidate checkpoints are temporary recovery cache, not permanent audit data.
+  verifier_budget_fraction: 0.3333333333333333
+  # Tokens are informational only. Legacy max_input_tokens_per_job is accepted but ignored.
+  # Candidate/verifier progress for DONE/SUPERSEDED jobs is recovery cache, not invocation audit.
   chunk_checkpoint_retention_days: 30
   tool_command_timeout_seconds: 20
   max_tool_output_bytes: 256000
