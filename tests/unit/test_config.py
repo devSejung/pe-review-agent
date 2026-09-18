@@ -94,6 +94,7 @@ def test_review_budget_defaults_and_bounds_are_validated() -> None:
     assert settings.max_llm_calls_per_job == 30
     assert settings.max_tool_calls_per_job == 50
     assert settings.max_input_tokens_per_job == 300_000
+    assert settings.chunk_checkpoint_retention_days == 30
 
     with pytest.raises(ValidationError):
         ReviewSettings(max_candidate_chunks=0)
@@ -103,6 +104,8 @@ def test_review_budget_defaults_and_bounds_are_validated() -> None:
         ReviewSettings(max_tool_calls_per_job=-1)
     with pytest.raises(ValidationError):
         ReviewSettings(max_input_tokens_per_job=999)
+    with pytest.raises(ValidationError):
+        ReviewSettings(chunk_checkpoint_retention_days=-1)
 
 
 def test_unknown_nested_yaml_setting_fails_check_config(monkeypatch, tmp_path: Path) -> None:

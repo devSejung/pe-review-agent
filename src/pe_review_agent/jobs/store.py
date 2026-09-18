@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -33,11 +33,13 @@ from pe_review_agent.jobs.models import (
     ProjectReviewStartMode,
     Publication,
     PublicationStatus,
+    ReviewChunkCheckpoint,
     ReviewFinding,
     ReviewResultRow,
     ServiceState,
 )
 from pe_review_agent.jobs.state_machine import require_transition, valid_retry_target
+from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 from pe_review_agent.review.lineage import FindingHistory
 
 
@@ -713,6 +715,112 @@ class JobStore:
             events.append(event)
             attempt.tool_events = events
             await session.flush()
+
+    async def load_candidate_chunk_checkpoints(
+        self,
+        job_id: uuid.UUID,
+        *,
+        checkpoint_version: str,
+    ) -> dict[str, CandidateChunkCheckpoint]:
+        """Load reusable candidate checkpoints for this exact durable review job/version."""
+
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(ReviewChunkCheckpoint)
+                    .where(
+                        ReviewChunkCheckpoint.job_id == job_id,
+                        ReviewChunkCheckpoint.checkpoint_version == checkpoint_version,
+                    )
+                    .order_by(ReviewChunkCheckpoint.id.asc())
+                )
+            ).all()
+        return {
+            row.chunk_key: CandidateChunkCheckpoint(
+                chunk_key=row.chunk_key,
+                parent_chunk_key=row.parent_chunk_key,
+                status=row.status,
+                paths=tuple(row.paths or ()),
+                change_summary=row.change_summary,
+                findings=tuple(Finding.model_validate(item) for item in (row.findings or ())),
+                input_tokens=row.input_tokens,
+                output_tokens=row.output_tokens,
+                llm_calls=row.llm_calls,
+                tool_calls=row.tool_calls,
+            )
+            for row in rows
+        }
+
+    async def save_candidate_chunk_checkpoint(
+        self,
+        job_id: uuid.UUID,
+        *,
+        worker_id: str,
+        checkpoint_version: str,
+        checkpoint: CandidateChunkCheckpoint,
+    ) -> None:
+        """Durably upsert one completed/split candidate chunk before moving to the next chunk."""
+
+        payload = {
+            "job_id": job_id,
+            "checkpoint_version": checkpoint_version,
+            "chunk_key": checkpoint.chunk_key,
+            "parent_chunk_key": checkpoint.parent_chunk_key,
+            "status": checkpoint.status,
+            "paths": list(checkpoint.paths),
+            "change_summary": checkpoint.change_summary,
+            "findings": [finding.model_dump(mode="json") for finding in checkpoint.findings],
+            "input_tokens": checkpoint.input_tokens,
+            "output_tokens": checkpoint.output_tokens,
+            "llm_calls": checkpoint.llm_calls,
+            "tool_calls": checkpoint.tool_calls,
+        }
+        async with self._sessions.begin() as session:
+            job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+            if job is None:
+                raise KeyError(job_id)
+            _require_live_lease(job, worker_id)
+            await session.execute(
+                pg_insert(ReviewChunkCheckpoint)
+                .values(**payload)
+                .on_conflict_do_update(
+                    index_elements=[
+                        ReviewChunkCheckpoint.job_id,
+                        ReviewChunkCheckpoint.checkpoint_version,
+                        ReviewChunkCheckpoint.chunk_key,
+                    ],
+                    set_={
+                        "parent_chunk_key": checkpoint.parent_chunk_key,
+                        "status": checkpoint.status,
+                        "paths": list(checkpoint.paths),
+                        "change_summary": checkpoint.change_summary,
+                        "findings": [
+                            finding.model_dump(mode="json") for finding in checkpoint.findings
+                        ],
+                        "input_tokens": checkpoint.input_tokens,
+                        "output_tokens": checkpoint.output_tokens,
+                        "llm_calls": checkpoint.llm_calls,
+                        "tool_calls": checkpoint.tool_calls,
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+
+    async def prune_candidate_chunk_checkpoints(self, *, retention_days: int) -> int:
+        """Delete old recovery-only checkpoints for terminal DONE/SUPERSEDED jobs."""
+
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        terminal_job_ids = select(Job.id).where(
+            Job.state.in_([JobState.DONE.value, JobState.SUPERSEDED.value])
+        )
+        async with self._sessions.begin() as session:
+            result = await session.execute(
+                delete(ReviewChunkCheckpoint).where(
+                    ReviewChunkCheckpoint.job_id.in_(terminal_job_ids),
+                    ReviewChunkCheckpoint.updated_at <= cutoff,
+                )
+            )
+            return int(result.rowcount or 0)
 
     async def save_review_result_and_mark_ready(
         self,

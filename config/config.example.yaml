@@ -54,6 +54,8 @@ review:
   max_llm_calls_per_job: 30
   max_tool_calls_per_job: 50
   max_input_tokens_per_job: 300000
+  # DONE/SUPERSEDED candidate checkpoints are temporary recovery cache, not permanent audit data.
+  chunk_checkpoint_retention_days: 30
   tool_command_timeout_seconds: 20
   max_tool_output_bytes: 256000
 

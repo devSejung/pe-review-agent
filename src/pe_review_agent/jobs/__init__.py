@@ -4,6 +4,8 @@ from pe_review_agent.jobs.models import (
     ProjectReviewStartMode,
     Publication,
     PublicationStatus,
+    ReviewChunkCheckpoint,
+    ReviewChunkCheckpointStatus,
     ReviewFinding,
     ReviewResultRow,
 )
@@ -18,6 +20,8 @@ __all__ = [
     "Publication",
     "PublicationStatus",
     "PublishGuardStatus",
+    "ReviewChunkCheckpoint",
+    "ReviewChunkCheckpointStatus",
     "ReviewFinding",
     "ReviewResultRow",
 ]

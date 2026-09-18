@@ -25,6 +25,7 @@ from pe_review_agent.domain import (
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
 from pe_review_agent.jobs.models import ServiceState
 from pe_review_agent.retry import PermanentError
+from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="PE_REVIEW_TEST_POSTGRES_DSN is not configured")
@@ -141,6 +142,23 @@ async def _published_job(settings: Settings):  # type: ignore[no-untyped-def]
             job.id,
             stage=AttemptStage.REVIEW,
             worker_id="audit-worker",
+        )
+        await store.save_candidate_chunk_checkpoint(
+            job.id,
+            worker_id="audit-worker",
+            checkpoint_version="candidate-v1",
+            checkpoint=CandidateChunkCheckpoint(
+                chunk_key="c" * 64,
+                parent_chunk_key=None,
+                status="DONE",
+                paths=("fw/train.c",),
+                change_summary="- training timeout handling changed",
+                findings=(),
+                input_tokens=100,
+                output_tokens=20,
+                llm_calls=1,
+                tool_calls=1,
+            ),
         )
         await store.append_attempt_tool_event(
             review_attempt,
@@ -696,6 +714,8 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
     assert "Review budget / coverage" in response.text
     assert "3 / 30" in response.text
     assert "1 / 50" in response.text
+    assert "Candidate chunk checkpoints" in response.text
+    assert "cccccccccccc" in response.text
 
 
 def test_logs_page_and_api_expose_full_structured_error(

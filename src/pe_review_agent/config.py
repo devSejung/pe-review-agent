@@ -124,6 +124,7 @@ class ReviewSettings(StrictSettingsModel):
     max_llm_calls_per_job: int = Field(default=30, ge=1, le=1_000)
     max_tool_calls_per_job: int = Field(default=50, ge=0, le=5_000)
     max_input_tokens_per_job: int = Field(default=300_000, ge=1_000, le=20_000_000)
+    chunk_checkpoint_retention_days: int = Field(default=30, ge=0, le=3650)
     tool_command_timeout_seconds: float = Field(default=20.0, gt=0, le=300)
     max_tool_output_bytes: int = Field(default=256_000, ge=4096, le=4_000_000)
     generated_path_patterns: list[str] = Field(

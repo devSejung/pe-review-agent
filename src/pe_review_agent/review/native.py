@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import posixpath
 import re
@@ -15,6 +16,10 @@ from pe_review_agent.domain import Finding, ReviewContext, ReviewResult
 from pe_review_agent.llm.client import LlmClient, assistant_message_for_tool_loop
 from pe_review_agent.repos.tools import RepositoryToolExecutor
 from pe_review_agent.retry import ContextLengthError, PermanentError, TransientError
+from pe_review_agent.review.checkpoints import (
+    CANDIDATE_CHECKPOINT_VERSION,
+    CandidateChunkCheckpoint,
+)
 from pe_review_agent.review.chunking import DiffChunk, chunk_diff
 from pe_review_agent.review.validator import FindingValidator
 
@@ -27,6 +32,13 @@ class _CandidateReview(BaseModel):
 class _VerificationReview(BaseModel):
     review_summary: str = ""
     findings: list[Finding] = Field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateChunk:
+    chunk: DiffChunk
+    chunk_key: str
+    parent_chunk_key: str | None = None
 
 
 class _BudgetExhausted(Exception):
@@ -78,8 +90,27 @@ class _ReviewBudget:
         if reason not in self.stop_reasons:
             self.stop_reasons.append(reason)
 
+    def snapshot(self) -> tuple[int, int, int, int]:
+        return self.llm_calls, self.tool_calls, self.input_tokens, self.output_tokens
+
+    def delta(self, before: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        return (
+            self.llm_calls - before[0],
+            self.tool_calls - before[1],
+            self.input_tokens - before[2],
+            self.output_tokens - before[3],
+        )
+
+    def restore_checkpoint(self, checkpoint: CandidateChunkCheckpoint) -> None:
+        self.llm_calls += checkpoint.llm_calls
+        self.tool_calls += checkpoint.tool_calls
+        self.input_tokens += checkpoint.input_tokens
+        self.output_tokens += checkpoint.output_tokens
+
 
 ToolTraceCallback = Callable[[dict[str, Any]], Awaitable[None]]
+CheckpointLoadCallback = Callable[[], Awaitable[dict[str, CandidateChunkCheckpoint]]]
+CheckpointSaveCallback = Callable[[CandidateChunkCheckpoint], Awaitable[None]]
 
 
 class NativeFirmwareReviewEngine:
@@ -96,6 +127,8 @@ class NativeFirmwareReviewEngine:
         tools: RepositoryToolExecutor,
         *,
         tool_trace: ToolTraceCallback | None = None,
+        checkpoint_load: CheckpointLoadCallback | None = None,
+        checkpoint_save: CheckpointSaveCallback | None = None,
     ) -> ReviewResult:
         if context.skip_reason:
             return ReviewResult(
@@ -130,10 +163,18 @@ class NativeFirmwareReviewEngine:
                 },
             )
         budget = _ReviewBudget.from_settings(self.settings)
+        checkpoints = await checkpoint_load() if checkpoint_load is not None else {}
+        for checkpoint in checkpoints.values():
+            budget.restore_checkpoint(checkpoint)
+        checkpoint_hits = 0
+        checkpoint_writes = 0
         candidate_findings: list[Finding] = []
         candidate_change_summaries: list[str] = []
         initial_chunks = chunk_diff(context.diff, max_chars=self.settings.max_diff_chunk_chars)
-        pending_chunks = list(initial_chunks)
+        pending_chunks = [
+            _candidate_chunk(chunk, ordinal=index)
+            for index, chunk in enumerate(initial_chunks, start=1)
+        ]
         reviewed_chunks: list[DiffChunk] = []
         budget_stop_reasons: list[str] = []
         while pending_chunks:
@@ -143,13 +184,54 @@ class NativeFirmwareReviewEngine:
                 budget_stop_reasons.append(reason)
                 await _emit_budget_stop(tool_trace, phase="candidate", reason=reason, budget=budget)
                 break
-            chunk = pending_chunks.pop(0)
+            pending = pending_chunks.pop(0)
+            chunk = pending.chunk
+            checkpoint = checkpoints.get(pending.chunk_key)
+            if checkpoint is not None:
+                if checkpoint.status == "SPLIT":
+                    checkpoint_hits += 1
+                    await _emit_checkpoint_event(
+                        tool_trace,
+                        event="checkpoint_reused",
+                        chunk_key=pending.chunk_key,
+                        status=checkpoint.status,
+                    )
+                    pieces = self._split_context_limited_chunk(chunk)
+                    pending_chunks[0:0] = _split_candidate_chunks(pending, pieces)
+                    continue
+                if checkpoint.status == "DONE":
+                    checkpoint_hits += 1
+                    await _emit_checkpoint_event(
+                        tool_trace,
+                        event="checkpoint_reused",
+                        chunk_key=pending.chunk_key,
+                        status=checkpoint.status,
+                    )
+                    reviewed_chunks.append(chunk)
+                    if checkpoint.change_summary.strip():
+                        candidate_change_summaries.append(checkpoint.change_summary.strip())
+                    candidate_findings.extend(
+                        finding.model_copy(deep=True) for finding in checkpoint.findings
+                    )
+                    continue
+                if checkpoint.status == "RETRY":
+                    await _emit_checkpoint_event(
+                        tool_trace,
+                        event="checkpoint_retry_usage_restored",
+                        chunk_key=pending.chunk_key,
+                        status=checkpoint.status,
+                    )
+                else:
+                    raise PermanentError(
+                        f"unsupported candidate checkpoint status {checkpoint.status!r}"
+                    )
             candidate_messages = self._candidate_messages(
                 context,
                 chunk,
                 chunk_index=len(reviewed_chunks) + 1,
                 chunk_count=len(reviewed_chunks) + 1 + len(pending_chunks),
             )
+            budget_before = budget.snapshot()
             try:
                 candidate, _usage = await self._tool_session(
                     candidate_messages,
@@ -159,7 +241,7 @@ class NativeFirmwareReviewEngine:
                     tool_trace=tool_trace,
                 )
             except _BudgetExhausted as exc:
-                pending_chunks.insert(0, chunk)
+                pending_chunks.insert(0, pending)
                 budget_stop_reasons.append(exc.reason)
                 await _emit_budget_stop(
                     tool_trace,
@@ -170,18 +252,76 @@ class NativeFirmwareReviewEngine:
                 break
             except ContextLengthError:
                 pieces = self._split_context_limited_chunk(chunk)
-                pending_chunks[0:0] = pieces
+                split_checkpoint = _checkpoint_from_budget_delta(
+                    pending,
+                    status="SPLIT",
+                    budget=budget,
+                    budget_before=budget_before,
+                    previous=checkpoint,
+                )
+                if checkpoint_save is not None:
+                    await checkpoint_save(split_checkpoint)
+                    checkpoints[pending.chunk_key] = split_checkpoint
+                    checkpoint_writes += 1
+                    await _emit_checkpoint_event(
+                        tool_trace,
+                        event="checkpoint_saved",
+                        chunk_key=pending.chunk_key,
+                        status="SPLIT",
+                    )
+                pending_chunks[0:0] = _split_candidate_chunks(pending, pieces)
                 continue
-            reviewed_chunks.append(chunk)
+            except TransientError:
+                retry_checkpoint = _checkpoint_from_budget_delta(
+                    pending,
+                    status="RETRY",
+                    budget=budget,
+                    budget_before=budget_before,
+                    previous=checkpoint,
+                )
+                if checkpoint_save is not None:
+                    await checkpoint_save(retry_checkpoint)
+                    checkpoints[pending.chunk_key] = retry_checkpoint
+                    checkpoint_writes += 1
+                    await _emit_checkpoint_event(
+                        tool_trace,
+                        event="checkpoint_saved",
+                        chunk_key=pending.chunk_key,
+                        status="RETRY",
+                    )
+                raise
             parsed = self._parse_candidate_review(
-                candidate.content, stage=f"candidate chunk {len(reviewed_chunks)}"
+                candidate.content, stage=f"candidate chunk {len(reviewed_chunks) + 1}"
             )
+            done_checkpoint = _checkpoint_from_budget_delta(
+                pending,
+                status="DONE",
+                budget=budget,
+                budget_before=budget_before,
+                candidate=parsed,
+                previous=checkpoint,
+            )
+            if checkpoint_save is not None:
+                await checkpoint_save(done_checkpoint)
+                checkpoints[pending.chunk_key] = done_checkpoint
+                checkpoint_writes += 1
+                await _emit_checkpoint_event(
+                    tool_trace,
+                    event="checkpoint_saved",
+                    chunk_key=pending.chunk_key,
+                    status="DONE",
+                )
+            reviewed_chunks.append(chunk)
             if parsed.change_summary.strip():
                 candidate_change_summaries.append(parsed.change_summary.strip())
             candidate_findings.extend(parsed.findings)
 
         change_summary = self._merge_change_summaries(candidate_change_summaries, context)
-        candidate_coverage = self._coverage(context, reviewed_chunks, pending_chunks)
+        candidate_coverage = self._coverage(
+            context,
+            reviewed_chunks,
+            [item.chunk for item in pending_chunks],
+        )
         candidates = _CandidateReview(
             change_summary=change_summary,
             findings=self._include_previous_candidates(
@@ -221,6 +361,11 @@ class NativeFirmwareReviewEngine:
                     "change_summary": change_summary,
                     "review_summary": review_summary,
                     "review_budget": budget_metadata,
+                    "candidate_checkpoints": {
+                        "version": CANDIDATE_CHECKPOINT_VERSION,
+                        "reused": checkpoint_hits,
+                        "saved": checkpoint_writes,
+                    },
                 },
             )
 
@@ -278,6 +423,11 @@ class NativeFirmwareReviewEngine:
                 "change_summary": change_summary,
                 "review_summary": review_summary,
                 "review_budget": budget_metadata,
+                "candidate_checkpoints": {
+                    "version": CANDIDATE_CHECKPOINT_VERSION,
+                    "reused": checkpoint_hits,
+                    "saved": checkpoint_writes,
+                },
             },
         )
 
@@ -1149,12 +1299,97 @@ def _bounded_metadata(value: str | None, limit: int) -> str | None:
     return normalized if len(normalized) <= limit else normalized[:limit] + "\n<truncated>"
 
 
+def _candidate_chunk(chunk: DiffChunk, *, ordinal: int) -> _CandidateChunk:
+    return _CandidateChunk(
+        chunk=chunk,
+        chunk_key=_chunk_key(f"initial:{ordinal}", chunk),
+    )
+
+
+def _split_candidate_chunks(
+    parent: _CandidateChunk,
+    pieces: list[DiffChunk],
+) -> list[_CandidateChunk]:
+    return [
+        _CandidateChunk(
+            chunk=piece,
+            chunk_key=_chunk_key(f"{parent.chunk_key}:split:{index}", piece),
+            parent_chunk_key=parent.chunk_key,
+        )
+        for index, piece in enumerate(pieces, start=1)
+    ]
+
+
+def _chunk_key(identity: str, chunk: DiffChunk) -> str:
+    digest = hashlib.sha256()
+    digest.update(identity.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(chunk.paths, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    digest.update(b"\0")
+    digest.update(chunk.text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _checkpoint_from_budget_delta(
+    pending: _CandidateChunk,
+    *,
+    status: str,
+    budget: _ReviewBudget,
+    budget_before: tuple[int, int, int, int],
+    candidate: _CandidateReview | None = None,
+    previous: CandidateChunkCheckpoint | None = None,
+) -> CandidateChunkCheckpoint:
+    llm_calls, tool_calls, input_tokens, output_tokens = budget.delta(budget_before)
+    if previous is not None:
+        llm_calls += previous.llm_calls
+        tool_calls += previous.tool_calls
+        input_tokens += previous.input_tokens
+        output_tokens += previous.output_tokens
+    return CandidateChunkCheckpoint(
+        chunk_key=pending.chunk_key,
+        parent_chunk_key=pending.parent_chunk_key,
+        status=status,
+        paths=pending.chunk.paths,
+        change_summary=candidate.change_summary if candidate is not None else "",
+        findings=(
+            tuple(finding.model_copy(deep=True) for finding in candidate.findings)
+            if candidate is not None
+            else ()
+        ),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        llm_calls=llm_calls,
+        tool_calls=tool_calls,
+    )
+
+
 async def _emit_tool_trace(
     callback: ToolTraceCallback | None,
     event: dict[str, Any],
 ) -> None:
     if callback is not None:
         await callback(event)
+
+
+async def _emit_checkpoint_event(
+    callback: ToolTraceCallback | None,
+    *,
+    event: str,
+    chunk_key: str,
+    status: str,
+) -> None:
+    await _emit_tool_trace(
+        callback,
+        {
+            "event": event,
+            "phase": "candidate",
+            "status": status.lower(),
+            "chunk_key": chunk_key,
+            "ts": datetime.now(UTC).isoformat(),
+        },
+    )
 
 
 async def _emit_budget_stop(

@@ -55,6 +55,12 @@ class ProjectReviewStartMode(StrEnum):
     INCLUDE_OPEN = "INCLUDE_OPEN"
 
 
+class ReviewChunkCheckpointStatus(StrEnum):
+    DONE = "DONE"
+    SPLIT = "SPLIT"
+    RETRY = "RETRY"
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -126,6 +132,51 @@ class Job(Base):
     publications: Mapped[list[Publication]] = relationship(
         back_populates="job", cascade="all, delete-orphan"
     )
+    chunk_checkpoints: Mapped[list[ReviewChunkCheckpoint]] = relationship(
+        back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class ReviewChunkCheckpoint(Base):
+    __tablename__ = "review_chunk_checkpoints"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "checkpoint_version",
+            "chunk_key",
+            name="uq_review_chunk_checkpoints_identity",
+        ),
+        CheckConstraint(
+            f"status IN ({_values(ReviewChunkCheckpointStatus)})",
+            name="ck_review_chunk_checkpoints_status",
+        ),
+        Index("ix_review_chunk_checkpoints_job", "job_id"),
+        Index("ix_review_chunk_checkpoints_retention", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("review_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    checkpoint_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunk_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    parent_chunk_key: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    paths: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    change_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    findings: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    llm_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    job: Mapped[Job] = relationship(back_populates="chunk_checkpoints")
 
 
 class Attempt(Base):

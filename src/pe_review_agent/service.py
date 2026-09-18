@@ -33,6 +33,10 @@ from pe_review_agent.observability import METRICS, log_event
 from pe_review_agent.repos import RepositoryManager, RepositoryToolExecutor
 from pe_review_agent.retry import PermanentError, TransientError, exponential_backoff
 from pe_review_agent.review import NativeFirmwareReviewEngine
+from pe_review_agent.review.checkpoints import (
+    CANDIDATE_CHECKPOINT_VERSION,
+    CandidateChunkCheckpoint,
+)
 from pe_review_agent.review.lineage import (
     findings_for_inline_publication,
     reconcile_finding_lineage,
@@ -42,6 +46,8 @@ from pe_review_agent.review.policy import load_policy
 logger = logging.getLogger(__name__)
 _RECONCILIATION_WATERMARK_KEY = "gerrit-open-changes"
 _RECONCILIATION_FULL_SWEEP_KEY = "gerrit-open-changes-full-sweep"
+_CHECKPOINT_CLEANUP_WATERMARK_KEY = "candidate-checkpoint-cleanup"
+_CHECKPOINT_CLEANUP_INTERVAL = timedelta(hours=24)
 
 
 class LeaseLostError(RuntimeError):
@@ -296,7 +302,39 @@ class ReviewWorker:
                             **event,
                         )
 
-                    review = await self.engine.review(context, tools, tool_trace=tool_trace)
+                    async def checkpoint_load() -> dict[str, CandidateChunkCheckpoint]:
+                        lease.ensure()
+                        try:
+                            return await self.store.load_candidate_chunk_checkpoints(
+                                job.id,
+                                checkpoint_version=CANDIDATE_CHECKPOINT_VERSION,
+                            )
+                        except Exception as exc:
+                            raise TransientError(
+                                f"failed to load candidate chunk checkpoints: {exc}"
+                            ) from exc
+
+                    async def checkpoint_save(checkpoint: CandidateChunkCheckpoint) -> None:
+                        lease.ensure()
+                        try:
+                            await self.store.save_candidate_chunk_checkpoint(
+                                job.id,
+                                worker_id=worker_id,
+                                checkpoint_version=CANDIDATE_CHECKPOINT_VERSION,
+                                checkpoint=checkpoint,
+                            )
+                        except Exception as exc:
+                            raise TransientError(
+                                f"failed to persist candidate chunk checkpoint: {exc}"
+                            ) from exc
+
+                    review = await self.engine.review(
+                        context,
+                        tools,
+                        tool_trace=tool_trace,
+                        checkpoint_load=checkpoint_load,
+                        checkpoint_save=checkpoint_save,
+                    )
                     lineage_complete = review.review_metadata.get("lineage_complete", True)
                     if lineage_complete or "review_budget" in review.review_metadata:
                         review = reconcile_finding_lineage(
@@ -836,6 +874,28 @@ async def run_reconciler(
     overlap = timedelta(seconds=max(60, interval))
     full_sweep_interval = timedelta(seconds=settings.service.reconcile_full_sweep_interval_seconds)
     while True:
+        pass_started = datetime.now(UTC)
+        try:
+            last_cleanup = await store.get_service_watermark(_CHECKPOINT_CLEANUP_WATERMARK_KEY)
+            if last_cleanup is None or pass_started - last_cleanup >= _CHECKPOINT_CLEANUP_INTERVAL:
+                deleted = await store.prune_candidate_chunk_checkpoints(
+                    retention_days=settings.review.chunk_checkpoint_retention_days
+                )
+                await store.advance_service_watermark(
+                    _CHECKPOINT_CLEANUP_WATERMARK_KEY, pass_started
+                )
+                if deleted:
+                    log_event(
+                        logger,
+                        "pruned expired candidate chunk checkpoints",
+                        deleted=deleted,
+                        retention_days=settings.review.chunk_checkpoint_retention_days,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("candidate chunk checkpoint cleanup failed")
+
         project_cutoffs: dict[str, datetime | None] | None = None
         project_scopes = ()
         if control is not None:
@@ -859,7 +919,6 @@ async def run_reconciler(
         elif not settings.service.enabled:
             await asyncio.sleep(interval)
             continue
-        pass_started = datetime.now(UTC)
         try:
             watermark = await store.get_service_watermark(_RECONCILIATION_WATERMARK_KEY)
             last_full_sweep = await store.get_service_watermark(_RECONCILIATION_FULL_SWEEP_KEY)
