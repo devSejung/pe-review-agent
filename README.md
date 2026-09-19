@@ -81,6 +81,25 @@ summary plus native inline/range comments.
   retry-budget epoch, refuses stale Patch Sets, and resumes from a durable review/publication intent
   when one exists instead of rerunning Qwen.
 
+## Potential future direction: optional build-aware C evidence
+
+The current reviewer intentionally works without owning each firmware repository's build system. A
+possible future accuracy upgrade is an **optional** C semantic-evidence layer fed by existing CI,
+especially for compile-configuration-sensitive or cross-function defects. This is not a current
+runtime dependency and should not make repository onboarding require a manually entered build command.
+
+One practical shape is for an existing Jenkins build, even when Jenkins runs on another server, to
+publish compact artifacts such as `compile_commands.json` plus project/branch/revision/target metadata.
+The reviewer could consume an exact-revision artifact when available, otherwise a clearly identified
+compatible branch baseline, and fall back to the existing diff + repository-tool + LLM review when no
+semantic artifact exists. Generated headers may be added only when needed; the full build workspace or
+toolchain does not need to move onto the review server.
+
+This direction is deliberately deferred until real DMC/FW replay data shows worthwhile recall/precision
+gain. If pursued, the semantic layer should enrich candidate/verifier evidence rather than publish raw
+static-analyzer warnings directly to Gerrit, and it should remain generic enough to support other
+firmware repositories with different branches and build systems.
+
 ## Runtime topology
 
 ```text

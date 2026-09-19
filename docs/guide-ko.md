@@ -994,6 +994,42 @@ job의 오래된 cache를 reconciler가 정리합니다. 실제 호출 audit은 
 `FAILED_PERMANENT`는 수동 requeue 가능성이 있어 cache 자동 정리에서 제외합니다. 정상 예산 종료 후
 게시까지 완료된 `DONE`은 기존 실패-job requeue 대상이 아니며, 예산을 올렸다고 자동 재검토하지 않습니다.
 
+### 향후 선택 가능한 방향: Jenkins build metadata 기반 C semantic evidence
+
+현재 reviewer는 각 FW repo의 build command를 필수로 알지 않아도 동작합니다. 이 원칙은 유지합니다.
+향후 실제 DMC/FW replay에서 검출력 향상이 충분히 확인될 경우에만, **선택 기능**으로 compiler/build-aware
+C semantic evidence를 추가하는 방향을 고려할 수 있습니다. 이 기능이 없어도 지금의 diff + repository tool
++ Qwen candidate/verifier 리뷰는 그대로 동작해야 하며, 새 project를 enable할 때 build command 입력을
+필수 onboarding 절차로 만들지 않습니다.
+
+현실적인 연결점은 기존 Jenkins입니다. Jenkins가 reviewer와 다른 서버에서 실행되어도 상관없으며,
+성공 build가 다음과 같은 작은 artifact를 남기면 reviewer가 필요할 때 가져와 사용할 수 있습니다.
+
+```text
+metadata.json
+  project / branch / revision SHA / target / build number
+
+compile_commands.json
+  source file별 실제 compiler / -D / -I / target option
+
+generated headers (선택)
+  semantic 분석에 정말 필요한 경우에만 추가
+```
+
+우선순위는 `동일 revision artifact > 호환 가능한 동일 branch의 최근 성공 build > semantic evidence 없음`
+순으로 생각합니다. 정확히 일치하지 않는 baseline artifact를 사용할 때는 provenance를 명확히 남겨야 하며,
+현재 Patch Set의 compile option이 달라졌을 가능성을 무시해서는 안 됩니다. 아무 artifact도 없으면 semantic
+분석만 생략하고 기존 reviewer로 정상 진행합니다.
+
+이 방향의 목적은 Jenkins나 전체 FW toolchain을 review 서버로 옮기는 것이 아닙니다. Jenkins가 이미 알고
+있는 build 정보를 재사용해 type/macro/configuration/call/data-flow 같은 C 의미 근거를 reviewer에 공급하고,
+Qwen이 그 근거를 diff와 domain context에 맞춰 triage/검증하는 구조입니다. Static analyzer 경고를 그대로
+Gerrit에 게시하는 구조는 피합니다.
+
+초기 적용 대상은 DMC가 될 수 있지만 core에 DMC build command를 박지 않습니다. 다른 FW repo와 branch로
+확장 가능하도록 optional adapter/profile 형태를 전제로 하며, 실제 도입 여부와 투자 범위는 historical DMC
+CR/버그 replay에서 recall, precision, false-positive, latency 개선폭을 확인한 뒤 결정합니다.
+
 ---
 
 ## 7. Gerrit SSH와 REST는 각각 왜 필요한가
