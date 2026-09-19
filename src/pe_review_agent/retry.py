@@ -12,9 +12,18 @@ class RetryDecision:
 
 
 class TransientError(RuntimeError):
-    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 class PermanentError(RuntimeError):

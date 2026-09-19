@@ -14,7 +14,13 @@ from sqlalchemy import text
 from pe_review_agent.admin import ControlStore
 from pe_review_agent.config import Settings
 from pe_review_agent.db import Database
-from pe_review_agent.domain import AttemptStage, GerritPatchsetEvent, JobState, ReviewResult
+from pe_review_agent.domain import (
+    AttemptStage,
+    GerritPatchsetEvent,
+    JobState,
+    ReviewContext,
+    ReviewResult,
+)
 from pe_review_agent.gerrit import (
     GerritEventStream,
     GerritRestClient,
@@ -28,16 +34,14 @@ from pe_review_agent.jobs import (
     PublicationStatus,
     PublishGuardStatus,
 )
+from pe_review_agent.jobs.progress import PostgresProgressBackend
 from pe_review_agent.llm import LlmClient
 from pe_review_agent.observability import METRICS, log_event
 from pe_review_agent.repos import RepositoryManager, RepositoryToolExecutor
 from pe_review_agent.retry import PermanentError, TransientError, exponential_backoff
 from pe_review_agent.review import NativeFirmwareReviewEngine
-from pe_review_agent.review.checkpoints import (
-    CANDIDATE_CHECKPOINT_VERSION,
-    CandidateChunkCheckpoint,
-)
 from pe_review_agent.review.lineage import (
+    FindingHistory,
     findings_for_inline_publication,
     reconcile_finding_lineage,
 )
@@ -275,6 +279,36 @@ class ReviewWorker:
                 context.historical_findings = list(history.historical_findings)
                 context.previous_patchset_number = history.baseline_patchset
                 tools = RepositoryToolExecutor(workspace.root, self.settings.review)
+
+                # Recovery-only path: a previous worker may have durably completed the exact-input
+                # review and crashed before promoting it to review_results/READY_TO_PUBLISH. This
+                # needs no new inference and must remain recoverable even when that crashed attempt
+                # consumed the final REVIEW retry slot.
+                try:
+                    recovered = await self._recover_completed_review(
+                        job,
+                        context=context,
+                        history=history,
+                        worker_id=worker_id,
+                        lease=lease,
+                        review_started=review_started,
+                    )
+                except TransientError as exc:
+                    # This is a read-only recovery probe, not permission to run inference. Keep
+                    # retrying it independently of an already exhausted REVIEW attempt budget;
+                    # once the read succeeds, a missing result still falls through to the normal
+                    # review-attempt gate below.
+                    await self._schedule_retry(
+                        job.id,
+                        AttemptStage.REVIEW,
+                        worker_id,
+                        exc,
+                        allow_recovery_pass=True,
+                    )
+                    return
+                if recovered is not None:
+                    return
+
                 if not await self._can_start_attempt(job, AttemptStage.REVIEW, worker_id):
                     return
                 review_attempt = await self._start_attempt(job, AttemptStage.REVIEW, worker_id)
@@ -302,68 +336,67 @@ class ReviewWorker:
                             **event,
                         )
 
-                    async def checkpoint_load() -> dict[str, CandidateChunkCheckpoint]:
-                        lease.ensure()
-                        try:
-                            return await self.store.load_candidate_chunk_checkpoints(
-                                job.id,
-                                checkpoint_version=CANDIDATE_CHECKPOINT_VERSION,
-                            )
-                        except Exception as exc:
-                            raise TransientError(
-                                f"failed to load candidate chunk checkpoints: {exc}"
-                            ) from exc
-
-                    async def checkpoint_save(checkpoint: CandidateChunkCheckpoint) -> None:
-                        lease.ensure()
-                        try:
-                            await self.store.save_candidate_chunk_checkpoint(
-                                job.id,
-                                worker_id=worker_id,
-                                checkpoint_version=CANDIDATE_CHECKPOINT_VERSION,
-                                checkpoint=checkpoint,
-                            )
-                        except Exception as exc:
-                            raise TransientError(
-                                f"failed to persist candidate chunk checkpoint: {exc}"
-                            ) from exc
-
+                    backend = PostgresProgressBackend(
+                        self.store._sessions,
+                        job_id=job.id,
+                        worker_id=worker_id,
+                        attempt_id=review_attempt.id,
+                    )
                     review = await self.engine.review(
                         context,
                         tools,
                         tool_trace=tool_trace,
-                        checkpoint_load=checkpoint_load,
-                        checkpoint_save=checkpoint_save,
+                        backend=backend,
                     )
-                    lineage_complete = review.review_metadata.get("lineage_complete", True)
-                    if lineage_complete or "review_budget" in review.review_metadata:
-                        review = reconcile_finding_lineage(
-                            project=job.project,
-                            review=review,
-                            history=history,
-                            complete=lineage_complete,
-                        ).review
-                    lease.ensure()
-                    # The engine performs model verification and static location validation. The
-                    # explicit VALIDATING state makes recovery semantics visible and leaves room
-                    # for additional deterministic validators without coupling them to publishing.
-                    if job.state == JobState.REVIEWING:
-                        job = await self.store.transition(
-                            job.id, JobState.VALIDATING, worker_id=worker_id
-                        )
-                    lease.ensure()
-                    await self.store.save_review_result_and_mark_ready(
-                        job.id, review, worker_id=worker_id
+                    job, review = await self._promote_review_result(
+                        job,
+                        review=review,
+                        history=history,
+                        worker_id=worker_id,
+                        lease=lease,
                     )
                     # Only mark the model attempt successful after the generated result is durable.
                     # A crash before READY_TO_PUBLISH therefore leaves an unfinished attempt that
                     # consumes the configured review retry budget on reclaim.
                     await self._finish_attempt(review_attempt, success=True)
+                except TransientError as exc:
+                    await self._finish_attempt_if_open(
+                        review_attempt,
+                        success=False,
+                        retryable=True,
+                        error=exc,
+                    )
+                    # The final progress write is transactional but its COMMIT acknowledgement can
+                    # be lost. Probe exact-input completed progress before treating this as another
+                    # inference failure. A successful probe promotes the already-finished result;
+                    # a transient probe failure gets a recovery-only retry; only a definite miss
+                    # falls back to the ordinary REVIEW retry budget.
+                    try:
+                        recovered = await self._recover_completed_review(
+                            job,
+                            context=context,
+                            history=history,
+                            worker_id=worker_id,
+                            lease=lease,
+                            review_started=review_started,
+                        )
+                    except TransientError as recovery_error:
+                        await self._schedule_retry(
+                            job.id,
+                            AttemptStage.REVIEW,
+                            worker_id,
+                            recovery_error,
+                            allow_recovery_pass=True,
+                        )
+                        return
+                    if recovered is not None:
+                        return
+                    raise
                 except Exception as exc:
                     await self._finish_attempt_if_open(
                         review_attempt,
                         success=False,
-                        retryable=isinstance(exc, TransientError),
+                        retryable=False,
                         error=exc,
                     )
                     raise
@@ -383,6 +416,80 @@ class ReviewWorker:
                 fetch_attempt, success=False, retryable=False, error=exc
             )
             await self._permanent_failure(job, worker_id=worker_id, error=exc)
+
+    async def _recover_completed_review(
+        self,
+        job: JobRecord,
+        *,
+        context: ReviewContext,
+        history: FindingHistory,
+        worker_id: str,
+        lease: LeaseGuard,
+        review_started: float,
+    ) -> ReviewResult | None:
+        recover_completed = getattr(self.engine, "recover_completed", None)
+        if recover_completed is None:
+            return None
+        backend = PostgresProgressBackend(
+            self.store._sessions,
+            job_id=job.id,
+            worker_id=worker_id,
+            attempt_id=None,
+        )
+        review = await recover_completed(context, backend=backend)
+        if review is None:
+            return None
+        _, review = await self._promote_review_result(
+            job,
+            review=review,
+            history=history,
+            worker_id=worker_id,
+            lease=lease,
+        )
+        log_event(
+            logger,
+            "recovered completed review progress without a new model attempt",
+            job_id=str(job.id),
+            project=job.project,
+            change=job.change_number,
+            patchset=job.patchset_number,
+        )
+        METRICS.review_latency_seconds.observe(perf_counter() - review_started)
+        self._record_review_metrics(job, review)
+        return review
+
+    async def _promote_review_result(
+        self,
+        job: JobRecord,
+        *,
+        review: ReviewResult,
+        history: FindingHistory,
+        worker_id: str,
+        lease: LeaseGuard,
+    ) -> tuple[JobRecord, ReviewResult]:
+        lineage_complete = review.review_metadata.get("lineage_complete", True)
+        if lineage_complete or "review_budget" in review.review_metadata:
+            review = reconcile_finding_lineage(
+                project=job.project,
+                review=review,
+                history=history,
+                complete=lineage_complete,
+            ).review
+        lease.ensure()
+        # The engine performs model verification and static location validation. The explicit
+        # VALIDATING state makes recovery semantics visible and leaves room for additional
+        # deterministic validators without coupling them to publishing.
+        if job.state == JobState.REVIEWING:
+            job = await self.store.transition(job.id, JobState.VALIDATING, worker_id=worker_id)
+        elif job.state != JobState.VALIDATING:
+            raise RuntimeError(f"completed review cannot be promoted from {job.state.value}")
+        lease.ensure()
+        job = await self.store.save_review_result_and_mark_ready(
+            job.id,
+            review,
+            worker_id=worker_id,
+        )
+        return job, review
 
     async def _process_publish(self, job: JobRecord, *, worker_id: str, lease: LeaseGuard) -> None:
         review = await self.store.load_review_result(job.id)
@@ -408,7 +515,9 @@ class ReviewWorker:
             job = await self.store.transition(job.id, JobState.PUBLISHING, worker_id=worker_id)
 
         if publication is None:
-            inline_findings = findings_for_inline_publication(review)
+            inline_findings = findings_for_inline_publication(review)[
+                : self.settings.review.max_findings
+            ]
             inline_review = review.model_copy(
                 update={"findings": inline_findings},
                 deep=True,
@@ -693,11 +802,11 @@ class ReviewWorker:
             return
         stage_attempts = await self.store.count_consumed_retry_attempts(job_id, stage=stage)
         budget = self._retry_budget(stage)
-        # RECONCILE is special: a previously ambiguous Gerrit POST may already have committed.
-        # Transient GET failures can never prove that side effect absent, so exhausting an
-        # ordinary retry budget here must not terminalize the job or release a newer Patch Set.
-        # Attempts stay durable/auditable and backoff is capped by retry.max_seconds until Gerrit
-        # can answer (or an operator deliberately intervenes).
+        # RECONCILE and explicit recovery-only passes do not authorize a new expensive or
+        # side-effecting attempt. A previously ambiguous Gerrit POST or an already-complete review
+        # may be waiting
+        # only for a transient read to recover, so ordinary stage-attempt exhaustion cannot prove
+        # those durable facts absent.
         if (
             stage is not AttemptStage.RECONCILE
             and stage_attempts >= budget
@@ -878,7 +987,7 @@ async def run_reconciler(
         try:
             last_cleanup = await store.get_service_watermark(_CHECKPOINT_CLEANUP_WATERMARK_KEY)
             if last_cleanup is None or pass_started - last_cleanup >= _CHECKPOINT_CLEANUP_INTERVAL:
-                deleted = await store.prune_candidate_chunk_checkpoints(
+                deleted = await store.prune_review_recovery_cache(
                     retention_days=settings.review.chunk_checkpoint_retention_days
                 )
                 await store.advance_service_watermark(
@@ -887,14 +996,14 @@ async def run_reconciler(
                 if deleted:
                     log_event(
                         logger,
-                        "pruned expired candidate chunk checkpoints",
+                        "pruned expired review recovery cache",
                         deleted=deleted,
                         retention_days=settings.review.chunk_checkpoint_retention_days,
                     )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("candidate chunk checkpoint cleanup failed")
+            logger.exception("review recovery cache cleanup failed")
 
         project_cutoffs: dict[str, datetime | None] | None = None
         project_scopes = ()

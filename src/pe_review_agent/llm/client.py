@@ -133,6 +133,11 @@ class LlmClient:
                 f"LLM returned an invalid OpenAI-compatible response: {response.text[:1000]}"
             ) from exc
 
+        # Extract known usage before tool-argument parsing; malformed model output still used API
+        # capacity and must remain visible even when the incomplete session is retried for free.
+        usage = body.get("usage") or {}
+        input_tokens = _int_or_none(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        output_tokens = _int_or_none(usage.get("completion_tokens") or usage.get("output_tokens"))
         calls: list[ToolCall] = []
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
@@ -141,9 +146,17 @@ class LlmClient:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as exc:
                 detail = f"{function.get('name')}: {raw_arguments[:500]}"
-                raise TransientError(f"LLM emitted invalid tool arguments for {detail}") from exc
+                raise TransientError(
+                    f"LLM emitted invalid tool arguments for {detail}",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                ) from exc
             if not isinstance(arguments, dict):
-                raise TransientError("LLM tool arguments must decode to an object")
+                raise TransientError(
+                    "LLM tool arguments must decode to an object",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
             calls.append(
                 ToolCall(
                     id=str(call.get("id") or ""),
@@ -152,14 +165,11 @@ class LlmClient:
                     raw_arguments=raw_arguments,
                 )
             )
-        usage = body.get("usage") or {}
         return LlmCompletion(
             content=str(message.get("content") or ""),
             tool_calls=tuple(calls),
-            input_tokens=_int_or_none(usage.get("prompt_tokens") or usage.get("input_tokens")),
-            output_tokens=_int_or_none(
-                usage.get("completion_tokens") or usage.get("output_tokens")
-            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             finish_reason=choice.get("finish_reason"),
             raw_message=message,
         )
@@ -212,7 +222,8 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 def _int_or_none(value: Any) -> int | None:
     try:
-        return int(value) if value is not None else None
+        result = int(value) if value is not None else None
+        return result if result is not None and result >= 0 else None
     except (TypeError, ValueError):
         return None
 

@@ -908,12 +908,13 @@ review:
   min_confidence: 0.82
   # 기본 8. 실제 repo 탐색량이 많으면 16 전후부터 조정하고, 무작정 크게 올리지 않습니다.
   max_tool_rounds: 8
-  # 큰 Change 한 건이 LLM/tool 자원을 무제한 소비하지 않도록 하는 job 전체 budget
+  # 불필요한 탐색을 제한하는 운영 예산. 장애 재실행 비용을 포함한 과금 hard cap은 아님
   max_candidate_chunks: 12
   max_llm_calls_per_job: 30
   max_tool_calls_per_job: 50
-  max_input_tokens_per_job: 300000
-  # DONE/SUPERSEDED job의 candidate checkpoint 보존 기간
+  verifier_budget_fraction: 0.3333333333333333
+  # 토큰은 참고 정보만 표시. 기존 max_input_tokens_per_job 설정은 허용하지만 무시함
+  # DONE/SUPERSEDED job의 candidate/verifier progress 보존 기간
   chunk_checkpoint_retention_days: 30
 
 service:
@@ -933,29 +934,101 @@ admin:
   password_env: "PE_REVIEW_ADMIN_PASSWORD"
 ```
 
-`max_candidate_chunks`, `max_llm_calls_per_job`, `max_tool_calls_per_job`,
-`max_input_tokens_per_job`은 **Change 한 건 전체**에 적용되는 안전 상한입니다. budget에 도달해도
-job을 실패시키지 않습니다. 이미 검토가 끝난 chunk의 결과는 유지하고, verifier를 통과한 finding만
-게시하며, 미검토 범위와 stop reason을 Gerrit summary 및 Job Audit에 표시합니다.
+`max_candidate_chunks`, `max_llm_calls_per_job`, `max_tool_calls_per_job`은 과도한 코드 탐색과
+불필요한 반복을 제한하는 **운영 예산**입니다. 전체 비용을 영구적으로 묶는 과금 상한은 아닙니다.
+정상적으로 예산에 도달하면 job을 무작정 retry하지 않고, 검증된 결과만 게시하며 미검토/미검증
+범위와 제한 사유를 Gerrit summary 및 Job Audit에 표시합니다.
 
-`max_input_tokens_per_job`은 provider가 반환한 누적 usage를 기준으로 **다음 LLM 호출을 차단**합니다.
-따라서 이미 시작된 한 호출이 threshold를 조금 넘어갈 수는 있습니다.
+`verifier_budget_fraction`은 verifier를 위해 보호하는 LLM/tool 예산 비율입니다. 초기값은 1/3이며
+실제 FW CR로 조정해야 합니다. 예를 들어 LLM 한도 30이면 candidate가 사용할 수 있는 범위는 20회,
+verifier 보호분은 10회입니다. candidate가 8회에 끝나면 verifier는 남은 22회를 사용할 수 있습니다.
+tool 한도 50에서는 올림하여 17회를 보호하고 candidate에 최대 33회를 허용합니다.
+
+각 chunk에 같은 횟수를 고정 배정하지 않습니다. candidate와 verifier 각각 내부에서 순환 실행하며
+한 번에 LLM 요청 하나 또는 tool 실행 하나를 진행합니다. 쉬운 chunk가 빨리 끝나면 나머지에 예산이
+돌아갑니다. 새 탐색 session의 첫 호출과 최종 응답 여력을 확보할 수 있는 범위만 시작합니다.
+마지막 한 번만 가능하면 도구 없는 제한된 검토를 수행하며, 시작조차 불가능한 범위는 미검토입니다.
+각 session의 마지막 호출은 처음부터 tools 없이 최종 JSON을 요청합니다. 필요한 탐색이 제한된
+결과는 JSON이 유효해도 부분 검토 상태를 유지하고 이전 finding의 해결 판정에 사용하지 않습니다.
+
+토큰 사전 계산, 토큰 예약, 누적 토큰에 의한 호출 차단은 사용하지 않습니다. 기존
+`max_input_tokens_per_job` 키는 업그레이드 호환 목적으로 읽지만 동작에는 영향을 주지 않습니다.
+API가 반환한 토큰 수는 Audit 참고 정보이며, 응답을 못 받은 요청의 토큰 수를 0으로 확정하지 않습니다.
+모델의 출력 길이 제한과 context 초과 시 분할은 별개의 안전장치로 유지됩니다.
 
 Admin Web의 **Settings → Review budget**에서도 같은 값을 저장할 수 있습니다. Review policy/budget은
 worker가 시작될 때 읽으므로 저장 직후에는 기존 process에 적용되지 않으며, 화면의
 **Restart required** 안내대로 `receiver` / `worker` / `reconciler`를 재시작해야 적용됩니다.
 
-candidate review는 chunk 하나가 끝날 때마다 PostgreSQL에 compact checkpoint를 남깁니다. 저장되는
-내용은 chunk hash/status, 경로 목록, change summary, candidate findings, token/LLM/tool usage이며 **전체
-diff, prompt, tool result 전문, reasoning transcript를 중복 저장하지 않습니다.** worker가 죽거나 Qwen
-timeout으로 REVIEW retry가 발생하면 같은 durable job(동일 revision + policy version)의 `DONE` chunk는
-LLM을 다시 호출하지 않고 복원합니다. context-limit 때문에 더 잘게 나눈 `SPLIT` 결정도 복원하며,
-실패한 chunk는 결과를 재사용하지 않되 `RETRY` usage를 누적해서 candidate 단계의 budget 사용량이
-retry 때 초기화되지 않게 합니다. verifier 자체는 checkpoint 대상이 아니며 retry 시 다시 실행됩니다.
+candidate chunk와 verifier batch 모두 완료 결과를 PostgreSQL의 compact progress에 저장합니다.
+결과, 경로/hash, 사용량, 제한 사유, context-limit 분할 결정과 검증 대상 후보 집합을 저장하며 **전체
+diff, prompt, tool result 전문, reasoning transcript를 중복 저장하지 않습니다.** 모델/정책/근거 context
+등이 동일할 때만 재사용합니다. verifier에 진입하기 전에 후보 집합과 candidate 범위를 확정하므로,
+검증 중 장애 후 복원하면서 candidate 탐색을 다시 열어 검증 대상을 바꾸지 않습니다.
 
-checkpoint는 장애복구용 cache입니다. 기본 `chunk_checkpoint_retention_days: 30`으로 DONE/SUPERSEDED
-job의 오래된 checkpoint를 reconciler가 정리합니다. `FAILED_PERMANENT`는 manual requeue 가능성이 있으므로
-자동 정리 대상에서 제외합니다. retention 값은 `config.yaml`에서 변경하며 서비스 재시작 후 적용됩니다.
+재시작 계산 예시는 `완료 A 5회 + 완료 B 4회 + 미완료 C 6회 후 장애`입니다. A/B는 결과를 재사용하고
+9회를 계속 차감합니다. C는 처음부터 다시 수행하므로 폐기된 6회는 재실행 예산에서 제외합니다.
+전체 한도 30에서 재실행에 남는 몫은 21회이며, 이 안에서도 verifier 보호분을 유지합니다. 이미 쓴
+C의 6회는 실제 호출 감사 기록에 그대로 남습니다. 정상적인 예산/round 제한 종료는 장애로 취급해
+환급하지 않습니다. 반복 timeout/잘못된 응답도 `retry.review_attempts`로 제한합니다.
+
+최종 응답에서도 유효한 JSON을 못 받거나 도구를 다시 요청하면 성공/문제없음으로 처리하지 않습니다.
+그 미완료 작업은 재시도 대상이며, 재시도도 소진하면 실패가 표시됩니다. 도구 실행 금지는 코드로
+강제하지만 JSON 의미나 FW 결함 판정의 정확성까지 보장하는 것은 아닙니다.
+
+Job Audit의 **Review progress / checkpoints**는 완료/분할/제한 상태를, **Actual invocation audit**는
+실패를 포함한 lifetime 요청 시도를 보여줍니다. 요청 전 intent를 저장하므로 `started`/unconfirmed는
+진행 중이거나 종료되어 결과 확인이 안 된 요청입니다. 실제 전송 직전 중단됐을 수도 있습니다.
+실패 재실행이 있으면 실제 총 요청 시도는 운영 예산보다 클 수 있습니다. 표시된 최신 100개를 넘어선
+기록도 DB에는 남고 합계에는 포함됩니다.
+
+업그레이드는 구 worker를 중지하고 migration 후 새 worker를 시작하십시오. 구 #16의 v1 checkpoint에는
+모델/context와 제한 상태 증명이 없으므로 새 엔진이 그 결과를 완전한 검토로 추정해 재사용하지 않습니다.
+기존 행과 알려진 사용량은 Audit에 보존하지만, 결과 자체를 재사용하지 않으므로 새 operational budget에서
+차감하지 않습니다. 즉 새 엔진은 해당 범위를 다시 검토하고, 새 v2 결과/제한 상태로 완료 여부를 판단합니다.
+예전 집계에 섞인 실패 비용은 정확히 분리할 수 없습니다. 기존에 게시 완료된 review를 업데이트 때문에
+자동 재게시하지 않습니다.
+
+progress는 장애복구용 cache입니다. 기본 `chunk_checkpoint_retention_days: 30`으로 DONE/SUPERSEDED
+job의 오래된 cache를 reconciler가 정리합니다. 실제 호출 audit은 job 생명주기 동안 보존합니다.
+`FAILED_PERMANENT`는 수동 requeue 가능성이 있어 cache 자동 정리에서 제외합니다. 정상 예산 종료 후
+게시까지 완료된 `DONE`은 기존 실패-job requeue 대상이 아니며, 예산을 올렸다고 자동 재검토하지 않습니다.
+
+### 향후 선택 가능한 방향: Jenkins build metadata 기반 C semantic evidence
+
+현재 reviewer는 각 FW repo의 build command를 필수로 알지 않아도 동작합니다. 이 원칙은 유지합니다.
+향후 실제 DMC/FW replay에서 검출력 향상이 충분히 확인될 경우에만, **선택 기능**으로 compiler/build-aware
+C semantic evidence를 추가하는 방향을 고려할 수 있습니다. 이 기능이 없어도 지금의 diff + repository tool
++ Qwen candidate/verifier 리뷰는 그대로 동작해야 하며, 새 project를 enable할 때 build command 입력을
+필수 onboarding 절차로 만들지 않습니다.
+
+현실적인 연결점은 기존 Jenkins입니다. Jenkins가 reviewer와 다른 서버에서 실행되어도 상관없으며,
+성공 build가 다음과 같은 작은 artifact를 남기면 reviewer가 필요할 때 가져와 사용할 수 있습니다.
+
+```text
+metadata.json
+  project / branch / revision SHA / target / build number
+
+compile_commands.json
+  source file별 실제 compiler / -D / -I / target option
+
+generated headers (선택)
+  semantic 분석에 정말 필요한 경우에만 추가
+```
+
+우선순위는 `동일 revision artifact > 호환 가능한 동일 branch의 최근 성공 build > semantic evidence 없음`
+순으로 생각합니다. 정확히 일치하지 않는 baseline artifact를 사용할 때는 provenance를 명확히 남겨야 하며,
+현재 Patch Set의 compile option이 달라졌을 가능성을 무시해서는 안 됩니다. 아무 artifact도 없으면 semantic
+분석만 생략하고 기존 reviewer로 정상 진행합니다.
+
+이 방향의 목적은 Jenkins나 전체 FW toolchain을 review 서버로 옮기는 것이 아닙니다. Jenkins가 이미 알고
+있는 build 정보를 재사용해 type/macro/configuration/call/data-flow 같은 C 의미 근거를 reviewer에 공급하고,
+Qwen이 그 근거를 diff와 domain context에 맞춰 triage/검증하는 구조입니다. Static analyzer 경고를 그대로
+Gerrit에 게시하는 구조는 피합니다.
+
+초기 적용 대상은 DMC가 될 수 있지만 core에 DMC build command를 박지 않습니다. 다른 FW repo와 branch로
+확장 가능하도록 optional adapter/profile 형태를 전제로 하며, 실제 도입 여부와 투자 범위는 historical DMC
+CR/버그 replay에서 recall, precision, false-positive, latency 개선폭을 확인한 뒤 결정합니다.
 
 ---
 

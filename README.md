@@ -29,16 +29,28 @@ summary plus native inline/range comments.
   subject, branch, and the bounded current commit message are supplied as untrusted intent hints,
   while the Patch Set diff remains authoritative. The change summary is preserved even when there
   are zero publishable findings.
-- Per-job review budgets cap candidate chunks, LLM calls, repository-tool executions, and cumulative
-  reported input tokens. Reaching a budget does not fail the durable job: only findings that completed
-  verification are publishable, finding-lineage resolution is disabled for incomplete reviews, and
-  Gerrit/Admin explicitly disclose the reviewed coverage and stop reason.
-- Candidate chunk work is checkpointed in PostgreSQL after each completed chunk (and after deterministic
-  context-limit splits). A retry/restart reuses those compact results instead of rerunning finished LLM
-  work; transient failed-chunk usage is also carried forward so candidate-phase budget accounting does
-  not reset for resumed chunks.
-  Checkpoints store hashes/results/usage rather than full diffs or model transcripts, and old checkpoints
-  for DONE/SUPERSEDED jobs are pruned by retention policy.
+- Operational budgets limit candidate chunks, LLM requests and repository-tool executions. A
+  configurable verifier reserve (initially one third) prevents candidate exploration from consuming
+  all verification capacity. Candidate chunks and verifier batches take turns; every active session
+  protects a final response slot, sent without tools. Unused candidate capacity goes to verification.
+- Budgets limit excessive exploration, not lifetime billing. Completed candidate/verifier results
+  remain charged on resume. A failed unfinished session restarts from its initial prompt without its
+  abandoned execution's charges, under the separate durable review retry limit. Actual lifetime
+  request attempts, including failures and unconfirmed in-flight requests, are audited separately and
+  can exceed the operational allowance. Normal budget/round stops never create a fresh allowance.
+- Token usage is informational only. Existing `max_input_tokens_per_job` settings are accepted but
+  ignored; there is no token admission, reservation, or cumulative-token stop.
+- Context-bound progress stores completed results, deterministic context splits, limitations and a
+  frozen verification candidate set in PostgreSQL. No full diff, prompt, tool output or reasoning
+  transcript is duplicated into checkpoints. A restart cannot silently promote partial work to complete
+  work or reopen candidate exploration after verification starts. Incomplete reviews never classify
+  omitted prior findings as fixed. Candidate selection truncation is disclosed after exact deduplication.
+- Result caches for old DONE/SUPERSEDED jobs expire by retention policy; invocation audit stays for the
+  job lifetime. Legacy v1 checkpoints remain visible for upgrade audit. Their missing model/context/
+  completeness identity is not guessed: old findings are not automatically trusted and their known
+  usage is shown only as legacy audit data. Because that work is not reused, it is not charged against
+  the new operational allowance. No deployed FW quality claim or optimal reserve ratio is implied by
+  these recovery guarantees.
 - Merge commits are currently safe-skipped with a visible Gerrit summary rather than reviewed
   against an incorrect first-parent diff. Gerrit 3.8 uses its auto-merge base for merge diffs; a
   future merge-review path must ingest that Gerrit DiffInfo before native inline comments are safe.
@@ -68,6 +80,25 @@ summary plus native inline/range comments.
   `pe-review-agent requeue --job-id <uuid>`. Requeue preserves prior attempt history, starts a new
   retry-budget epoch, refuses stale Patch Sets, and resumes from a durable review/publication intent
   when one exists instead of rerunning Qwen.
+
+## Potential future direction: optional build-aware C evidence
+
+The current reviewer intentionally works without owning each firmware repository's build system. A
+possible future accuracy upgrade is an **optional** C semantic-evidence layer fed by existing CI,
+especially for compile-configuration-sensitive or cross-function defects. This is not a current
+runtime dependency and should not make repository onboarding require a manually entered build command.
+
+One practical shape is for an existing Jenkins build, even when Jenkins runs on another server, to
+publish compact artifacts such as `compile_commands.json` plus project/branch/revision/target metadata.
+The reviewer could consume an exact-revision artifact when available, otherwise a clearly identified
+compatible branch baseline, and fall back to the existing diff + repository-tool + LLM review when no
+semantic artifact exists. Generated headers may be added only when needed; the full build workspace or
+toolchain does not need to move onto the review server.
+
+This direction is deliberately deferred until real DMC/FW replay data shows worthwhile recall/precision
+gain. If pursued, the semantic layer should enrich candidate/verifier evidence rather than publish raw
+static-analyzer warnings directly to Gerrit, and it should remain generic enough to support other
+firmware repositories with different branches and build systems.
 
 ## Runtime topology
 

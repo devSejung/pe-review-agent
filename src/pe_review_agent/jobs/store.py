@@ -35,6 +35,7 @@ from pe_review_agent.jobs.models import (
     PublicationStatus,
     ReviewChunkCheckpoint,
     ReviewFinding,
+    ReviewProgressRow,
     ReviewResultRow,
     ServiceState,
 )
@@ -806,8 +807,8 @@ class JobStore:
                 )
             )
 
-    async def prune_candidate_chunk_checkpoints(self, *, retention_days: int) -> int:
-        """Delete old recovery-only checkpoints for terminal DONE/SUPERSEDED jobs."""
+    async def prune_review_recovery_cache(self, *, retention_days: int) -> int:
+        """Delete old v1/v2 recovery cache for terminal DONE/SUPERSEDED jobs."""
 
         cutoff = datetime.now(UTC) - timedelta(days=retention_days)
         terminal_job_ids = select(Job.id).where(
@@ -820,7 +821,14 @@ class JobStore:
                     ReviewChunkCheckpoint.updated_at <= cutoff,
                 )
             )
-            return int(result.rowcount or 0)
+            progress_result = await session.execute(
+                delete(ReviewProgressRow).where(
+                    ReviewProgressRow.job_id.in_(terminal_job_ids),
+                    ReviewProgressRow.updated_at <= cutoff,
+                )
+            )
+            # Invocation audit is not a cache; keep it for the lifetime of the job.
+            return int(result.rowcount or 0) + int(progress_result.rowcount or 0)
 
     async def save_review_result_and_mark_ready(
         self,
