@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from pe_review_agent.admin import ControlStore
+from pe_review_agent.admin import ControlStore, OperationsStore
 from pe_review_agent.admin.web import create_admin_app
 from pe_review_agent.config import Settings
 from pe_review_agent.db import Database
@@ -23,7 +23,8 @@ from pe_review_agent.domain import (
     Severity,
 )
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
-from pe_review_agent.jobs.models import ServiceState
+from pe_review_agent.jobs.models import Job, ServiceState
+from pe_review_agent.operations import settings_fingerprint
 from pe_review_agent.retry import PermanentError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 
@@ -66,7 +67,8 @@ async def _truncate(settings: Settings) -> None:
         async with database.session() as session:
             await session.execute(
                 text(
-                    "TRUNCATE review_managed_projects, review_service_state, review_publications, "
+                    "TRUNCATE review_service_heartbeats, review_managed_projects, "
+                    "review_service_state, review_publications, "
                     "review_findings, review_results, review_attempts, review_jobs "
                     "RESTART IDENTITY CASCADE"
                 )
@@ -84,6 +86,21 @@ async def _effective_review_settings(settings: Settings):  # type: ignore[no-unt
         return effective.review
     finally:
         await database.close()
+
+
+async def _dashboard_snapshot(
+    control: ControlStore,
+    operations: OperationsStore,
+    *,
+    service_enabled: bool,
+) -> dict[str, object]:
+    projects = await control.list_projects()
+    return await operations.dashboard_snapshot(
+        service_enabled=service_enabled,
+        enabled_projects={project.project for project in projects if project.enabled},
+        projects_total=len(projects),
+        config=await control.config_change_status(),
+    )
 
 
 async def _failed_job(settings: Settings):  # type: ignore[no-untyped-def]
@@ -475,7 +492,9 @@ async def test_project_review_scope_can_switch_and_reenable_resets_from_now_cuto
             review_policy_version="firmware-v1",
         )
 
-        before_from_now = datetime.now(UTC)
+        async with database.session() as session:
+            before_from_now = await session.scalar(text("SELECT now()"))
+        assert before_from_now is not None
         from_now = await control.set_project_review_start_mode(
             "team/fw", ProjectReviewStartMode.FROM_NOW
         )
@@ -486,7 +505,9 @@ async def test_project_review_scope_can_switch_and_reenable_resets_from_now_cuto
         assert queued_after.state is JobState.SKIPPED_SCOPE
 
         await control.set_project_enabled("team/fw", False)
-        before_reenable = datetime.now(UTC)
+        async with database.session() as session:
+            before_reenable = await session.scalar(text("SELECT now()"))
+        assert before_reenable is not None
         reenabled = await control.set_project_enabled("team/fw", True)
         assert reenabled.review_start_at is not None
         assert reenabled.review_start_at >= before_reenable
@@ -543,6 +564,334 @@ async def test_admin_pause_restart_then_resume_keeps_bootstrap_switch_live(tmp_p
         await database.close()
 
 
+@pytest.mark.asyncio
+async def test_config_generation_and_heartbeat_application_are_durable(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        operations = OperationsStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        original, generation = await control.effective_settings_with_generation(settings)
+        assert generation == 0
+
+        # Live pause/resume does not require process restart and therefore does not advance the
+        # startup configuration generation.
+        await control.set_service_enabled(settings, False)
+        assert await control.current_config_generation() == 0
+
+        changed_model = original.llm.model + "-ops"
+        await control.replace_runtime_sections(
+            settings,
+            {
+                "llm": {
+                    "base_url": original.llm.base_url,
+                    "model": changed_model,
+                    "temperature": original.llm.temperature,
+                    "max_output_tokens": original.llm.max_output_tokens,
+                }
+            },
+        )
+        changed, generation = await control.effective_settings_with_generation(settings)
+        assert generation == 1
+        assert (await control.config_change_status())["changed_sections"] == ["llm"]
+
+        now = datetime.now(UTC)
+        old_fingerprint = settings_fingerprint(original)
+        new_fingerprint = settings_fingerprint(changed)
+        for component in ("admin", "worker", "reconciler"):
+            await operations.record_service_heartbeat(
+                component=component,
+                instance_id=f"{component}-1",
+                version="0.1.0",
+                revision="a" * 40,
+                config_fingerprint=new_fingerprint,
+                applied_config_generation=1,
+                started_at=now,
+            )
+        await operations.record_service_heartbeat(
+            component="receiver",
+            instance_id="receiver-1",
+            version="0.1.0",
+            revision="a" * 40,
+            config_fingerprint=old_fingerprint,
+            applied_config_generation=0,
+            started_at=now,
+        )
+        await operations.record_service_heartbeat(
+            component="receiver",
+            instance_id="receiver-2",
+            version="0.1.0",
+            revision="a" * 40,
+            config_fingerprint=new_fingerprint,
+            applied_config_generation=1,
+            started_at=now,
+        )
+
+        status = await operations.operational_status(await control.config_change_status())
+        assert status["config"]["pending_components"] == ["receiver"]
+        assert status["config"]["drift_components"] == ["receiver"]
+        assert status["config"]["all_applied"] is False
+
+        await operations.record_service_heartbeat(
+            component="receiver",
+            instance_id="receiver-1",
+            version="0.1.0",
+            revision="a" * 40,
+            config_fingerprint=new_fingerprint,
+            applied_config_generation=1,
+            started_at=now,
+        )
+        status = await operations.operational_status(await control.config_change_status())
+        assert status["config"]["pending_components"] == []
+        assert status["config"]["drift_components"] == []
+        assert status["config"]["all_applied"] is True
+        assert status["mixed_revisions"] is False
+
+        # Submitting the identical form is not a configuration change.
+        await control.replace_runtime_sections(
+            settings,
+            {
+                "llm": {
+                    "base_url": changed.llm.base_url,
+                    "model": changed.llm.model,
+                    "temperature": changed.llm.temperature,
+                    "max_output_tokens": changed.llm.max_output_tokens,
+                }
+            },
+        )
+        assert await control.current_config_generation() == 1
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_groups_failed_overdue_and_stuck_jobs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        operations = OperationsStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        effective, generation = await control.effective_settings_with_generation(settings)
+        now = datetime.now(UTC)
+        fingerprint = settings_fingerprint(effective)
+        for component in ("receiver", "worker", "reconciler", "admin"):
+            await operations.record_service_heartbeat(
+                component=component,
+                instance_id=f"{component}-attention",
+                version="0.1.0",
+                revision="b" * 40,
+                config_fingerprint=fingerprint,
+                applied_config_generation=generation,
+                started_at=now,
+            )
+
+        async with database.sessions.begin() as session:
+            common = {
+                "project": "team/fw",
+                "patchset_number": 1,
+                "review_policy_version": "firmware-v1",
+                "event_payload": {},
+                "attempt_count": 1,
+                "retry_epoch_start_attempt": 0,
+                "created_at": now - timedelta(hours=1),
+            }
+            session.add_all(
+                [
+                    Job(
+                        **common,
+                        change_number=1201,
+                        revision_sha="1" * 40,
+                        state=JobState.FAILED_PERMANENT.value,
+                        next_attempt_at=now,
+                        last_error_class="PermanentError",
+                        last_error="review failed for attention test",
+                        updated_at=now - timedelta(minutes=20),
+                    ),
+                    Job(
+                        **common,
+                        change_number=1202,
+                        revision_sha="2" * 40,
+                        state=JobState.RETRY_WAIT.value,
+                        retry_state=JobState.REVIEWING.value,
+                        next_attempt_at=now - timedelta(minutes=5),
+                        updated_at=now - timedelta(minutes=5),
+                    ),
+                    Job(
+                        **common,
+                        change_number=1203,
+                        revision_sha="3" * 40,
+                        state=JobState.REVIEWING.value,
+                        next_attempt_at=now,
+                        lease_owner="dead-worker",
+                        lease_expires_at=now - timedelta(minutes=3),
+                        claimed_at=now - timedelta(minutes=20),
+                        updated_at=now - timedelta(minutes=3),
+                    ),
+                    Job(
+                        **common,
+                        change_number=1204,
+                        revision_sha="4" * 40,
+                        state=JobState.READY_TO_PUBLISH.value,
+                        next_attempt_at=now,
+                        updated_at=now - timedelta(minutes=10),
+                    ),
+                    Job(
+                        **common,
+                        change_number=1205,
+                        revision_sha="5" * 40,
+                        state=JobState.PUBLISHING.value,
+                        next_attempt_at=now,
+                        lease_owner="silent-worker",
+                        lease_expires_at=now + timedelta(minutes=5),
+                        claimed_at=now - timedelta(minutes=10),
+                        updated_at=now - timedelta(minutes=6),
+                    ),
+                ]
+            )
+
+        snapshot = await _dashboard_snapshot(control, operations, service_enabled=True)
+        kinds = {item["kind"] for item in snapshot["attention"]}
+        assert {
+            "failed-job",
+            "overdue-retry",
+            "expired-lease",
+            "publish-queue",
+            "stale-active",
+        } <= kinds
+        assert not {item["kind"] for item in snapshot["attention"]} & {
+            "component",
+            "config",
+        }
+
+        paused = await _dashboard_snapshot(control, operations, service_enabled=False)
+        paused_kinds = {item["kind"] for item in paused["attention"]}
+        assert "failed-job" in paused_kinds
+        assert not paused_kinds & {
+            "overdue-retry",
+            "expired-lease",
+            "publish-queue",
+            "stale-active",
+        }
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_attention_count_is_exact_when_rendering_is_capped(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        operations = OperationsStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        effective, generation = await control.effective_settings_with_generation(settings)
+        now = datetime.now(UTC)
+        fingerprint = settings_fingerprint(effective)
+        for component in ("receiver", "worker", "reconciler", "admin"):
+            await operations.record_service_heartbeat(
+                component=component,
+                instance_id=f"{component}-bulk",
+                version="0.1.0",
+                revision="d" * 40,
+                config_fingerprint=fingerprint,
+                applied_config_generation=generation,
+                started_at=now,
+            )
+        async with database.sessions.begin() as session:
+            session.add_all(
+                [
+                    Job(
+                        project="team/fw",
+                        change_number=20_000 + index,
+                        patchset_number=1,
+                        revision_sha=f"{index:040x}",
+                        review_policy_version="firmware-v1",
+                        state=JobState.FAILED_PERMANENT.value,
+                        event_payload={},
+                        attempt_count=1,
+                        retry_epoch_start_attempt=0,
+                        next_attempt_at=now,
+                        last_error_class="PermanentError",
+                        last_error="bulk attention test",
+                        created_at=now - timedelta(hours=1),
+                        updated_at=now - timedelta(minutes=index + 1),
+                    )
+                    for index in range(205)
+                ]
+            )
+
+        snapshot = await _dashboard_snapshot(control, operations, service_enabled=True)
+        rendered_jobs = [item for item in snapshot["attention"] if item.get("job") is not None]
+        assert snapshot["attention_count"] == 205
+        assert snapshot["attention_truncated"] is True
+        assert len(rendered_jobs) == 200
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_service_heartbeat_reports_stale_stop_and_prunes_history(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        operations = OperationsStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+        effective, generation = await control.effective_settings_with_generation(settings)
+        now = datetime.now(UTC)
+        await operations.record_service_heartbeat(
+            component="receiver",
+            instance_id="receiver-lifecycle",
+            version="0.1.0",
+            revision="c" * 40,
+            config_fingerprint=settings_fingerprint(effective),
+            applied_config_generation=generation,
+            started_at=now - timedelta(hours=1),
+        )
+        async with database.sessions.begin() as session:
+            await session.execute(
+                text(
+                    "UPDATE review_service_heartbeats "
+                    "SET last_seen_at = :last_seen "
+                    "WHERE component = 'receiver' AND instance_id = 'receiver-lifecycle'"
+                ),
+                {"last_seen": now - timedelta(minutes=2)},
+            )
+
+        status = await operations.operational_status(await control.config_change_status())
+        receiver = next(
+            item for item in status["components"] if item["component"] == "receiver"
+        )
+        assert receiver["status"] == "stale"
+
+        await operations.stop_service_heartbeat("receiver", "receiver-lifecycle")
+        status = await operations.operational_status(await control.config_change_status())
+        receiver = next(
+            item for item in status["components"] if item["component"] == "receiver"
+        )
+        assert receiver["status"] == "stopped"
+
+        async with database.sessions.begin() as session:
+            await session.execute(
+                text(
+                    "UPDATE review_service_heartbeats "
+                    "SET last_seen_at = :last_seen "
+                    "WHERE component = 'receiver' AND instance_id = 'receiver-lifecycle'"
+                ),
+                {"last_seen": now - timedelta(days=31)},
+            )
+        assert await operations.prune_service_heartbeats(retention_days=30) == 1
+        assert await operations.list_service_heartbeats() == []
+    finally:
+        await database.close()
+
+
 def test_admin_requires_auth_and_mutations_are_csrf_protected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -555,6 +904,8 @@ def test_admin_requires_auth_and_mutations_are_csrf_protected(
         response = client.get("/", auth=("ops", "correct-horse"))
         assert response.status_code == 200
         assert "Gerrit AI Reviewer" in response.text
+        assert "Process liveness" in response.text
+        assert "starting" in response.text
 
         no_csrf = client.post(
             "/api/projects",
@@ -602,6 +953,11 @@ def test_admin_live_controls_runtime_config_and_requeue(
 
     with TestClient(create_admin_app(settings)) as client:
         auth = ("ops", "correct-horse")
+        dashboard = client.get("/", auth=auth)
+        assert dashboard.status_code == 200
+        assert "Needs attention" in dashboard.text
+        assert "failed permanently" in dashboard.text
+
         page = client.get("/settings", auth=auth)
         csrf = client.cookies.get("pe_review_csrf")
         assert page.status_code == 200 and csrf
@@ -639,6 +995,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
         )
         assert saved_connections.status_code == 200
         assert saved_connections.json()["restart_required"] is True
+        assert saved_connections.json()["config_generation"] == 1
 
         saved_review = client.put(
             "/api/runtime-config",
@@ -659,6 +1016,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
         )
         assert saved_review.status_code == 200
         assert saved_review.json()["restart_required"] is True
+        assert saved_review.json()["config_generation"] == 2
 
         settings_page = client.get("/settings", auth=auth)
         assert 'value="en-US" selected' in settings_page.text
@@ -686,6 +1044,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
         )
         assert reset_review.status_code == 200
         assert reset_review.json()["restart_required"] is True
+        assert reset_review.json()["config_generation"] == 3
         reset_settings = client.get("/settings", auth=auth)
         assert 'value="ko-KR" selected' in reset_settings.text
         assert "Review policy source:</strong> config.yaml" in reset_settings.text
@@ -694,6 +1053,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
         assert "gerrit-new" in connections.text
         assert "qwen-new" in connections.text
         assert "Saved DB connection overrides are active" in connections.text
+        assert "Configuration generation 3 is not fully applied" in connections.text
 
         reset_connections = client.post(
             "/api/runtime-config/reset-connections",
@@ -703,6 +1063,7 @@ def test_admin_live_controls_runtime_config_and_requeue(
         )
         assert reset_connections.status_code == 200
         assert reset_connections.json()["restart_required"] is True
+        assert reset_connections.json()["config_generation"] == 4
         reset_page = client.get("/connections", auth=auth)
         assert "config.yaml (no saved Admin connection overrides)" in reset_page.text
 

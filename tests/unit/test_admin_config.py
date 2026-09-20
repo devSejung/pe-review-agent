@@ -7,6 +7,7 @@ from pe_review_agent.admin.store import _attempt_display_status
 from pe_review_agent.admin.web import create_admin_app
 from pe_review_agent.config import Settings
 from pe_review_agent.jobs.models import Attempt, Job
+from pe_review_agent.operations import settings_fingerprint
 
 
 def _settings(*, host: str, auth_mode: str) -> Settings:
@@ -52,3 +53,16 @@ def test_attempt_status_distinguishes_running_from_abandoned() -> None:
     assert _attempt_display_status(job, running, now) == "success"
     abandoned.success = False
     assert _attempt_display_status(job, abandoned, now) == "failed"
+
+
+def test_runtime_fingerprint_excludes_live_project_enablement() -> None:
+    settings = _settings(host="127.0.0.1", auth_mode="basic")
+    changed_projects = settings.model_copy(
+        update={
+            "gerrit": settings.gerrit.model_copy(
+                update={"projects": ["team/other-fw"]},
+            )
+        }
+    )
+
+    assert settings_fingerprint(settings) == settings_fingerprint(changed_projects)

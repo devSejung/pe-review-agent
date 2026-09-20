@@ -70,7 +70,9 @@
         const result = await api('/api/runtime-config', {
           method: 'PUT', body: JSON.stringify(formPayload(form)),
         });
-        show(result.detail || 'Runtime configuration saved.', result.restart_required ? 'warning' : 'success');
+        const generation = result.config_generation === undefined ? '' : ` Generation ${result.config_generation}.`;
+        show(`${result.detail || 'Runtime configuration saved.'}${generation}`, result.restart_required ? 'warning' : 'success');
+        if (result.restart_required) window.setTimeout(() => window.location.reload(), 800);
       } catch (error) { show(error.message, 'danger'); }
       finally { form.classList.remove('api-busy'); }
     });

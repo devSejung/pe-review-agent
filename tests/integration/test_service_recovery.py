@@ -266,7 +266,8 @@ async def test_publish_response_loss_recovers_without_rerunning_review(
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE review_managed_projects, review_publications, review_findings, "
+                "TRUNCATE review_service_heartbeats, review_managed_projects, "
+                "review_publications, review_findings, "
                 "review_results, "
                 "review_attempts, review_jobs RESTART IDENTITY CASCADE"
             )
@@ -1069,7 +1070,8 @@ async def _truncate(database: Database) -> None:
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE review_managed_projects, review_publications, review_findings, "
+                "TRUNCATE review_service_heartbeats, review_managed_projects, "
+                "review_publications, review_findings, "
                 "review_results, "
                 "review_attempts, review_jobs RESTART IDENTITY CASCADE"
             )
