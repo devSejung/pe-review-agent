@@ -8,6 +8,7 @@ from pe_review_agent.jobs.models import (
     ReviewChunkCheckpointStatus,
     ReviewFinding,
     ReviewResultRow,
+    ServiceHeartbeatRow,
 )
 from pe_review_agent.jobs.store import JobRecord, JobStore, PublishGuardStatus
 
@@ -24,4 +25,5 @@ __all__ = [
     "ReviewChunkCheckpointStatus",
     "ReviewFinding",
     "ReviewResultRow",
+    "ServiceHeartbeatRow",
 ]

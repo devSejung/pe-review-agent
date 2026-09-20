@@ -7,15 +7,36 @@
       <div class="page-pretitle">Operations</div>
       <h2 class="page-title">Dashboard</h2>
     </div>
-    <div class="col-auto ms-auto">
-      {% if snapshot.service_enabled %}
-      <span class="badge bg-green-lt fs-6">Review service enabled</span>
-      {% else %}
-      <span class="badge bg-red-lt fs-6">Review service paused</span>
-      {% endif %}
+    <div class="col-auto ms-auto d-flex gap-2">
+      {% if snapshot.attention_count %}<span class="badge bg-red-lt fs-6">{{ snapshot.attention_count }} need attention</span>{% endif %}
+      {% if snapshot.service_enabled %}<span class="badge bg-green-lt fs-6">Review enabled</span>{% else %}<span class="badge bg-secondary-lt fs-6">Review paused</span>{% endif %}
     </div>
   </div>
 </div>
+
+{% if snapshot.attention %}
+<div class="card border-danger mb-4">
+  <div class="card-header"><h3 class="card-title text-danger">Needs attention</h3><div class="card-actions text-secondary">Showing up to 20 of {{ snapshot.attention_count }}</div></div>
+  <div class="list-group list-group-flush">
+    {% for item in snapshot.attention[:20] %}
+    <div class="list-group-item">
+      <div class="d-flex align-items-start gap-3">
+        <span class="badge {% if item.severity == 'danger' %}bg-red-lt{% else %}bg-yellow-lt{% endif %}">{{ item.kind }}</span>
+        <div class="flex-fill">
+          <div class="fw-semibold">{{ item.title }}</div>
+          <div class="text-secondary small mt-1">{{ item.detail }}</div>
+        </div>
+        <div class="btn-list flex-nowrap">
+          <a class="btn btn-sm btn-outline-secondary" href="{{ item.href }}">{{ item.action }}</a>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% else %}
+<div class="alert alert-success mb-4"><strong>All systems operational.</strong> No failed, overdue, unowned, or configuration-drift condition requires action.</div>
+{% endif %}
 
 <div class="row row-deck row-cards mb-4">
   <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">Jobs / 24h</div><div class="h1 mb-0">{{ snapshot.recent_24h }}</div></div></div></div>
@@ -24,21 +45,57 @@
   <div class="col-sm-6 col-lg-3"><div class="card"><div class="card-body"><div class="subheader">Queue / active</div><div class="h1 mb-0">{{ snapshot.states.get('RECEIVED', 0) + snapshot.states.get('RETRY_WAIT', 0) + snapshot.states.get('FETCHING', 0) + snapshot.states.get('REVIEWING', 0) + snapshot.states.get('VALIDATING', 0) + snapshot.states.get('READY_TO_PUBLISH', 0) + snapshot.states.get('PUBLISHING', 0) }}</div></div></div></div>
 </div>
 
+<div class="row row-cards mb-4">
+  <div class="col-xl-8">
+    <div class="card h-100">
+      <div class="card-header"><h3 class="card-title">Process liveness</h3><div class="card-actions text-secondary small">Heartbeat stale after 60s</div></div>
+      <div class="table-responsive">
+        <table class="table table-vcenter card-table">
+          <thead><tr><th>Component</th><th>Status</th><th>Version / revision</th><th>Config</th><th>Last heartbeat</th></tr></thead>
+          <tbody>
+          {% for component in snapshot.operations.components %}
+          <tr>
+            <td class="fw-semibold">{{ component.component }}</td>
+            <td><span class="badge {% if component.status == 'healthy' %}bg-green-lt{% elif component.status in ['starting','stale'] %}bg-yellow-lt{% else %}bg-red-lt{% endif %}">{{ component.status }}</span>{% if component.active_instances > 1 %}<span class="text-secondary small ms-1">×{{ component.active_instances }}</span>{% endif %}</td>
+            <td><div>{{ component.version or 'unknown' }}</div><code>{{ component.revision_short }}</code></td>
+            <td>
+              <span class="badge {% if component.generation_current %}bg-green-lt{% else %}bg-yellow-lt{% endif %}">gen {{ component.applied_config_generation if component.applied_config_generation is not none else '—' }}</span>
+              {% if not component.fingerprint_current and component.active_instances %}<span class="badge bg-orange-lt">settings drift</span>{% endif %}
+            </td>
+            <td class="text-secondary">{{ component.last_seen_age }}{% if component.last_seen_at %} ago{% endif %}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-xl-4">
+    <div class="card h-100">
+      <div class="card-header"><h3 class="card-title">Configuration application</h3></div>
+      <div class="card-body">
+        <div class="subheader">Current generation</div><div class="h1">{{ snapshot.operations.config.generation }}</div>
+        {% if snapshot.operations.config.changed_at %}<div class="text-secondary small mb-3">Last changed {{ snapshot.operations.config.changed_at }}</div>{% endif %}
+        <div class="mb-2"><strong>Changed sections:</strong> {{ snapshot.operations.config.changed_sections | join(', ') or 'none' }}</div>
+        {% if snapshot.operations.config.pending_components %}
+        <div class="alert alert-warning py-2 mb-0">Pending: <code>{{ snapshot.operations.config.pending_components | join(', ') }}</code></div>
+        {% else %}
+        <div class="alert alert-success py-2 mb-0">All running services loaded the current configuration.</div>
+        {% endif %}
+        {% if snapshot.operations.config.drift_components %}
+        <div class="alert alert-warning py-2 mt-2 mb-0">Settings drift: <code>{{ snapshot.operations.config.drift_components | join(', ') }}</code></div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="row row-cards">
   <div class="col-lg-4">
     <div class="card h-100">
       <div class="card-header"><h3 class="card-title">Job states</h3></div>
       <div class="card-body">
-        {% if snapshot.states %}
-          {% for state, count in snapshot.states.items() %}
-          <div class="d-flex align-items-center mb-3">
-            <div class="flex-fill"><span class="state-dot state-{{ state|lower }}"></span>{{ state }}</div>
-            <div class="fw-semibold">{{ count }}</div>
-          </div>
-          {% endfor %}
-        {% else %}
-          <div class="empty-state">No jobs yet. Add a test project and upload a Patch Set.</div>
-        {% endif %}
+        {% if snapshot.states %}{% for state, count in snapshot.states.items() %}<div class="d-flex align-items-center mb-3"><div class="flex-fill"><span class="state-dot state-{{ state|lower }}"></span>{{ state }}</div><div class="fw-semibold">{{ count }}</div></div>{% endfor %}{% else %}<div class="empty-state">No jobs yet. Add a test project and upload a Patch Set.</div>{% endif %}
       </div>
     </div>
   </div>
@@ -46,20 +103,9 @@
     <div class="card">
       <div class="card-header"><h3 class="card-title">Recent jobs</h3><div class="card-actions"><a href="/jobs" class="btn btn-sm btn-outline-primary">View all</a></div></div>
       <div class="table-responsive">
-        <table class="table table-vcenter card-table">
-          <thead><tr><th>Project</th><th>Change</th><th>Patch Set</th><th>State</th><th>Updated</th></tr></thead>
-          <tbody>
-          {% for job in snapshot.recent_jobs %}
-          <tr>
-            <td class="text-truncate project-cell"><a href="/jobs/{{ job.id }}" class="text-reset fw-medium">{{ job.project }}</a></td>
-            <td><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a></td>
-            <td>{{ job.patchset_number }}</td>
-            <td><span class="badge bg-secondary-lt">{{ job.state }}</span></td>
-            <td class="text-secondary">{{ job.updated_at }}</td>
-          </tr>
-          {% else %}<tr><td colspan="5" class="text-center text-secondary py-5">No review jobs yet.</td></tr>{% endfor %}
-          </tbody>
-        </table>
+        <table class="table table-vcenter card-table"><thead><tr><th>Project</th><th>Change</th><th>Patch Set</th><th>State</th><th>Updated</th></tr></thead><tbody>
+          {% for job in snapshot.recent_jobs %}<tr><td class="text-truncate project-cell"><a href="/jobs/{{ job.id }}" class="text-reset fw-medium">{{ job.project }}</a></td><td><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a></td><td>{{ job.patchset_number }}</td><td><span class="badge bg-secondary-lt">{{ job.state }}</span></td><td class="text-secondary">{{ job.updated_at }}</td></tr>{% else %}<tr><td colspan="5" class="text-center text-secondary py-5">No review jobs yet.</td></tr>{% endfor %}
+        </tbody></table>
       </div>
     </div>
   </div>

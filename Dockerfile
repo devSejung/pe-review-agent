@@ -22,11 +22,18 @@ FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1
 # by the host OS. When omitted, the image keeps its normal Debian sources.
 ARG APT_DEBIAN_MIRROR_URL=""
 ARG APT_DEBIAN_SECURITY_MIRROR_URL=""
+ARG PE_REVIEW_BUILD_SHA="unknown"
+ARG PE_REVIEW_BUILD_VERSION="0.1.0"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PE_REVIEW_CONFIG=/etc/pe-review-agent/config.yaml
+    PE_REVIEW_CONFIG=/etc/pe-review-agent/config.yaml \
+    PE_REVIEW_BUILD_SHA=${PE_REVIEW_BUILD_SHA} \
+    PE_REVIEW_BUILD_VERSION=${PE_REVIEW_BUILD_VERSION}
+
+LABEL org.opencontainers.image.revision=${PE_REVIEW_BUILD_SHA}
+LABEL org.opencontainers.image.version=${PE_REVIEW_BUILD_VERSION}
 
 RUN set -eux; \
     for sources in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \

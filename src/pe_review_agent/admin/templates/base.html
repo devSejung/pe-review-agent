@@ -42,7 +42,11 @@
     <header class="navbar navbar-expand-md d-print-none">
       <div class="container-xl">
         <div class="navbar-nav flex-row order-md-last">
-          <span class="badge bg-green-lt">Admin Console · :8080</span>
+          {% if operations.needs_attention %}
+          <a href="/" class="badge bg-yellow-lt text-decoration-none">Runtime needs attention · Admin :8080</a>
+          {% else %}
+          <span class="badge bg-green-lt">Runtime healthy · Admin :8080</span>
+          {% endif %}
         </div>
         <div>
           <div class="text-secondary small">Production control plane</div>
@@ -52,6 +56,28 @@
     </header>
     <div class="page-body">
       <div class="container-xl">
+        {% if operations.config.pending_components %}
+        <div class="alert alert-warning d-flex align-items-center mb-3" role="alert">
+          <div class="flex-fill">
+            <strong>Configuration generation {{ operations.config.generation }} is not fully applied.</strong>
+            Waiting for: <code>{{ operations.config.pending_components | join(', ') }}</code>.
+            {% if operations.config.changed_sections %}Changed sections: {{ operations.config.changed_sections | join(', ') }}.{% endif %}
+          </div>
+          <a class="btn btn-sm btn-outline-warning" href="/">View status</a>
+        </div>
+        {% endif %}
+        {% if operations.mixed_revisions %}
+        <div class="alert alert-danger mb-3" role="alert">
+          <strong>Mixed application revisions detected.</strong> Restart all reviewer services from the same source revision before relying on diagnostics.
+        </div>
+        {% endif %}
+        {% if operations.config.drift_components %}
+        <div class="alert alert-warning mb-3" role="alert">
+          <strong>Runtime settings drift detected.</strong>
+          Different non-secret settings are loaded by: <code>{{ operations.config.drift_components | join(', ') }}</code>.
+          This is separate from the Admin configuration generation and usually means a partial restart after editing <code>config.yaml</code>.
+        </div>
+        {% endif %}
         <div id="flash-area" aria-live="polite"></div>
         {% block content %}{% endblock %}
       </div>

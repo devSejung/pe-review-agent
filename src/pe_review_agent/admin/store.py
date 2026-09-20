@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import exists, func, or_, select, update
@@ -29,6 +29,10 @@ _RUNTIME_CONFIG_KEY = "admin-runtime-config"
 _RUNTIME_STORAGE_VERSION_KEY = "_storage_version"
 _RUNTIME_STORAGE_VERSION = 2
 _LEGACY_SECTIONS_KEY = "_legacy_sections"
+_CONFIG_GENERATION_KEY = "_config_generation"
+_CONFIG_CHANGED_AT_KEY = "_config_changed_at"
+_CONFIG_CHANGED_SECTIONS_KEY = "_config_changed_sections"
+_RESTART_REQUIRED_SECTIONS = frozenset({"gerrit", "llm", "review"})
 _LEGACY_FULL_SECTION_KEYS: dict[str, frozenset[str]] = {
     "gerrit": frozenset(
         {"ssh_host", "ssh_port", "ssh_user", "rest_url", "rest_auth_mode", "rest_username"}
@@ -89,45 +93,75 @@ class ControlStore:
                     json_value={
                         "service_enabled": settings.service.enabled,
                         _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                        _CONFIG_GENERATION_KEY: 0,
                     },
                 )
                 .on_conflict_do_nothing(index_elements=[ServiceState.key])
             )
             row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY, with_for_update=True)
-            if (
-                row is not None
-                and row.json_value.get(_RUNTIME_STORAGE_VERSION_KEY) != _RUNTIME_STORAGE_VERSION
-            ):
-                # Releases before override-only storage seeded a complete snapshot of config.yaml
-                # into this row. If an old section still exactly matches today's bootstrap config,
-                # dropping it is semantics-preserving and prevents it from becoming a fake
-                # override after upgrade. If it differs, preserve it: the difference may be an
-                # intentional historical Admin edit, and the UI exposes an explicit reset path.
-                defaults = _defaults_from_settings(settings)
+            if row is not None:
                 stored = dict(row.json_value or {})
-                legacy_sections: list[str] = []
-                for section in ("gerrit", "llm", "review"):
-                    value = stored.get(section)
-                    if _looks_like_legacy_full_section(
-                        section, value, defaults[section]
-                    ) and _legacy_snapshot_matches_defaults(value, defaults[section]):
-                        stored.pop(section, None)
-                    elif _looks_like_legacy_full_section(section, value, defaults[section]):
-                        legacy_sections.append(section)
-                stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
-                if legacy_sections:
-                    stored[_LEGACY_SECTIONS_KEY] = legacy_sections
-                else:
-                    stored.pop(_LEGACY_SECTIONS_KEY, None)
-                row.json_value = stored
-                row.updated_at = datetime.now(UTC)
+                changed = False
+                if _CONFIG_GENERATION_KEY not in stored:
+                    stored[_CONFIG_GENERATION_KEY] = 0
+                    changed = True
+                if stored.get(_RUNTIME_STORAGE_VERSION_KEY) != _RUNTIME_STORAGE_VERSION:
+                    # Releases before override-only storage seeded a complete snapshot of
+                    # config.yaml into this row. Preserve only meaningful historical overrides.
+                    defaults = _defaults_from_settings(settings)
+                    legacy_sections: list[str] = []
+                    for section in ("gerrit", "llm", "review"):
+                        value = stored.get(section)
+                        if _looks_like_legacy_full_section(
+                            section, value, defaults[section]
+                        ) and _legacy_snapshot_matches_defaults(value, defaults[section]):
+                            stored.pop(section, None)
+                        elif _looks_like_legacy_full_section(section, value, defaults[section]):
+                            legacy_sections.append(section)
+                    stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
+                    if legacy_sections:
+                        stored[_LEGACY_SECTIONS_KEY] = legacy_sections
+                    else:
+                        stored.pop(_LEGACY_SECTIONS_KEY, None)
+                    changed = True
+                if changed:
+                    row.json_value = stored
+                    row.updated_at = datetime.now(UTC)
 
-    async def runtime_config(self, settings: Settings) -> dict[str, Any]:
+    async def _runtime_snapshot(
+        self,
+        settings: Settings,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         async with self._sessions() as session:
             row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY)
             if row is None:
-                return _defaults_from_settings(settings)
-            return _merge_runtime_defaults(_defaults_from_settings(settings), row.json_value)
+                stored = {
+                    "service_enabled": settings.service.enabled,
+                    _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                    _CONFIG_GENERATION_KEY: 0,
+                }
+            else:
+                stored = dict(row.json_value or {})
+            return _merge_runtime_defaults(_defaults_from_settings(settings), stored), stored
+
+    async def runtime_config(self, settings: Settings) -> dict[str, Any]:
+        runtime, _ = await self._runtime_snapshot(settings)
+        return runtime
+
+    async def current_config_generation(self) -> int:
+        async with self._sessions() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY)
+            return _config_generation(dict(row.json_value or {})) if row is not None else 0
+
+    async def config_change_status(self) -> dict[str, Any]:
+        async with self._sessions() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY)
+            stored = dict(row.json_value or {}) if row is not None else {}
+        return {
+            "generation": _config_generation(stored),
+            "changed_at": stored.get(_CONFIG_CHANGED_AT_KEY),
+            "changed_sections": list(stored.get(_CONFIG_CHANGED_SECTIONS_KEY) or []),
+        }
 
     async def patch_runtime_config(
         self,
@@ -146,6 +180,7 @@ class ControlStore:
                         json_value={
                             "service_enabled": settings.service.enabled,
                             _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                            _CONFIG_GENERATION_KEY: 0,
                         },
                     )
                     .on_conflict_do_nothing(index_elements=[ServiceState.key])
@@ -155,11 +190,22 @@ class ControlStore:
                     raise RuntimeError("failed to initialize durable runtime configuration")
 
             stored = dict(row.json_value or {})
+            stored.setdefault(_CONFIG_GENERATION_KEY, 0)
+            changed_sections: set[str] = set()
             for key, value in updates.items():
                 if isinstance(value, dict) and isinstance(stored.get(key), dict):
-                    stored[key] = {**stored[key], **value}
+                    merged = {**stored[key], **value}
+                    if merged != stored[key]:
+                        stored[key] = merged
+                        if key in _RESTART_REQUIRED_SECTIONS:
+                            changed_sections.add(key)
                 else:
-                    stored[key] = value
+                    if stored.get(key) != value:
+                        stored[key] = value
+                        if key in _RESTART_REQUIRED_SECTIONS:
+                            changed_sections.add(key)
+            if changed_sections:
+                _mark_config_changed(stored, changed_sections)
             stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
             # Store only explicit overrides instead of a frozen copy of every config.yaml default.
             row.json_value = stored
@@ -191,6 +237,7 @@ class ControlStore:
                         json_value={
                             "service_enabled": settings.service.enabled,
                             _RUNTIME_STORAGE_VERSION_KEY: _RUNTIME_STORAGE_VERSION,
+                            _CONFIG_GENERATION_KEY: 0,
                         },
                     )
                     .on_conflict_do_nothing(index_elements=[ServiceState.key])
@@ -200,7 +247,9 @@ class ControlStore:
                     raise RuntimeError("failed to initialize durable runtime configuration")
 
             stored = dict(row.json_value or {})
+            stored.setdefault(_CONFIG_GENERATION_KEY, 0)
             legacy_sections = set(stored.get(_LEGACY_SECTIONS_KEY) or [])
+            changed_sections: set[str] = set()
             for section, values in updates.items():
                 section_defaults = defaults.get(section)
                 if not isinstance(section_defaults, dict):
@@ -210,12 +259,18 @@ class ControlStore:
                     for key, value in values.items()
                     if value != section_defaults.get(key)
                 }
+                previous = stored.get(section)
                 if override:
-                    stored[section] = override
-                else:
+                    if previous != override:
+                        stored[section] = override
+                        changed_sections.add(section)
+                elif section in stored:
                     stored.pop(section, None)
+                    changed_sections.add(section)
                 legacy_sections.discard(section)
 
+            if changed_sections:
+                _mark_config_changed(stored, changed_sections)
             stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
             if legacy_sections:
                 stored[_LEGACY_SECTIONS_KEY] = sorted(legacy_sections)
@@ -234,8 +289,7 @@ class ControlStore:
             return {
                 key
                 for key in row.json_value
-                if key
-                not in {"service_enabled", _RUNTIME_STORAGE_VERSION_KEY, _LEGACY_SECTIONS_KEY}
+                if key != "service_enabled" and not key.startswith("_")
             }
 
     async def legacy_runtime_snapshot_sections(self, settings: Settings) -> set[str]:
@@ -255,10 +309,17 @@ class ControlStore:
             if row is None:
                 return _defaults_from_settings(settings)
             stored = dict(row.json_value or {})
+            stored.setdefault(_CONFIG_GENERATION_KEY, 0)
             legacy_sections = set(stored.get(_LEGACY_SECTIONS_KEY) or [])
+            changed_sections: set[str] = set()
             for section in sections:
-                stored.pop(section, None)
+                if section in stored:
+                    stored.pop(section, None)
+                    if section in _RESTART_REQUIRED_SECTIONS:
+                        changed_sections.add(section)
                 legacy_sections.discard(section)
+            if changed_sections:
+                _mark_config_changed(stored, changed_sections)
             stored[_RUNTIME_STORAGE_VERSION_KEY] = _RUNTIME_STORAGE_VERSION
             if legacy_sections:
                 stored[_LEGACY_SECTIONS_KEY] = sorted(legacy_sections)
@@ -285,7 +346,14 @@ class ControlStore:
         await self.patch_runtime_config(settings, {"service_enabled": enabled})
 
     async def effective_settings(self, base: Settings) -> Settings:
-        runtime = await self.runtime_config(base)
+        effective, _ = await self.effective_settings_with_generation(base)
+        return effective
+
+    async def effective_settings_with_generation(
+        self,
+        base: Settings,
+    ) -> tuple[Settings, int]:
+        runtime, stored = await self._runtime_snapshot(base)
         managed_projects = await self.list_projects()
         projects = (
             [item.project for item in managed_projects if item.enabled]
@@ -362,8 +430,9 @@ class ControlStore:
         # immutable bootstrap value as the default. Folding a DB pause into this
         # Settings snapshot would turn OFF -> restart into a permanent hard-off
         # state that a later Admin resume cannot override.
-        return base.model_copy(
-            update={"gerrit": gerrit, "llm": llm, "review": review}
+        return (
+            base.model_copy(update={"gerrit": gerrit, "llm": llm, "review": review}),
+            _config_generation(stored),
         )
 
     async def list_projects(self) -> list[ManagedProjectRecord]:
@@ -494,35 +563,6 @@ class ControlStore:
                 select(ManagedProject.enabled).where(ManagedProject.project == project)
             )
             return bool(value)
-
-    async def dashboard_snapshot(self) -> dict[str, Any]:
-        cutoff = datetime.now(UTC) - timedelta(hours=24)
-        async with self._sessions() as session:
-            state_rows = (
-                await session.execute(
-                    select(Job.state, func.count()).group_by(Job.state).order_by(Job.state.asc())
-                )
-            ).all()
-            recent_24h = await session.scalar(
-                select(func.count()).select_from(Job).where(Job.created_at >= cutoff)
-            )
-            failed_24h = await session.scalar(
-                select(func.count())
-                .select_from(Job)
-                .where(Job.created_at >= cutoff, Job.state == JobState.FAILED_PERMANENT.value)
-            )
-            recent_jobs = (
-                await session.scalars(select(Job).order_by(Job.updated_at.desc()).limit(10))
-            ).all()
-        projects = await self.list_projects()
-        return {
-            "states": {state: int(count) for state, count in state_rows},
-            "recent_24h": int(recent_24h or 0),
-            "failed_24h": int(failed_24h or 0),
-            "projects_total": len(projects),
-            "projects_enabled": sum(1 for project in projects if project.enabled),
-            "recent_jobs": [_job_dict(job) for job in recent_jobs],
-        }
 
     async def list_jobs(
         self,
@@ -758,6 +798,17 @@ def _defaults_from_settings(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _config_generation(stored: dict[str, Any]) -> int:
+    value = stored.get(_CONFIG_GENERATION_KEY, 0)
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _mark_config_changed(stored: dict[str, Any], sections: set[str]) -> None:
+    stored[_CONFIG_GENERATION_KEY] = _config_generation(stored) + 1
+    stored[_CONFIG_CHANGED_AT_KEY] = datetime.now(UTC).isoformat()
+    stored[_CONFIG_CHANGED_SECTIONS_KEY] = sorted(sections)
+
+
 def _merge_runtime_defaults(defaults: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     merged: dict[str, Any] = dict(defaults)
     for key, value in current.items():
@@ -816,6 +867,10 @@ def _job_dict(job: Job) -> dict[str, Any]:
         "state": job.state,
         "retry_state": job.retry_state,
         "attempt_count": job.attempt_count,
+        "next_attempt_at": job.next_attempt_at,
+        "lease_owner": job.lease_owner,
+        "lease_expires_at": job.lease_expires_at,
+        "claimed_at": job.claimed_at,
         "last_error_class": job.last_error_class,
         "last_error": job.last_error,
         "created_at": job.created_at,

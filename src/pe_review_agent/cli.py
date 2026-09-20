@@ -13,6 +13,7 @@ from pe_review_agent.config import load_settings
 from pe_review_agent.db import Database
 from pe_review_agent.jobs import JobStore
 from pe_review_agent.observability import HealthServer, configure_logging
+from pe_review_agent.operations import ServiceHeartbeat
 from pe_review_agent.service import (
     database_ready,
     run_receiver,
@@ -70,30 +71,44 @@ async def _run_async(command_name: str, settings) -> None:  # type: ignore[no-un
         database,
         store,
         control,
+        operations,
         effective,
+        config_generation,
         gerrit,
         _llm,
         worker,
     ):
-        if command_name == "receiver":
-            await run_receiver(effective, store, control)
-            return
-        if command_name == "reconcile":
-            await run_reconciler(effective, store, gerrit, control)
-            return
-        if command_name == "worker":
-            health = HealthServer(
-                effective.service.health_host,
-                effective.service.health_port,
-                ready_check=lambda: database_ready(database),
-            )
-            await health.start()
-            try:
-                await worker.run_forever()
-            finally:
-                await health.close()
-            return
-        raise ValueError(f"unsupported command {command_name}")
+        component = "reconciler" if command_name == "reconcile" else command_name
+        details = {
+            "worker_concurrency": effective.service.worker_concurrency,
+            "enabled_projects": len(effective.gerrit.projects),
+        }
+        async with ServiceHeartbeat(
+            operations,
+            component,  # type: ignore[arg-type]
+            applied_config_generation=config_generation,
+            effective_settings=effective,
+            details=details,
+        ):
+            if command_name == "receiver":
+                await run_receiver(effective, store, control)
+                return
+            if command_name == "reconcile":
+                await run_reconciler(effective, store, gerrit, control)
+                return
+            if command_name == "worker":
+                health = HealthServer(
+                    effective.service.health_host,
+                    effective.service.health_port,
+                    ready_check=lambda: database_ready(database),
+                )
+                await health.start()
+                try:
+                    await worker.run_forever()
+                finally:
+                    await health.close()
+                return
+            raise ValueError(f"unsupported command {command_name}")
 
 
 def _migrate(dsn: str) -> None:

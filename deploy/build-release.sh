@@ -16,6 +16,12 @@ rm -rf "$release"
 mkdir -p "$release/docker-images" "$release/secrets"
 
 docker_build_args=()
+build_sha="$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  build_sha="${build_sha}-dirty"
+fi
+docker_build_args+=(--build-arg "PE_REVIEW_BUILD_SHA=${build_sha}")
+docker_build_args+=(--build-arg "PE_REVIEW_BUILD_VERSION=${version}")
 if [[ -n "${PIP_INDEX_URL:-}" ]]; then
   docker_build_args+=(--build-arg "PIP_INDEX_URL=${PIP_INDEX_URL}")
 fi

@@ -160,10 +160,21 @@ for shared use, put an internal HTTPS/SSO reverse proxy in front of it because B
 not encrypted by plain HTTP.
 
 The web UI manages projects, connection metadata, durable jobs, service enable/disable, review
-audit, structured logs, and review policy. It never stores Gerrit/LLM/admin secrets in PostgreSQL. Project enable/disable and global
+audit, structured logs, review policy, process liveness, and the **Needs attention** incident queue.
+It never stores Gerrit/LLM/admin secrets in PostgreSQL. Project enable/disable and global
 pause/resume take effect live. Gerrit endpoint/auth metadata, LLM endpoint/model, and review-policy
 changes are saved durably but require restarting receiver/worker/reconciler so active clients are not
 mutated mid-review.
+
+Restart-required changes advance a durable configuration generation. Receiver, worker, reconciler,
+and admin report a PostgreSQL heartbeat with their process instance, version, Git SHA, last-seen time,
+loaded generation, and a non-secret settings fingerprint. The global warning remains until all three
+runtime services have applied the current generation. A mixed Git SHA or settings fingerprint is
+shown as an operational error instead of being left for later log archaeology.
+
+The fingerprint is the loaded settings snapshot, not a file watcher. A manual `config.yaml` edit is
+visible as drift only after at least one process restarts. Admin Web saves are different: they advance
+the durable generation immediately, so pending processes are visible before restart.
 
 Admin Web stores only fields that an operator explicitly overrides. On **Connections**, the source
 banner shows whether Gerrit/LLM values currently come from `config.yaml` or saved Admin overrides.
@@ -183,6 +194,10 @@ identical to the current `config.yaml` is removed automatically. A differing ful
 to avoid deleting a potentially intentional Admin edit; Connections or Settings shows a warning for
 the corresponding section. After verifying the deployment file, use **Use config.yaml values** when
 the YAML should win.
+
+Stop old receiver/worker/reconciler/admin processes before migrating and starting this version. Older
+processes do not publish heartbeat/config-generation state, and an old Admin must not remain writable
+during a mixed-version upgrade.
 
 **Settings -> Review language** selects the human-facing language injected into both the candidate
 review and independent-verifier prompts. The default is `ko-KR`; `en-US` is also available. Function
@@ -247,6 +262,19 @@ GET /metrics
 Useful operational signals include queue depth, stage retry counts, review latency, Qwen latency and
 token usage, publish latency, verified finding counts, duplicate events, and superseded jobs.
 
+The Dashboard also derives process and durable-job health:
+
+- heartbeat older than 60 seconds: component is **stale**;
+- `FAILED_PERMANENT`: always listed under **Needs attention**;
+- retry overdue by more than two minutes;
+- FETCHING/REVIEWING/VALIDATING/PUBLISHING with an expired or missing lease after a grace period;
+- RECEIVED or READY_TO_PUBLISH waiting beyond their queue grace;
+- Gerrit publication remaining `AMBIGUOUS` for more than ten minutes;
+- runtime configuration not yet applied by every service, or mixed Git revisions.
+
+Intentional global pause and disabled projects suppress ordinary queue/lease warnings. Permanent
+failures and unresolved external publication outcomes remain visible.
+
 ## 7. Incident behavior
 
 Emergency stop for new work: use **Settings -> AI review service** in the Admin Web. The DB-backed
@@ -265,7 +293,8 @@ docker compose run --rm worker requeue --job-id <review-job-uuid>
 
 The same operation is available as **Jobs -> Requeue** in the Admin Web.
 
-For incident triage, open **Jobs -> Audit** on the affected Change. That page contains the complete
+For incident triage, begin with **Dashboard -> Needs attention**, then open **Jobs -> Audit** on the
+affected Change. That page contains the complete
 durable attempt timeline, full stored failure text, model summary/findings, and the exact Gerrit
 `ReviewInput`/response. Use **Logs** for process-level details and exception tracebacks. Logs are
 persisted in the shared reviewer volume as rotating JSONL files and can be filtered by service,

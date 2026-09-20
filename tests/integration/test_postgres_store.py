@@ -77,7 +77,8 @@ async def store():
     async with database.session() as session:
         await session.execute(
             text(
-                "TRUNCATE review_managed_projects, review_service_state, review_publications, "
+                "TRUNCATE review_service_heartbeats, review_managed_projects, "
+                "review_service_state, review_publications, "
                 "review_findings, "
                 "review_results, "
                 "review_attempts, review_jobs RESTART IDENTITY CASCADE"

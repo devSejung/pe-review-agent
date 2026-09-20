@@ -392,6 +392,46 @@ class ServiceState(Base):
     )
 
 
+class ServiceHeartbeatRow(Base):
+    __tablename__ = "review_service_heartbeats"
+    __table_args__ = (
+        CheckConstraint(
+            "component IN ('receiver', 'worker', 'reconciler', 'admin')",
+            name="ck_review_service_heartbeats_component",
+        ),
+        CheckConstraint(
+            "applied_config_generation >= 0",
+            name="ck_review_service_heartbeats_generation",
+        ),
+        Index(
+            "ix_review_service_heartbeats_component_seen",
+            "component",
+            "last_seen_at",
+        ),
+    )
+
+    component: Mapped[str] = mapped_column(String(32), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied_config_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    details: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class ManagedProject(Base):
     __tablename__ = "review_managed_projects"
     __table_args__ = (

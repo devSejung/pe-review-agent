@@ -23,6 +23,14 @@ postgres_ref="${POSTGRES_REF:-postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103
 postgres_image="${POSTGRES_IMAGE:-pe-review-postgres:16.15}"
 
 args=()
+build_sha="$(git -C "$root" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  build_sha="${build_sha}-dirty"
+fi
+build_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/pyproject.toml" | head -n 1)"
+build_version="${build_version:-0.1.0}"
+args+=(--build-arg "PE_REVIEW_BUILD_SHA=$build_sha")
+args+=(--build-arg "PE_REVIEW_BUILD_VERSION=$build_version")
 [[ -n "${PIP_INDEX_URL:-}" ]] && args+=(--build-arg "PIP_INDEX_URL=$PIP_INDEX_URL")
 [[ -n "${PIP_TRUSTED_HOST:-}" ]] && args+=(--build-arg "PIP_TRUSTED_HOST=$PIP_TRUSTED_HOST")
 [[ -n "${APT_DEBIAN_MIRROR_URL:-}" ]] && args+=(--build-arg "APT_DEBIAN_MIRROR_URL=$APT_DEBIAN_MIRROR_URL")

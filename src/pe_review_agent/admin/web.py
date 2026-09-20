@@ -25,9 +25,11 @@ from pe_review_agent.db import Database
 from pe_review_agent.gerrit import GerritEventStream, GerritRestClient
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
 from pe_review_agent.llm import LlmClient
+from pe_review_agent.operations import ServiceHeartbeat
 from pe_review_agent.repos import RepositoryManager
 from pe_review_agent.retry import PermanentError, TransientError
 
+from .operations import OperationsStore
 from .store import ControlStore
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -73,12 +75,23 @@ def create_admin_app(settings: Settings) -> FastAPI:
         database = Database(settings.database)
         jobs = JobStore(database.sessions)
         control = ControlStore(database.sessions)
+        operations = OperationsStore(database.sessions)
         await control.ensure_bootstrap(settings)
+        effective, config_generation = await control.effective_settings_with_generation(settings)
         app.state.database = database
         app.state.jobs = jobs
         app.state.control = control
+        app.state.operations = operations
         try:
-            yield
+            async with ServiceHeartbeat(
+                operations,
+                "admin",
+                applied_config_generation=config_generation,
+                effective_settings=effective,
+                details={"port": settings.admin.port},
+            ) as heartbeat:
+                app.state.service_heartbeat = heartbeat
+                yield
         finally:
             await database.close()
 
@@ -131,16 +144,29 @@ def create_admin_app(settings: Settings) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(request: Request, _: str = Depends(auth_dependency)):
         control: ControlStore = request.app.state.control
-        snapshot = await control.dashboard_snapshot()
-        snapshot["service_enabled"] = await control.service_enabled(
-            default=settings.service.enabled
+        service_enabled = await control.service_enabled(default=settings.service.enabled)
+        projects = await control.list_projects()
+        enabled_projects = {project.project for project in projects if project.enabled}
+        operations: OperationsStore = request.app.state.operations
+        snapshot = await operations.dashboard_snapshot(
+            service_enabled=service_enabled,
+            enabled_projects=enabled_projects,
+            projects_total=len(projects),
+            config=await control.config_change_status(),
         )
-        return _render(request, "dashboard.html", page="dashboard", snapshot=snapshot)
+        snapshot["service_enabled"] = service_enabled
+        return await _render(
+            request,
+            "dashboard.html",
+            page="dashboard",
+            snapshot=snapshot,
+            operations=snapshot["operations"],
+        )
 
     @app.get("/projects", response_class=HTMLResponse)
     async def projects(request: Request, _: str = Depends(auth_dependency)):
         control: ControlStore = request.app.state.control
-        return _render(
+        return await _render(
             request,
             "projects.html",
             page="projects",
@@ -156,7 +182,7 @@ def create_admin_app(settings: Settings) -> FastAPI:
         legacy_snapshots = await control.legacy_runtime_snapshot_sections(settings)
         auth = effective.gerrit.rest_auth
         rest_secret_env = auth.password_env if auth.mode == "basic" else auth.token_env
-        return _render(
+        return await _render(
             request,
             "connections.html",
             page="connections",
@@ -177,7 +203,7 @@ def create_admin_app(settings: Settings) -> FastAPI:
     ):
         control: ControlStore = request.app.state.control
         jobs = await control.list_jobs(limit=200, state=state_filter, project=project)
-        return _render(
+        return await _render(
             request,
             "jobs.html",
             page="jobs",
@@ -197,7 +223,7 @@ def create_admin_app(settings: Settings) -> FastAPI:
         audit = await control.get_job_audit(job_id)
         if audit is None:
             raise HTTPException(status_code=404, detail="job not found")
-        return _render(
+        return await _render(
             request,
             "job_detail.html",
             page="jobs",
@@ -221,7 +247,7 @@ def create_admin_app(settings: Settings) -> FastAPI:
             limit=500,
         )
         components = await asyncio.to_thread(_log_components, settings.admin.log_root)
-        return _render(
+        return await _render(
             request,
             "logs.html",
             page="logs",
@@ -239,7 +265,7 @@ def create_admin_app(settings: Settings) -> FastAPI:
         runtime["service_enabled"] = await control.service_enabled(default=settings.service.enabled)
         overrides = await control.runtime_override_sections()
         legacy_snapshots = await control.legacy_runtime_snapshot_sections(settings)
-        return _render(
+        return await _render(
             request,
             "settings.html",
             page="settings",
@@ -369,9 +395,11 @@ def create_admin_app(settings: Settings) -> FastAPI:
             updates["review"] = _validated_review_update(payload.review, current["review"])
         if updates:
             await control.replace_runtime_sections(settings, updates)
+        generation = await _refresh_admin_applied_config(request, settings)
         return {
             "ok": True,
             "restart_required": True,
+            "config_generation": generation,
             "detail": (
                 "Saved. Restart receiver/worker/reconciler to apply connection/review changes."
             ),
@@ -385,9 +413,11 @@ def create_admin_app(settings: Settings) -> FastAPI:
         _verify_csrf(request)
         control: ControlStore = request.app.state.control
         await control.reset_runtime_sections(settings, "gerrit", "llm")
+        generation = await _refresh_admin_applied_config(request, settings)
         return {
             "ok": True,
             "restart_required": True,
+            "config_generation": generation,
             "detail": "Connection overrides cleared. config.yaml values will apply after restart.",
         }
 
@@ -399,9 +429,11 @@ def create_admin_app(settings: Settings) -> FastAPI:
         _verify_csrf(request)
         control: ControlStore = request.app.state.control
         await control.reset_runtime_sections(settings, "review")
+        generation = await _refresh_admin_applied_config(request, settings)
         return {
             "ok": True,
             "restart_required": True,
+            "config_generation": generation,
             "detail": (
                 "Review policy override cleared. config.yaml values will apply after restart."
             ),
@@ -605,12 +637,17 @@ def _validate_admin_auth(settings: Settings) -> None:
         raise ValueError("admin.auth_mode=none is only allowed on a loopback admin.host")
 
 
-def _render(request: Request, template: str, **context: Any):
+async def _render(request: Request, template: str, **context: Any):
+    operations = context.pop("operations", None)
+    if operations is None:
+        operations = await request.app.state.operations.operational_status(
+            await request.app.state.control.config_change_status()
+        )
     csrf = request.cookies.get("pe_review_csrf") or secrets.token_urlsafe(32)
     response = _TEMPLATES.TemplateResponse(
         request=request,
         name=template,
-        context={"csrf_token": csrf, **context},
+        context={"csrf_token": csrf, "operations": operations, **context},
     )
     if request.cookies.get("pe_review_csrf") != csrf:
         response.set_cookie(
@@ -622,6 +659,14 @@ def _render(request: Request, template: str, **context: Any):
             max_age=8 * 60 * 60,
         )
     return response
+
+
+async def _refresh_admin_applied_config(request: Request, settings: Settings) -> int:
+    control: ControlStore = request.app.state.control
+    effective, generation = await control.effective_settings_with_generation(settings)
+    heartbeat: ServiceHeartbeat = request.app.state.service_heartbeat
+    await heartbeat.apply_configuration(generation, effective)
+    return generation
 
 
 def _verify_csrf(request: Request) -> None:

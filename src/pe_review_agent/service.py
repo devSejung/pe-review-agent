@@ -11,7 +11,7 @@ from time import perf_counter
 
 from sqlalchemy import text
 
-from pe_review_agent.admin import ControlStore
+from pe_review_agent.admin import ControlStore, OperationsStore
 from pe_review_agent.config import Settings
 from pe_review_agent.db import Database
 from pe_review_agent.domain import (
@@ -1091,20 +1091,41 @@ async def database_ready(database: Database) -> tuple[bool, str]:
 async def service_components(
     settings: Settings,
 ) -> AsyncIterator[
-    tuple[Database, JobStore, ControlStore, Settings, GerritRestClient, LlmClient, ReviewWorker]
+    tuple[
+        Database,
+        JobStore,
+        ControlStore,
+        OperationsStore,
+        Settings,
+        int,
+        GerritRestClient,
+        LlmClient,
+        ReviewWorker,
+    ]
 ]:
     database = Database(settings.database)
     store = JobStore(database.sessions)
     control = ControlStore(database.sessions)
+    operations = OperationsStore(database.sessions)
     await control.ensure_bootstrap(settings)
-    effective = await control.effective_settings(settings)
+    effective, config_generation = await control.effective_settings_with_generation(settings)
     gerrit = GerritRestClient(effective.gerrit)
     llm = LlmClient(effective.llm)
     repos = RepositoryManager(effective.repos, effective.gerrit)
     engine = NativeFirmwareReviewEngine(llm, effective.review)
     worker = ReviewWorker(effective, store, gerrit, repos, engine, control=control)
     try:
-        yield database, store, control, effective, gerrit, llm, worker
+        yield (
+            database,
+            store,
+            control,
+            operations,
+            effective,
+            config_generation,
+            gerrit,
+            llm,
+            worker,
+        )
     finally:
         await llm.aclose()
         await gerrit.aclose()

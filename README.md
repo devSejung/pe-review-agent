@@ -424,7 +424,9 @@ security headers.
 
 The UI has six operational surfaces:
 
-- **Dashboard** — recent job volume, failures, active queue/state counts, and recent Changes.
+- **Dashboard** — a low-touch **Needs attention** queue for permanent failures, overdue retries,
+  expired/unowned leases, and delayed publication; receiver/worker/reconciler/admin heartbeat state;
+  running version/Git revision; durable configuration-application status; recent volume and Changes.
 - **Projects** — add exact Gerrit project names, test REST Read + Git/SSH fetch access, and
   enable/disable review. New projects default to **From now on**, so established repositories with
   large open-Change histories are not backfilled accidentally. Operators can explicitly switch a
@@ -461,6 +463,17 @@ and `reconciler`. Unedited values continue to come from `config.yaml`, so editin
 masked merely because the service booted once. This avoids mutating long-lived HTTP/SSH/model clients
 in the middle of an active review while keeping the bootstrap file authoritative unless an operator
 intentionally saves an override.
+
+Every restart-required save or reset advances a durable configuration generation. Each long-running
+process writes its applied generation and a non-secret effective-settings fingerprint in PostgreSQL.
+The global Admin banner remains visible until receiver, worker, and reconciler report the current
+generation/fingerprint. The same heartbeat reports process start/last-seen time, application version,
+and build Git SHA, so partial restarts and mixed-source deployments are visible without mounting the
+Docker socket into the Admin container.
+
+The fingerprint describes the settings already loaded by a process; it is not a live file watcher.
+Editing `config.yaml` while every process keeps running becomes observable when at least one process
+restarts and reports the new fingerprint. Admin-managed changes use the durable generation immediately.
 
 On upgrade from a release that stored a complete runtime snapshot, sections that still exactly match
 the current `config.yaml` are pruned automatically. A differing legacy snapshot is preserved rather
@@ -524,6 +537,12 @@ GET http://127.0.0.1:8081/healthz
 GET http://127.0.0.1:8081/readyz
 GET http://127.0.0.1:8081/metrics
 ```
+
+The Dashboard complements these endpoints with PostgreSQL-backed heartbeats from all four long-lived
+components. A heartbeat older than 60 seconds is shown as stale. Heartbeat history is diagnostic data,
+not a lock; rows older than 30 days are pruned when a service starts. A configured global pause or
+disabled project does not stop heartbeats and does not falsely classify its intentionally queued jobs
+as stuck.
 
 ## Why this service owns the Gerrit lifecycle instead of using an OSS reviewer end-to-end
 

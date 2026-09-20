@@ -1590,6 +1590,11 @@ Company HTTPS / SSO reverse proxy
 
 볼 수 있는 항목:
 
+- **Needs attention**: 영구 실패, 지연된 retry, 만료/누락 lease, 게시 대기 및 ambiguous publication
+- receiver / worker / reconciler / admin 실제 heartbeat와 Healthy/Stale/Down 상태
+- 각 process의 실행 version, Git SHA, 시작 시각, 마지막 heartbeat
+- 현재 config generation과 process별 적용 generation
+- 부분 재시작으로 인한 mixed revision / settings fingerprint 경고
 - 최근 24시간 job 수
 - 최근 24시간 실패 수
 - enabled project 수
@@ -1622,6 +1627,16 @@ connection metadata 변경은 저장 후 receiver/worker/reconciler restart가 �
 Admin Web에서 직접 저장한 항목만 DB override가 되며, 저장하지 않은 connection 값은 계속
 `config.yaml`을 따릅니다. `Use config.yaml values`를 누른 뒤에도 long-lived client에는 restart가
 필요합니다.
+
+restart가 필요한 저장/reset은 PostgreSQL의 `config generation`을 증가시킵니다. 각 process가 자신이
+실제로 읽은 generation과 secret을 제외한 settings fingerprint를 heartbeat에 기록하므로, 단순 안내
+문구가 아니라 **어느 process가 아직 이전 설정인지** Dashboard 상단 경고에서 확인할 수 있습니다.
+receiver/worker/reconciler가 모두 현재 generation을 보고할 때까지 경고는 사라지지 않습니다.
+
+settings fingerprint는 각 process가 **이미 읽은 값**을 뜻하며 file watcher는 아닙니다. 모든 process가
+계속 실행 중인 동안 `config.yaml`만 직접 수정하면 즉시 감지할 수 없고, 하나 이상의 process가
+재시작해 새 fingerprint를 보고한 시점부터 drift가 표시됩니다. Admin Web 저장은 즉시 generation을
+올리므로 이 경우에는 재시작 전부터 pending process가 표시됩니다.
 
 이전 버전에서 업그레이드한 DB에는 과거의 전체 config snapshot이 남아 있을 수 있습니다.
 현재 `config.yaml`과 완전히 같은 legacy section은 시작 시 자동 정리합니다. 값이 다른 snapshot은
@@ -1972,7 +1987,18 @@ Logs
 
 ### Dashboard
 
-실패가 늘었는지, queue가 쌓였는지 봅니다.
+가장 먼저 **Needs attention**을 봅니다. 실패뿐 아니라 다음을 자동으로 구분합니다.
+
+- `FAILED_PERMANENT`
+- 예정 시각을 넘긴 `RETRY_WAIT`
+- lease가 만료되거나 사라진 FETCHING/REVIEWING/VALIDATING/PUBLISHING
+- 오래 기다리는 RECEIVED/READY_TO_PUBLISH
+- 장시간 해소되지 않은 ambiguous Gerrit publication
+- receiver/worker/reconciler/admin heartbeat stale/down
+- config generation 미적용 및 서로 다른 Git SHA 실행
+
+의도적으로 global pause했거나 project를 disable한 경우 일반 queue/lease 지연은 장애로 표시하지
+않습니다. 다만 영구 실패와 외부 게시 불확실성은 계속 표시합니다.
 
 ### Jobs
 
@@ -2155,6 +2181,11 @@ GET http://127.0.0.1:8081/metrics
 ```
 
 8081은 기본 Compose에서 localhost-only 운영을 권장합니다.
+
+Dashboard의 process 상태는 Docker socket을 읽는 방식이 아니라 각 process가 PostgreSQL에 15초마다
+남기는 heartbeat를 사용합니다. 60초 이상 갱신되지 않으면 stale로 표시합니다. heartbeat에는
+component/instance/version/Git SHA/start/last-seen/applied config generation이 포함되며 secret 값은
+포함하지 않습니다. 30일보다 오래된 heartbeat 이력은 service 시작 시 정리됩니다.
 
 ---
 
@@ -2468,7 +2499,8 @@ restart 필요:
 - review policy 일부
 - review language
 
-UI에서 restart 필요 여부를 표시합니다.
+UI는 restart 필요 여부뿐 아니라 config generation을 표시하고, receiver/worker/reconciler 중 실제로
+새 설정을 읽지 않은 process 이름을 계속 보여줍니다.
 
 ---
 
@@ -2479,7 +2511,7 @@ UI에서 restart 필요 여부를 표시합니다.
 3. Gerrit은 **SSH + REST 둘 다** 필요하다.
 4. `Stream Events`는 Gerrit global capability다.
 5. bot에는 Submit/+2 권한이 필요 없다.
-6. 장애가 나면 **Jobs -> Audit -> Logs** 순서로 본다.
+6. 장애가 나면 **Dashboard Needs attention -> Jobs Audit -> Logs** 순서로 본다.
 7. PostgreSQL은 cache가 아니라 **durable state**다.
 8. 처음 production 적용은 **test repo 하나**로 E2E 검증 후 확대한다.
 
