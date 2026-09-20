@@ -357,12 +357,13 @@ class ControlStore:
             }
         )
 
-        runtime_enabled = runtime.get("service_enabled", True)
-        service = base.service.model_copy(
-            update={"enabled": base.service.enabled and runtime_enabled is True}
-        )
+        # Keep the bootstrap hard kill switch separate from the live Admin pause.
+        # Long-running services poll service_enabled() on every loop and pass this
+        # immutable bootstrap value as the default. Folding a DB pause into this
+        # Settings snapshot would turn OFF -> restart into a permanent hard-off
+        # state that a later Admin resume cannot override.
         return base.model_copy(
-            update={"gerrit": gerrit, "llm": llm, "review": review, "service": service}
+            update={"gerrit": gerrit, "llm": llm, "review": review}
         )
 
     async def list_projects(self) -> list[ManagedProjectRecord]:

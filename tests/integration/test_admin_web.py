@@ -518,6 +518,31 @@ async def test_bootstrap_disabled_is_a_hard_kill_switch(tmp_path: Path) -> None:
         await database.close()
 
 
+@pytest.mark.asyncio
+async def test_admin_pause_restart_then_resume_keeps_bootstrap_switch_live(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    await _truncate(settings)
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        await control.ensure_bootstrap(settings)
+
+        # Simulate pausing from Admin, then restarting receiver/worker/reconciler.
+        await control.set_service_enabled(settings, False)
+        restarted_effective = await control.effective_settings(settings)
+
+        # The DB pause still wins while paused, but it must not rewrite the immutable
+        # bootstrap hard-switch value captured by the restarted services.
+        assert restarted_effective.service.enabled is True
+        assert await control.service_enabled(default=restarted_effective.service.enabled) is False
+
+        # Admin resume must take effect live without requiring another process restart.
+        await control.set_service_enabled(settings, True)
+        assert await control.service_enabled(default=restarted_effective.service.enabled) is True
+    finally:
+        await database.close()
+
+
 def test_admin_requires_auth_and_mutations_are_csrf_protected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
