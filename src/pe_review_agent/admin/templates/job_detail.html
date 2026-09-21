@@ -127,23 +127,36 @@
   </div>
 </div>
 
-{% set ns = namespace(has_tools=false) %}
-{% for attempt in audit.attempts %}{% if attempt.tool_events %}{% set ns.has_tools = true %}{% endif %}{% endfor %}
+{% set ns = namespace(has_tools=false, latest_tool_attempt=none) %}
+{% for attempt in audit.attempts %}
+  {% if attempt.tool_events %}
+    {% set ns.has_tools = true %}
+    {% set ns.latest_tool_attempt = attempt.attempt_number %}
+  {% endif %}
+{% endfor %}
 {% if ns.has_tools %}
 <div class="card mb-4">
   <div class="card-header"><h3 class="card-title">Repository tool trace</h3></div>
   <div class="card-body">
-    <div class="text-secondary small mb-3">Shows what the review model inspected. Result previews are bounded; repeated identical read-only calls are suppressed.</div>
+    <div class="text-secondary small mb-3">Shows what the review model inspected. Older attempts are collapsed by default; the most recent attempt is open. Result previews are bounded; repeated identical read-only calls are suppressed.</div>
     {% for attempt in audit.attempts %}
       {% if attempt.tool_events %}
-      <div class="mb-4">
-        <div class="fw-semibold mb-2">Attempt {{ attempt.attempt_number }} · {{ attempt.stage }}</div>
-        <div class="table-responsive">
+      <details class="mb-3" {% if attempt.attempt_number == ns.latest_tool_attempt %}open{% endif %} data-tool-trace-attempt="{{ attempt.attempt_number }}">
+        <summary class="fw-semibold">
+          Attempt {{ attempt.attempt_number }} · {{ attempt.stage }}
+          <span class="text-secondary fw-normal ms-2">
+            {{ attempt.started_at | display_time(display_timezone) }}
+            →
+            {{ attempt.finished_at | display_time(display_timezone) if attempt.finished_at else 'running' }}
+          </span>
+        </summary>
+        <div class="table-responsive mt-2">
           <table class="table table-sm table-vcenter">
-            <thead><tr><th>Round</th><th>Phase</th><th>Tool / event</th><th>Status</th><th>Arguments / detail</th></tr></thead>
+            <thead><tr><th>Time</th><th>Round</th><th>Phase</th><th>Tool / event</th><th>Status</th><th>Arguments / detail</th></tr></thead>
             <tbody>
             {% for event in attempt.tool_events %}
               <tr>
+                <td class="text-secondary text-nowrap small">{{ event.ts | display_time(display_timezone) if event.ts else '—' }}</td>
                 <td>{{ event.round or '—' }}</td>
                 <td><span class="badge bg-secondary-lt">{{ event.phase or 'unknown' }}</span></td>
                 <td class="font-monospace">{{ event.tool or event.event }}</td>
@@ -167,7 +180,7 @@
             </tbody>
           </table>
         </div>
-      </div>
+      </details>
       {% endif %}
     {% endfor %}
   </div>

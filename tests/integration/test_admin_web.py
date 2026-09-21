@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from pe_review_agent.domain import (
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
 from pe_review_agent.jobs.models import Job, ServiceState
 from pe_review_agent.operations import settings_fingerprint
-from pe_review_agent.retry import PermanentError
+from pe_review_agent.retry import PermanentError, TransientError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
@@ -192,6 +193,7 @@ async def _published_job(settings: Settings):  # type: ignore[no-untyped-def]
             review_attempt,
             {
                 "event": "tool_call",
+                "ts": "2026-09-21T05:00:01+00:00",
                 "phase": "candidate:1",
                 "round": 1,
                 "tool": "read_file",
@@ -274,6 +276,75 @@ async def _published_job(settings: Settings):  # type: ignore[no-untyped-def]
             worker_id="audit-publisher",
             gerrit_response={"labels": {}, "ready": True},
         )
+        return job.id
+    finally:
+        await database.close()
+
+
+async def _job_with_multiple_tool_trace_attempts(settings: Settings):  # type: ignore[no-untyped-def]
+    database = Database(settings.database)
+    try:
+        store = JobStore(database.sessions)
+        job, _ = await store.enqueue(
+            GerritPatchsetEvent(
+                project="team/fw",
+                change_number=779,
+                patchset_number=1,
+                revision_sha="d" * 40,
+                ref="refs/changes/79/779/1",
+                branch="main",
+            ),
+            review_policy_version="firmware-v1",
+        )
+        claimed = await store.claim_next(worker_id="trace-worker", lease_seconds=120)
+        assert claimed is not None
+        await store.transition(job.id, JobState.FETCHING, worker_id="trace-worker")
+        await store.transition(job.id, JobState.REVIEWING, worker_id="trace-worker")
+
+        first = await store.start_attempt(
+            job.id,
+            stage=AttemptStage.REVIEW,
+            worker_id="trace-worker",
+        )
+        await store.append_attempt_tool_event(
+            first,
+            {
+                "event": "tool_call",
+                "ts": "2026-09-21T04:00:01+00:00",
+                "phase": "candidate:1",
+                "round": 1,
+                "tool": "search_text",
+                "arguments": {"query": "first"},
+                "status": "ok",
+            },
+        )
+        await store.finish_attempt(
+            first,
+            success=False,
+            retryable=True,
+            error=TransientError("first trace attempt failed"),
+        )
+
+        second = await store.start_attempt(
+            job.id,
+            stage=AttemptStage.REVIEW,
+            worker_id="trace-worker",
+        )
+        await store.append_attempt_tool_event(
+            second,
+            {
+                "event": "tool_call",
+                "ts": "2026-09-21T05:00:02+00:00",
+                "phase": "candidate:1",
+                "round": 2,
+                "tool": "read_file",
+                "arguments": {"path": "fw/train.c"},
+                "status": "ok",
+            },
+        )
+        error = PermanentError("second trace attempt failed")
+        await store.finish_attempt(second, success=False, retryable=False, error=error)
+        await store.mark_failed_permanent(job.id, worker_id="trace-worker", error=error)
         return job.id
     finally:
         await database.close()
@@ -1143,6 +1214,35 @@ def test_admin_display_timezone_changes_live_without_config_generation(
     generation, timezone_name = asyncio.run(_display_timezone_state(settings))
     assert generation == 0
     assert timezone_name == "America/New_York"
+
+
+def test_repository_tool_trace_collapses_old_attempts_and_shows_event_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PE_REVIEW_TEST_ADMIN_PASSWORD", "correct-horse")
+    settings = _settings(tmp_path)
+    asyncio.run(_truncate(settings))
+    job_id = asyncio.run(_job_with_multiple_tool_trace_attempts(settings))
+
+    with TestClient(create_admin_app(settings)) as client:
+        response = client.get(f"/jobs/{job_id}", auth=("ops", "correct-horse"))
+
+    assert response.status_code == 200
+    assert (
+        "Older attempts are collapsed by default; the most recent attempt is open." in response.text
+    )
+    assert re.search(
+        r'<details class="mb-3"\s+data-tool-trace-attempt="1">',
+        response.text,
+    )
+    assert re.search(
+        r'<details class="mb-3"\s+open\s+data-tool-trace-attempt="2">',
+        response.text,
+    )
+    assert "2026-09-21 13:00:01 KST" in response.text
+    assert "2026-09-21 14:00:02 KST" in response.text
+    assert "Attempt 1 · REVIEW" in response.text
+    assert "Attempt 2 · REVIEW" in response.text
 
 
 def test_job_audit_shows_exact_review_findings_attempts_and_publication(
