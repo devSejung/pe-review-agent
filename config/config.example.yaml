@@ -49,8 +49,9 @@ review:
   max_policy_bytes: 128000
   max_diff_chunk_chars: 70000
   max_candidate_findings_total: 64
-  # Operational limits: completed work remains charged after restart; failed unfinished work
-  # may restart under retry.review_attempts. Lifetime actual requests can exceed these limits.
+  # Operational limits: completed work remains charged after restart; failed unfinished model work
+  # may restart under retry.review_attempts. Provider availability retries are tracked separately.
+  # Lifetime actual requests can exceed these limits.
   max_candidate_chunks: 12
   max_llm_calls_per_job: 30
   max_tool_calls_per_job: 50
@@ -65,6 +66,10 @@ retry:
   fetch_attempts: 4
   review_attempts: 4
   publish_attempts: 8
+  # LLM deployment/gateway availability is infrastructure retry, not a review-quality failure.
+  # Provider 429/5xx/transport failures do not consume review_attempts.
+  llm_provider_attempts: 12
+  llm_provider_max_wait_seconds: 1800
   base_seconds: 2
   max_seconds: 300
   jitter_ratio: 0.2

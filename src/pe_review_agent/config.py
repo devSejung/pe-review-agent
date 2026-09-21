@@ -155,6 +155,8 @@ class RetrySettings(StrictSettingsModel):
     fetch_attempts: int = Field(default=4, ge=1, le=20)
     review_attempts: int = Field(default=4, ge=1, le=20)
     publish_attempts: int = Field(default=8, ge=1, le=50)
+    llm_provider_attempts: int = Field(default=12, ge=1, le=100)
+    llm_provider_max_wait_seconds: int = Field(default=1800, ge=30, le=86400)
     base_seconds: float = Field(default=2.0, gt=0)
     max_seconds: float = Field(default=300.0, gt=0)
     jitter_ratio: float = Field(default=0.2, ge=0.0, le=1.0)

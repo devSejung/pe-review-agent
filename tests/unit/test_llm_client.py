@@ -6,7 +6,7 @@ import pytest
 
 from pe_review_agent.config import LlmSettings
 from pe_review_agent.llm.client import LlmClient, assistant_message_for_tool_loop
-from pe_review_agent.retry import ContextLengthError, TransientError
+from pe_review_agent.retry import ContextLengthError, ProviderUnavailableError
 
 
 @pytest.mark.asyncio
@@ -59,20 +59,81 @@ async def test_llm_client_parses_tool_call_and_usage() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_client_classifies_429_as_transient() -> None:
+async def test_llm_client_classifies_429_as_provider_unavailable() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, text="busy", headers={"Retry-After": "7"})
+        return httpx.Response(
+            429,
+            text="busy; Try again in 5 seconds",
+            headers={"Retry-After": "7"},
+        )
 
     client = LlmClient(
         LlmSettings(base_url="https://llm.example/v1"), transport=httpx.MockTransport(handler)
     )
     try:
-        with pytest.raises(TransientError) as error:
+        with pytest.raises(ProviderUnavailableError) as error:
             await client.complete(messages=[{"role": "user", "content": "review"}])
     finally:
         await client.aclose()
 
     assert error.value.retry_after_seconds == 7
+
+
+@pytest.mark.asyncio
+async def test_llm_client_uses_provider_body_retry_hint_when_header_is_missing() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "message": (
+                        "No deployments available for selected model, Try again in 5 seconds."
+                    )
+                }
+            },
+        )
+
+    client = LlmClient(
+        LlmSettings(base_url="https://llm.example/v1"), transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ProviderUnavailableError) as error:
+            await client.complete(messages=[{"role": "user", "content": "review"}])
+    finally:
+        await client.aclose()
+
+    assert error.value.retry_after_seconds == 5
+
+
+@pytest.mark.parametrize("status_code", [500, 503])
+@pytest.mark.asyncio
+async def test_llm_client_classifies_5xx_as_provider_unavailable(status_code: int) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, text="temporary inference deployment failure")
+
+    client = LlmClient(
+        LlmSettings(base_url="https://llm.example/v1"), transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ProviderUnavailableError):
+            await client.complete(messages=[{"role": "user", "content": "review"}])
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_llm_client_classifies_transport_failure_as_provider_unavailable() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("deployment gateway unavailable", request=request)
+
+    client = LlmClient(
+        LlmSettings(base_url="https://llm.example/v1"), transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ProviderUnavailableError, match="transport failure"):
+            await client.complete(messages=[{"role": "user", "content": "review"}])
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

@@ -971,7 +971,16 @@ diff, prompt, tool result 전문, reasoning transcript를 중복 저장하지 �
 9회를 계속 차감합니다. C는 처음부터 다시 수행하므로 폐기된 6회는 재실행 예산에서 제외합니다.
 전체 한도 30에서 재실행에 남는 몫은 21회이며, 이 안에서도 verifier 보호분을 유지합니다. 이미 쓴
 C의 6회는 실제 호출 감사 기록에 그대로 남습니다. 정상적인 예산/round 제한 종료는 장애로 취급해
-환급하지 않습니다. 반복 timeout/잘못된 응답도 `retry.review_attempts`로 제한합니다.
+환급하지 않습니다. 잘못된 JSON/스키마처럼 실제 review execution이 실패한 경우는
+`retry.review_attempts`로 제한합니다.
+
+LLM gateway/deployment 자체가 잠시 사용할 수 없는 경우는 별도입니다. HTTP 429/5xx와 LLM transport
+연결 실패는 `ProviderUnavailableError`로 분류하며 REVIEW retry budget을 소모하지 않습니다. 기본값은
+`retry.llm_provider_attempts: 12`, `retry.llm_provider_max_wait_seconds: 1800`(30분)이고 둘 중 하나를
+먼저 넘으면 provider availability failure로 종료합니다. HTTP `Retry-After`가 있으면 우선 따르고,
+없으면 provider body의 `Try again in N seconds` 힌트를 사용하며, 둘 다 없을 때만 일반 exponential
+backoff를 사용합니다. 이 대기는 Job Audit에서 **Waiting for LLM provider**로 별도 표시됩니다.
+이 두 retry 값은 `config.yaml` 설정이므로 변경 후 worker를 재시작해야 적용됩니다.
 
 최종 응답에서도 유효한 JSON을 못 받거나 도구를 다시 요청하면 성공/문제없음으로 처리하지 않습니다.
 그 미완료 작업은 재시도 대상이며, 재시도도 소진하면 실패가 표시됩니다. 도구 실행 금지는 코드로
@@ -1951,6 +1960,10 @@ Gerrit review publication 흐름입니다.
 ### RETRY_WAIT
 
 transient failure 후 backoff 대기 상태입니다.
+
+LLM provider 429/5xx/transport 장애로 대기 중이면 Job Audit에 **Waiting for LLM provider**,
+provider retry 횟수, 다음 retry 시각, provider wait budget이 표시됩니다. 이 경우 REVIEW retry 횟수는
+소모하지 않습니다.
 
 ### FAILED_PERMANENT
 

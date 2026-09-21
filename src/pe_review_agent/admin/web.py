@@ -230,6 +230,8 @@ def create_admin_app(settings: Settings) -> FastAPI:
         audit = await control.get_job_audit(job_id)
         if audit is None:
             raise HTTPException(status_code=404, detail="job not found")
+        audit["provider_retry"]["limit"] = settings.retry.llm_provider_attempts
+        audit["provider_retry"]["max_wait_seconds"] = settings.retry.llm_provider_max_wait_seconds
         return await _render(
             request,
             "job_detail.html",

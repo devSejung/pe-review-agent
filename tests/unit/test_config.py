@@ -8,6 +8,7 @@ from pe_review_agent.config import (
     DatabaseSettings,
     GerritRestAuth,
     GerritSettings,
+    RetrySettings,
     ReviewSettings,
     ServiceSettings,
     load_settings,
@@ -120,6 +121,17 @@ def test_review_budget_defaults_and_bounds_are_validated() -> None:
         ReviewSettings(max_input_tokens_per_job=999)
     with pytest.raises(ValidationError):
         ReviewSettings(chunk_checkpoint_retention_days=-1)
+
+
+def test_llm_provider_retry_defaults_are_bounded_separately() -> None:
+    settings = RetrySettings()
+    assert settings.review_attempts == 4
+    assert settings.llm_provider_attempts == 12
+    assert settings.llm_provider_max_wait_seconds == 1800
+    with pytest.raises(ValidationError):
+        RetrySettings(llm_provider_attempts=0)
+    with pytest.raises(ValidationError):
+        RetrySettings(llm_provider_max_wait_seconds=29)
 
 
 def test_unknown_nested_yaml_setting_fails_check_config(monkeypatch, tmp_path: Path) -> None:

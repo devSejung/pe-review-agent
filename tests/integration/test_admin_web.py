@@ -26,7 +26,7 @@ from pe_review_agent.domain import (
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
 from pe_review_agent.jobs.models import Job, ServiceState
 from pe_review_agent.operations import settings_fingerprint
-from pe_review_agent.retry import PermanentError, TransientError
+from pe_review_agent.retry import PermanentError, ProviderUnavailableError, TransientError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 
 DSN = os.environ.get("PE_REVIEW_TEST_POSTGRES_DSN")
@@ -136,6 +136,47 @@ async def _failed_job(settings: Settings):  # type: ignore[no-untyped-def]
             job.id,
             worker_id="test-worker",
             error=PermanentError("intentional test failure"),
+        )
+        return job.id
+    finally:
+        await database.close()
+
+
+async def _provider_waiting_job(settings: Settings):  # type: ignore[no-untyped-def]
+    database = Database(settings.database)
+    try:
+        store = JobStore(database.sessions)
+        job, _ = await store.enqueue(
+            GerritPatchsetEvent(
+                project="team/fw",
+                change_number=776,
+                patchset_number=1,
+                revision_sha="9" * 40,
+                ref="refs/changes/76/776/1",
+                branch="main",
+            ),
+            review_policy_version="firmware-v1",
+        )
+        claimed = await store.claim_next(worker_id="provider-worker", lease_seconds=120)
+        assert claimed is not None
+        await store.transition(job.id, JobState.FETCHING, worker_id="provider-worker")
+        await store.transition(job.id, JobState.REVIEWING, worker_id="provider-worker")
+        attempt = await store.start_attempt(
+            job.id,
+            stage=AttemptStage.REVIEW,
+            worker_id="provider-worker",
+        )
+        error = ProviderUnavailableError(
+            "LLM HTTP 429: No deployments available; Try again in 5 seconds.",
+            retry_after_seconds=5,
+        )
+        await store.finish_attempt(attempt, success=False, retryable=True, error=error)
+        await store.schedule_retry(
+            job.id,
+            resume_state=JobState.REVIEWING,
+            retry_at=datetime.now(UTC) + timedelta(seconds=5),
+            error=error,
+            worker_id="provider-worker",
         )
         return job.id
     finally:
@@ -1214,6 +1255,31 @@ def test_admin_display_timezone_changes_live_without_config_generation(
     generation, timezone_name = asyncio.run(_display_timezone_state(settings))
     assert generation == 0
     assert timezone_name == "America/New_York"
+
+
+def test_job_audit_shows_llm_provider_wait_without_calling_it_review_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PE_REVIEW_TEST_ADMIN_PASSWORD", "correct-horse")
+    settings = _settings(tmp_path)
+    asyncio.run(_truncate(settings))
+    job_id = asyncio.run(_provider_waiting_job(settings))
+
+    with TestClient(create_admin_app(settings)) as client:
+        response = client.get(f"/jobs/{job_id}", auth=("ops", "correct-horse"))
+        jobs_page = client.get("/jobs", auth=("ops", "correct-horse"))
+
+    assert response.status_code == 200
+    assert jobs_page.status_code == 200
+    assert "Waiting for LLM provider" in response.text
+    assert "Provider retry" in response.text
+    assert "1 / 12" in response.text
+    assert "Retry scheduled" in response.text
+    assert "30 min" in response.text
+    assert "does not consume the REVIEW retry budget" in response.text
+    assert "No deployments available" in response.text
+    assert "Current failure" not in response.text
+    assert "Waiting for LLM provider" in jobs_page.text
 
 
 def test_repository_tool_trace_collapses_old_attempts_and_shows_event_time(

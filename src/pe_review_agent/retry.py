@@ -26,6 +26,10 @@ class TransientError(RuntimeError):
         self.output_tokens = output_tokens
 
 
+class ProviderUnavailableError(TransientError):
+    """The configured LLM provider/deployment is temporarily unavailable."""
+
+
 class PermanentError(RuntimeError):
     pass
 

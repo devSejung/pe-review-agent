@@ -149,7 +149,7 @@ class ScriptLlm:
     def __init__(self, outputs):
         self.outputs = list(outputs)
         self.requests = []
-        self.settings = SimpleNamespace(model="same-model")
+        self.settings = SimpleNamespace(model="same-model", max_output_tokens=16_384)
 
     async def complete(self, *, messages, tools=None):
         self.requests.append((messages, tools))
@@ -157,6 +157,179 @@ class ScriptLlm:
         if isinstance(item, BaseException):
             raise item
         return item
+
+
+def truncated_completion(
+    content: str = '{"change_summary":"partial',
+    *,
+    reasoning_chars: int = 0,
+) -> LlmCompletion:
+    return LlmCompletion(
+        content=content,
+        tool_calls=(),
+        input_tokens=41_616,
+        output_tokens=16_384,
+        finish_reason="length",
+        raw_message={"reasoning_content": "r" * reasoning_chars},
+    )
+
+
+@pytest.mark.asyncio
+async def test_truncated_response_is_compactly_retried_without_replaying_tools(
+    tmp_path: Path,
+) -> None:
+    settings = ReviewSettings(max_llm_calls_per_job=6)
+    backend = MemoryProgressBackend()
+    progress = ReviewProgress(input_key="t" * 64)
+    llm = ScriptLlm(
+        [
+            truncated_completion(reasoning_chars=12_345),
+            completion('{"change_summary":"compact","findings":[]}'),
+        ]
+    )
+    runner = RoundRobinReview(
+        llm=llm,
+        tools=Tools(),
+        settings=settings,
+        budget=ReviewBudget(settings),
+        backend=backend,
+        progress=progress,
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    runner.trace = capture
+    result = await runner.run(
+        "candidate",
+        [WorkItem(key="one", payload=None)],
+        messages=lambda _: [{"role": "user", "content": "review"}],
+        parse=lambda text, _: json.loads(text),
+        split=lambda _: [],
+        max_units=1,
+    )
+
+    assert [tools is not None for _, tools in llm.requests] == [True, False]
+    assert len(result.completed) == 1
+    assert runner.budget.usage.llm_calls == 1
+    assert runner.budget.usage.input_tokens == 10
+    assert runner.budget.usage.output_tokens == 5
+    assert len(backend.invocations) == 2
+    invocations = list(backend.invocations.values())
+    assert invocations[0].status == "failed"
+    assert "configured_max_output_tokens=16384" in (invocations[0].error or "")
+    assert "reasoning_chars=12345" in (invocations[0].error or "")
+    assert invocations[1].status == "completed"
+    assert "previous response hit the model output limit" in llm.requests[1][0][-1]["content"]
+    assert "message under 500" in llm.requests[1][0][-1]["content"]
+    assert "evidence under 700" in llm.requests[1][0][-1]["content"]
+    assert any(event.get("event") == "output_truncation_recovery" for event in trace)
+
+
+@pytest.mark.asyncio
+async def test_second_truncation_fails_once_without_infinite_recovery(tmp_path: Path) -> None:
+    settings = ReviewSettings(max_llm_calls_per_job=6)
+    backend = MemoryProgressBackend()
+    llm = ScriptLlm([truncated_completion(), truncated_completion()])
+    runner = RoundRobinReview(
+        llm=llm,
+        tools=Tools(),
+        settings=settings,
+        budget=ReviewBudget(settings),
+        backend=backend,
+        progress=ReviewProgress(input_key="u" * 64),
+    )
+
+    with pytest.raises(TransientError, match="cannot be split further"):
+        await runner.run(
+            "candidate",
+            [WorkItem(key="one", payload=None)],
+            messages=lambda _: [{"role": "user", "content": "review"}],
+            parse=lambda text, _: json.loads(text),
+            split=lambda _: [],
+            max_units=1,
+        )
+
+    assert len(llm.requests) == 2
+    assert all(invocation.status == "failed" for invocation in backend.invocations.values())
+    assert runner.budget.usage.llm_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_truncation_splits_work_instead_of_restarting_whole_review(
+    tmp_path: Path,
+) -> None:
+    settings = ReviewSettings(max_llm_calls_per_job=8)
+    backend = MemoryProgressBackend()
+    llm = ScriptLlm(
+        [
+            truncated_completion(),
+            truncated_completion(),
+            completion('{"change_summary":"left","findings":[]}'),
+            completion('{"change_summary":"right","findings":[]}'),
+        ]
+    )
+    runner = RoundRobinReview(
+        llm=llm,
+        tools=Tools(),
+        settings=settings,
+        budget=ReviewBudget(settings),
+        backend=backend,
+        progress=ReviewProgress(input_key="w" * 64),
+    )
+    parent = WorkItem(key="parent", payload="parent")
+
+    result = await runner.run(
+        "candidate",
+        [parent],
+        messages=lambda item: [{"role": "user", "content": item.key}],
+        parse=lambda text, _: json.loads(text),
+        split=lambda item: [
+            WorkItem(key=f"{item.key}-left", payload="left", parent_key=item.key),
+            WorkItem(key=f"{item.key}-right", payload="right", parent_key=item.key),
+        ],
+        max_units=2,
+    )
+
+    assert [item.key for item in result.completed] == ["parent-left", "parent-right"]
+    assert backend.progress["w" * 64].checkpoints["parent"].status == "SPLIT"
+    assert runner.budget.usage.llm_calls == 2
+    assert len(llm.requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_truncation_recovery_never_executes_model_tool_calls(tmp_path: Path) -> None:
+    settings = ReviewSettings(max_llm_calls_per_job=6)
+    backend = MemoryProgressBackend()
+    recovery_tool = read_call("fw")
+    llm = ScriptLlm(
+        [
+            truncated_completion(),
+            LlmCompletion("", (recovery_tool,), 10, 5, "tool_calls", {}),
+        ]
+    )
+    tools = Tools()
+    runner = RoundRobinReview(
+        llm=llm,
+        tools=tools,
+        settings=settings,
+        budget=ReviewBudget(settings),
+        backend=backend,
+        progress=ReviewProgress(input_key="v" * 64),
+    )
+
+    with pytest.raises(TransientError, match="final no-tools turn"):
+        await runner.run(
+            "candidate",
+            [WorkItem(key="one", payload=None)],
+            messages=lambda _: [{"role": "user", "content": "review"}],
+            parse=lambda text, _: json.loads(text),
+            split=lambda _: [],
+            max_units=1,
+        )
+
+    assert not tools.executed
 
 
 def context(root: Path, *, diff: str = "+advance();\n") -> ReviewContext:
