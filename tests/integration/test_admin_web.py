@@ -1067,6 +1067,13 @@ def test_admin_live_controls_runtime_config_and_requeue(
         reset_page = client.get("/connections", auth=auth)
         assert "config.yaml (no saved Admin connection overrides)" in reset_page.text
 
+        failed_audit = client.get(f"/jobs/{failed_job_id}", auth=auth)
+        assert failed_audit.status_code == 200
+        assert "Current failure" in failed_audit.text
+        assert "Recorded " in failed_audit.text
+        assert " KST" in failed_audit.text
+        assert "+00:00" not in failed_audit.text
+
         requeued = client.post(
             f"/api/jobs/{failed_job_id}/requeue",
             auth=auth,
@@ -1104,6 +1111,8 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
     assert "1 / 50" in response.text
     assert "Legacy candidate chunk checkpoints" in response.text
     assert "cccccccccccc" in response.text
+    assert " KST" in response.text
+    assert "+00:00" not in response.text
 
 
 def test_logs_page_and_api_expose_full_structured_error(
@@ -1139,6 +1148,7 @@ def test_logs_page_and_api_expose_full_structured_error(
 
     assert page.status_code == 200
     assert "ValueError: full failure" in page.text
+    assert "2026-09-17 09:00:01 KST" in page.text
     assert api.status_code == 200
     assert len(api.json()["entries"]) == 1
     assert api.json()["entries"][0]["exception"].endswith("ValueError: full failure")

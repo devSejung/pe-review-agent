@@ -655,6 +655,7 @@ class ControlStore:
                 )
             ).one()
             audit = _job_dict(job)
+            audit["current_failure_at"] = _current_failure_at(job, attempts, publication)
             audit["review_progress"] = [
                 {"input_key": row.input_key, "updated_at": row.updated_at, **row.payload}
                 for row in progress_rows
@@ -766,6 +767,26 @@ class ControlStore:
                 else None
             )
             return audit
+
+
+def _current_failure_at(
+    job: Job,
+    attempts: list[Attempt],
+    publication: Publication | None,
+) -> datetime | None:
+    if not job.last_error:
+        return None
+    matching_times: list[datetime] = []
+    if publication is not None and publication.last_error == job.last_error:
+        matching_times.append(publication.updated_at)
+    for attempt in attempts:
+        if attempt.finished_at is not None and attempt.error_message == job.last_error:
+            matching_times.append(attempt.finished_at)
+    if matching_times:
+        return max(matching_times)
+    # Retry-budget exhaustion and other job-level failures do not necessarily have their own
+    # Attempt row. In those cases updated_at is when the current durable failure was recorded.
+    return job.updated_at
 
 
 def _defaults_from_settings(settings: Settings) -> dict[str, Any]:

@@ -30,7 +30,7 @@
       <tbody id="logs-body" data-component="{{ component_filter }}" data-level="{{ level_filter }}" data-query="{{ query_filter }}">
       {% for entry in entries %}
       <tr>
-        <td class="text-secondary text-nowrap">{{ entry.get('ts', '') }}</td>
+        <td class="text-secondary text-nowrap">{{ entry.get('ts', '') | seoul_time }}</td>
         <td><span class="badge {% if entry.get('level') in ['ERROR','CRITICAL'] %}bg-red-lt{% elif entry.get('level') == 'WARNING' %}bg-yellow-lt{% else %}bg-blue-lt{% endif %}">{{ entry.get('level', 'UNKNOWN') }}</span></td>
         <td><span class="badge bg-secondary-lt">{{ entry.get('component', 'unknown') }}</span></td>
         <td class="log-message"><div class="small text-secondary">{{ entry.get('logger', '') }}</div><div>{{ entry.get('message', '') }}</div></td>

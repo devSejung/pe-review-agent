@@ -29,11 +29,13 @@ from pe_review_agent.operations import ServiceHeartbeat
 from pe_review_agent.repos import RepositoryManager
 from pe_review_agent.retry import PermanentError, TransientError
 
+from .display import format_seoul_time
 from .operations import OperationsStore
 from .store import ControlStore
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _TEMPLATES = Jinja2Templates(directory=str(_PACKAGE_ROOT / "templates"))
+_TEMPLATES.env.filters["seoul_time"] = format_seoul_time
 _BASIC = HTTPBasic(auto_error=False)
 
 
