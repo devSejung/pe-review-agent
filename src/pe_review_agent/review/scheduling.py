@@ -213,7 +213,7 @@ class RoundRobinReview:
                             "requested final JSON now. Do not invent missing code or contracts. "
                             "Return only evidence-supported findings; insufficient evidence is not "
                             "proof that an earlier issue was fixed. Do not request any more tools. "
-                            f"{self._compact_output_instruction(phase)}"
+                            f"{self._normal_final_instruction(phase)}"
                         ),
                     },
                 ]
@@ -319,6 +319,19 @@ class RoundRobinReview:
             await self._trace(event="budget_exhausted", phase=phase, reason=reason)
         outcome.limitations = list(dict.fromkeys(outcome.limitations))
         return outcome
+
+    def _normal_final_instruction(self, phase: Phase) -> str:
+        finding_instruction = (
+            "Return every independently actionable finding supported by this chunk; do not pad "
+            "with speculative, duplicate, stylistic, or low-signal findings. "
+            if phase == "candidate"
+            else "Return only findings that survive verification. "
+        )
+        return (
+            "Emit JSON only, with no chain-of-thought, analysis, Markdown, preamble, or code "
+            f"fences. {finding_instruction}"
+            "Do not repeat source code or the same evidence across fields."
+        )
 
     def _compact_output_instruction(self, phase: Phase) -> str:
         finding_instruction = (

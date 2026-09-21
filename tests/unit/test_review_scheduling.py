@@ -222,6 +222,8 @@ async def test_truncated_response_is_compactly_retried_without_replaying_tools(
     assert "reasoning_chars=12345" in (invocations[0].error or "")
     assert invocations[1].status == "completed"
     assert "previous response hit the model output limit" in llm.requests[1][0][-1]["content"]
+    assert "message under 500" in llm.requests[1][0][-1]["content"]
+    assert "evidence under 700" in llm.requests[1][0][-1]["content"]
     assert any(event.get("event") == "output_truncation_recovery" for event in trace)
 
 

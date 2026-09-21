@@ -485,11 +485,10 @@ null. Do not reuse an old semantic_id merely because the category is similar.
 Describe only changes supported by this diff chunk. Use Change metadata only to clarify likely
 intent; never copy claims from the subject or commit message when the diff does not support them.
 
-Keep the final JSON compact. Return every independently actionable defect supported by this chunk,
+Keep the final JSON focused. Return every independently actionable defect supported by this chunk,
 but never pad the response with speculative, duplicate, stylistic, or low-signal findings. Do not
-restate the diff or repository text. Keep change_summary under 800 characters; category under 80;
-title under 120; message under 500; impact under 300; evidence under 700; remediation under 300.
-No chain-of-thought, analysis, Markdown, preamble, or code fences: emit the JSON object immediately.
+restate the diff or repository text, and do not repeat the same evidence across fields. No
+chain-of-thought, analysis, Markdown, preamble, or code fences: emit the JSON object immediately.
 
 Return ONLY a JSON object with this shape:
 {{
@@ -635,11 +634,10 @@ containing only findings that survive verification. Correct inaccurate line
 semantic_id null. Set confidence conservatively. `review_summary` summarizes the verified review
 result only; do not repeat or rewrite the candidate's change summary.
 
-Keep the final JSON compact. Return at most {max_response_findings} findings because this batch has
-only {max_response_findings} candidates. Do not restate candidate or repository text. Keep
-review_summary under 500 characters; category under 80; title under 120; message under 500; impact
-under 300; evidence under 700; remediation under 300. No chain-of-thought, analysis, Markdown,
-preamble, or code fences: emit the JSON object immediately.
+Keep the final JSON focused. Return at most {max_response_findings} findings because this batch has
+only {max_response_findings} candidates. Do not restate candidate or repository text, and do not
+repeat the same evidence across fields. No chain-of-thought, analysis, Markdown, preamble, or code
+fences: emit the JSON object immediately.
 
 Return ONLY a JSON object with this shape:
 {{
