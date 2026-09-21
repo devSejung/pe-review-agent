@@ -45,9 +45,9 @@
                 <option value="FROM_NOW" {% if item.review_start_mode.value == 'FROM_NOW' %}selected{% endif %}>From now on</option>
                 <option value="INCLUDE_OPEN" {% if item.review_start_mode.value == 'INCLUDE_OPEN' %}selected{% endif %}>Include current open Changes</option>
               </select>
-              {% if item.review_start_mode.value == 'FROM_NOW' and item.review_start_at %}<div class="form-hint">Cutoff: {{ item.review_start_at }}</div>{% else %}<div class="form-hint text-warning">Backfill enabled</div>{% endif %}
+              {% if item.review_start_mode.value == 'FROM_NOW' and item.review_start_at %}<div class="form-hint">Cutoff: {{ item.review_start_at | display_time(display_timezone) }}</div>{% else %}<div class="form-hint text-warning">Backfill enabled</div>{% endif %}
             </td>
-            <td class="text-secondary">{{ item.updated_at }}</td>
+            <td class="text-secondary">{{ item.updated_at | display_time(display_timezone) }}</td>
             <td>
               <div class="btn-list flex-nowrap">
                 <button class="btn btn-sm btn-outline-primary" data-project-test="{{ item.project }}">Test</button>

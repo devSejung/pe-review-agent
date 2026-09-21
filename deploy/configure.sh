@@ -184,6 +184,7 @@ admin:
   auth_mode: "basic"
   username: "admin"
   password_env: "PE_REVIEW_ADMIN_PASSWORD"
+  timezone: "Asia/Seoul"
 EOF
 fi
 

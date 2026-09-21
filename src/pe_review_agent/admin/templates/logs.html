@@ -27,10 +27,10 @@
   <div class="table-responsive">
     <table class="table table-vcenter card-table log-table">
       <thead><tr><th>Time</th><th>Level</th><th>Component</th><th>Logger / message</th><th>Full detail</th></tr></thead>
-      <tbody id="logs-body" data-component="{{ component_filter }}" data-level="{{ level_filter }}" data-query="{{ query_filter }}">
+      <tbody id="logs-body" data-component="{{ component_filter }}" data-level="{{ level_filter }}" data-query="{{ query_filter }}" data-timezone="{{ display_timezone }}">
       {% for entry in entries %}
       <tr>
-        <td class="text-secondary text-nowrap">{{ entry.get('ts', '') }}</td>
+        <td class="text-secondary text-nowrap">{{ entry.get('ts', '') | display_time(display_timezone) }}</td>
         <td><span class="badge {% if entry.get('level') in ['ERROR','CRITICAL'] %}bg-red-lt{% elif entry.get('level') == 'WARNING' %}bg-yellow-lt{% else %}bg-blue-lt{% endif %}">{{ entry.get('level', 'UNKNOWN') }}</span></td>
         <td><span class="badge bg-secondary-lt">{{ entry.get('component', 'unknown') }}</span></td>
         <td class="log-message"><div class="small text-secondary">{{ entry.get('logger', '') }}</div><div>{{ entry.get('message', '') }}</div></td>

@@ -28,6 +28,24 @@
         </div>
       </div>
     </div>
+    <form class="card mt-4" data-api-form="/api/display-timezone" data-method="POST" data-reload="true">
+      <div class="card-header"><h3 class="card-title">Display timezone</h3><div class="card-actions"><span class="badge bg-green-lt">Applies immediately</span></div></div>
+      <div class="card-body">
+        <label class="form-label" for="display-timezone">IANA timezone</label>
+        <input id="display-timezone" class="form-control" name="timezone" list="timezone-suggestions" value="{{ display_timezone }}" required>
+        <datalist id="timezone-suggestions">
+          <option value="Asia/Seoul"></option>
+          <option value="UTC"></option>
+          <option value="Asia/Tokyo"></option>
+          <option value="Asia/Singapore"></option>
+          <option value="America/Los_Angeles"></option>
+          <option value="America/New_York"></option>
+          <option value="Europe/London"></option>
+        </datalist>
+        <div class="form-hint mt-2">Controls Admin UI timestamps only. Stored timestamps remain UTC. Any valid IANA timezone is accepted.</div>
+      </div>
+      <div class="card-footer text-end"><button class="btn btn-primary" type="submit">Save timezone</button></div>
+    </form>
   </div>
   <div class="col-lg-7">
     <form class="card" data-runtime-config>
