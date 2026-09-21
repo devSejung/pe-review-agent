@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy.engine import URL, make_url
 
 
@@ -177,6 +178,19 @@ class AdminSettings(StrictSettingsModel):
     username: str = "admin"
     password_env: str = "PE_REVIEW_ADMIN_PASSWORD"
     log_root: Path = Path("/var/lib/pe-review-agent/logs")
+    timezone: str = "Asia/Seoul"
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("admin.timezone must not be empty")
+        try:
+            ZoneInfo(normalized)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown IANA timezone: {normalized}") from exc
+        return normalized
 
     @property
     def password(self) -> SecretStr | None:

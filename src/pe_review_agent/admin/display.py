@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
-_KST = timezone(timedelta(hours=9), name="KST")
 
-
-def format_seoul_time(value: Any) -> str:
-    """Render stored UTC timestamps for operators in Korea without changing persistence."""
+def format_display_time(value: Any, timezone_name: str) -> str:
+    """Render stored UTC timestamps in the configured operator timezone."""
 
     if value is None or value == "":
         return "—"
@@ -21,4 +20,4 @@ def format_seoul_time(value: Any) -> str:
         return str(value)
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+    return value.astimezone(ZoneInfo(timezone_name)).strftime("%Y-%m-%d %H:%M:%S %Z")

@@ -103,6 +103,17 @@ async def _dashboard_snapshot(
     )
 
 
+async def _display_timezone_state(settings: Settings) -> tuple[int, str]:
+    database = Database(settings.database)
+    try:
+        control = ControlStore(database.sessions)
+        generation = (await control.config_change_status())["generation"]
+        timezone_name = await control.display_timezone(settings.admin.timezone)
+        return generation, timezone_name
+    finally:
+        await database.close()
+
+
 async def _failed_job(settings: Settings):  # type: ignore[no-untyped-def]
     database = Database(settings.database)
     try:
@@ -1082,6 +1093,56 @@ def test_admin_live_controls_runtime_config_and_requeue(
         )
         assert requeued.status_code == 200
         assert requeued.json()["state"] == "RECEIVED"
+
+
+def test_admin_display_timezone_changes_live_without_config_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PE_REVIEW_TEST_ADMIN_PASSWORD", "correct-horse")
+    settings = _settings(tmp_path)
+    asyncio.run(_truncate(settings))
+    failed_job_id = asyncio.run(_failed_job(settings))
+
+    with TestClient(create_admin_app(settings)) as client:
+        auth = ("ops", "correct-horse")
+        page = client.get("/settings", auth=auth)
+        csrf = client.cookies.get("pe_review_csrf")
+        assert page.status_code == 200 and csrf
+        assert 'name="timezone"' in page.text
+        assert 'value="Asia/Seoul"' in page.text
+
+        changed = client.post(
+            "/api/display-timezone",
+            auth=auth,
+            headers={"X-CSRF-Token": csrf},
+            json={"timezone": "America/New_York"},
+        )
+        assert changed.status_code == 200
+        assert changed.json()["timezone"] == "America/New_York"
+
+        changed_page = client.get(f"/jobs/{failed_job_id}", auth=auth)
+        assert changed_page.status_code == 200
+        assert "America/New_York" in changed_page.text
+        assert " KST" not in changed_page.text
+
+        invalid = client.post(
+            "/api/display-timezone",
+            auth=auth,
+            headers={"X-CSRF-Token": csrf},
+            json={"timezone": "Mars/Olympus"},
+        )
+        assert invalid.status_code == 422
+        invalid_path = client.post(
+            "/api/display-timezone",
+            auth=auth,
+            headers={"X-CSRF-Token": csrf},
+            json={"timezone": "/etc/passwd"},
+        )
+        assert invalid_path.status_code == 422
+
+    generation, timezone_name = asyncio.run(_display_timezone_state(settings))
+    assert generation == 0
+    assert timezone_name == "America/New_York"
 
 
 def test_job_audit_shows_exact_review_findings_attempts_and_publication(

@@ -18,6 +18,7 @@ dependencies = [
   "pydantic-settings>=2.7,<3",
   "PyYAML>=6.0.2,<7",
   "SQLAlchemy[asyncio]>=2.0.36,<3",
+  "tzdata>=2026.4,<2027",
   "uvicorn>=0.53,<0.54",
 ]
 

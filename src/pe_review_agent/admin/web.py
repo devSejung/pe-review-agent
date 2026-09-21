@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -29,13 +30,13 @@ from pe_review_agent.operations import ServiceHeartbeat
 from pe_review_agent.repos import RepositoryManager
 from pe_review_agent.retry import PermanentError, TransientError
 
-from .display import format_seoul_time
+from .display import format_display_time
 from .operations import OperationsStore
 from .store import ControlStore
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _TEMPLATES = Jinja2Templates(directory=str(_PACKAGE_ROOT / "templates"))
-_TEMPLATES.env.filters["seoul_time"] = format_seoul_time
+_TEMPLATES.env.filters["display_time"] = format_display_time
 _BASIC = HTTPBasic(auto_error=False)
 
 
@@ -63,6 +64,10 @@ class RuntimeConfigUpdate(BaseModel):
     gerrit: dict[str, Any] = Field(default_factory=dict)
     llm: dict[str, Any] = Field(default_factory=dict)
     review: dict[str, Any] = Field(default_factory=dict)
+
+
+class DisplayTimezoneUpdate(BaseModel):
+    timezone: str = Field(min_length=1, max_length=128)
 
 
 class ProjectProbe(BaseModel):
@@ -272,9 +277,32 @@ def create_admin_app(settings: Settings) -> FastAPI:
             "settings.html",
             page="settings",
             runtime=runtime,
+            display_timezone=await control.display_timezone(settings.admin.timezone),
             review_override_active="review" in overrides,
             legacy_review_snapshot="review" in legacy_snapshots,
         )
+
+    @app.post("/api/display-timezone")
+    async def update_display_timezone(
+        request: Request,
+        payload: DisplayTimezoneUpdate,
+        _: str = Depends(auth_dependency),
+    ):
+        _verify_csrf(request)
+        timezone_name = payload.timezone.strip()
+        try:
+            ZoneInfo(timezone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail=f"Unknown IANA timezone: {timezone_name}"
+            ) from exc
+        control: ControlStore = request.app.state.control
+        await control.set_display_timezone(timezone_name)
+        return {
+            "ok": True,
+            "timezone": timezone_name,
+            "detail": f"Display timezone changed to {timezone_name}.",
+        }
 
     @app.post("/api/projects")
     async def add_project(
@@ -645,11 +673,21 @@ async def _render(request: Request, template: str, **context: Any):
         operations = await request.app.state.operations.operational_status(
             await request.app.state.control.config_change_status()
         )
+    display_timezone = context.pop("display_timezone", None)
+    if display_timezone is None:
+        display_timezone = await request.app.state.control.display_timezone(
+            request.app.state.base_settings.admin.timezone
+        )
     csrf = request.cookies.get("pe_review_csrf") or secrets.token_urlsafe(32)
     response = _TEMPLATES.TemplateResponse(
         request=request,
         name=template,
-        context={"csrf_token": csrf, "operations": operations, **context},
+        context={
+            "csrf_token": csrf,
+            "operations": operations,
+            "display_timezone": display_timezone,
+            **context,
+        },
     )
     if request.cookies.get("pe_review_csrf") != csrf:
         response.set_cookie(

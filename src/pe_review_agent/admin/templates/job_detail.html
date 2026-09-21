@@ -23,7 +23,7 @@
   <div class="card-header"><h3 class="card-title text-danger">Current failure</h3></div>
   <div class="card-body">
     <div class="fw-semibold mb-2">{{ audit.last_error_class or 'Error' }}</div>
-    <div class="text-secondary small mb-2">Recorded {{ audit.current_failure_at | seoul_time }}</div>
+    <div class="text-secondary small mb-2">Recorded {{ audit.current_failure_at | display_time(display_timezone) }}</div>
     <pre class="audit-pre text-danger">{{ audit.last_error }}</pre>
   </div>
 </div>
@@ -35,7 +35,7 @@
   <div class="card-body">
     <p class="text-secondary small">Completed results and their operational charges survive restart. Abandoned unfinished sessions restart with a fresh allowance; their requests remain in the invocation audit. Candidate inputs are frozen before verification.</p>
     {% for progress in audit.review_progress %}
-    <div class="fw-semibold mb-2">{{ progress.phase }} · input {{ progress.input_key[:12] }} · {{ progress.updated_at | seoul_time }}</div>
+    <div class="fw-semibold mb-2">{{ progress.phase }} · input {{ progress.input_key[:12] }} · {{ progress.updated_at | display_time(display_timezone) }}</div>
     {% if progress.legacy_present %}<div class="alert alert-warning">Legacy v1 checkpoints lack context/completeness proof. Original rows and known usage remain for audit, but old findings are not reused and their usage is not charged to the new operational allowance.</div>{% endif %}
     <div class="table-responsive mb-3">
       <table class="table table-sm table-vcenter">
@@ -68,7 +68,7 @@
       <table class="table table-sm table-vcenter">
         <thead><tr><th>Time</th><th>Attempt / phase</th><th>Kind</th><th>Status</th><th>Input / output tokens</th><th>Error</th></tr></thead>
         <tbody>{% for call in audit.invocations %}
-          <tr><td class="small">{{ call.created_at | seoul_time }}</td><td>{{ call.attempt_id }} · {{ call.phase }}<div class="font-monospace small">{{ call.work_key[:12] }}</div></td><td>{{ call.kind }}</td><td>{{ call.status }}</td><td>{{ call.input_tokens if call.input_tokens is not none else 'unknown' }} / {{ call.output_tokens if call.output_tokens is not none else 'unknown' }}</td><td class="small">{{ call.error or '—' }}</td></tr>
+          <tr><td class="small">{{ call.created_at | display_time(display_timezone) }}</td><td>{{ call.attempt_id }} · {{ call.phase }}<div class="font-monospace small">{{ call.work_key[:12] }}</div></td><td>{{ call.kind }}</td><td>{{ call.status }}</td><td>{{ call.input_tokens if call.input_tokens is not none else 'unknown' }} / {{ call.output_tokens if call.output_tokens is not none else 'unknown' }}</td><td class="small">{{ call.error or '—' }}</td></tr>
         {% endfor %}</tbody>
       </table>
     </div>
@@ -91,7 +91,7 @@
             <td class="font-monospace small">{{ checkpoint.chunk_key[:12] }}{% if checkpoint.parent_chunk_key %}<div class="text-secondary">parent {{ checkpoint.parent_chunk_key[:12] }}</div>{% endif %}</td>
             <td class="small">{{ checkpoint.paths | join(', ') or '—' }}{% if checkpoint.finding_count %}<div class="text-secondary">{{ checkpoint.finding_count }} candidate finding(s)</div>{% endif %}</td>
             <td class="small">LLM {{ checkpoint.llm_calls }} · tools {{ checkpoint.tool_calls }} · in {{ checkpoint.input_tokens }} · out {{ checkpoint.output_tokens }}</td>
-            <td class="text-secondary small">{{ checkpoint.updated_at | seoul_time }}</td>
+            <td class="text-secondary small">{{ checkpoint.updated_at | display_time(display_timezone) }}</td>
           </tr>
         {% endfor %}
         </tbody>
@@ -117,8 +117,8 @@
           {% elif attempt.display_status == 'running' %}<span class="badge bg-blue-lt">running</span>
           {% else %}<span class="badge bg-yellow-lt">abandoned</span>{% endif %}
         </td>
-        <td class="text-secondary">{{ attempt.started_at | seoul_time }}</td>
-        <td class="text-secondary">{{ attempt.finished_at | seoul_time }}</td>
+        <td class="text-secondary">{{ attempt.started_at | display_time(display_timezone) }}</td>
+        <td class="text-secondary">{{ attempt.finished_at | display_time(display_timezone) }}</td>
         <td>{% if attempt.error_message %}<details><summary class="text-danger">{{ attempt.error_class or 'error' }}</summary><pre class="audit-pre mt-2">{{ attempt.error_message }}</pre></details>{% else %}—{% endif %}</td>
       </tr>
       {% else %}<tr><td colspan="6" class="text-center text-secondary py-4">No attempts recorded yet.</td></tr>{% endfor %}
@@ -233,8 +233,8 @@
     {% if audit.publication %}
     <div class="row g-3 mb-4">
       <div class="col-md-3"><div class="subheader">Status</div><div>{{ audit.publication.status }}</div></div>
-      <div class="col-md-3"><div class="subheader">Created</div><div>{{ audit.publication.created_at | seoul_time }}</div></div>
-      <div class="col-md-3"><div class="subheader">Posted</div><div>{{ audit.publication.posted_at | seoul_time }}</div></div>
+      <div class="col-md-3"><div class="subheader">Created</div><div>{{ audit.publication.created_at | display_time(display_timezone) }}</div></div>
+      <div class="col-md-3"><div class="subheader">Posted</div><div>{{ audit.publication.posted_at | display_time(display_timezone) }}</div></div>
       <div class="col-md-3"><div class="subheader">Fingerprint</div><div class="font-monospace small text-break">{{ audit.publication.fingerprint }}</div></div>
     </div>
     {% if audit.publication.last_error %}<div class="alert alert-danger"><pre class="audit-pre mb-0">{{ audit.publication.last_error }}</pre></div>{% endif %}

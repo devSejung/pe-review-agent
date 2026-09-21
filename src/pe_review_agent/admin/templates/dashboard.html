@@ -75,7 +75,7 @@
       <div class="card-header"><h3 class="card-title">Configuration application</h3></div>
       <div class="card-body">
         <div class="subheader">Current generation</div><div class="h1">{{ snapshot.operations.config.generation }}</div>
-        {% if snapshot.operations.config.changed_at %}<div class="text-secondary small mb-3">Last changed {{ snapshot.operations.config.changed_at | seoul_time }}</div>{% endif %}
+        {% if snapshot.operations.config.changed_at %}<div class="text-secondary small mb-3">Last changed {{ snapshot.operations.config.changed_at | display_time(display_timezone) }}</div>{% endif %}
         <div class="mb-2"><strong>Changed sections:</strong> {{ snapshot.operations.config.changed_sections | join(', ') or 'none' }}</div>
         {% if snapshot.operations.config.pending_components %}
         <div class="alert alert-warning py-2 mb-0">Pending: <code>{{ snapshot.operations.config.pending_components | join(', ') }}</code></div>
@@ -104,7 +104,7 @@
       <div class="card-header"><h3 class="card-title">Recent jobs</h3><div class="card-actions"><a href="/jobs" class="btn btn-sm btn-outline-primary">View all</a></div></div>
       <div class="table-responsive">
         <table class="table table-vcenter card-table"><thead><tr><th>Project</th><th>Change</th><th>Patch Set</th><th>State</th><th>Updated</th></tr></thead><tbody>
-          {% for job in snapshot.recent_jobs %}<tr><td class="text-truncate project-cell"><a href="/jobs/{{ job.id }}" class="text-reset fw-medium">{{ job.project }}</a></td><td><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a></td><td>{{ job.patchset_number }}</td><td><span class="badge bg-secondary-lt">{{ job.state }}</span></td><td class="text-secondary">{{ job.updated_at | seoul_time }}</td></tr>{% else %}<tr><td colspan="5" class="text-center text-secondary py-5">No review jobs yet.</td></tr>{% endfor %}
+          {% for job in snapshot.recent_jobs %}<tr><td class="text-truncate project-cell"><a href="/jobs/{{ job.id }}" class="text-reset fw-medium">{{ job.project }}</a></td><td><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a></td><td>{{ job.patchset_number }}</td><td><span class="badge bg-secondary-lt">{{ job.state }}</span></td><td class="text-secondary">{{ job.updated_at | display_time(display_timezone) }}</td></tr>{% else %}<tr><td colspan="5" class="text-center text-secondary py-5">No review jobs yet.</td></tr>{% endfor %}
         </tbody></table>
       </div>
     </div>

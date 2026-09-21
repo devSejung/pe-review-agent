@@ -32,6 +32,7 @@ _LEGACY_SECTIONS_KEY = "_legacy_sections"
 _CONFIG_GENERATION_KEY = "_config_generation"
 _CONFIG_CHANGED_AT_KEY = "_config_changed_at"
 _CONFIG_CHANGED_SECTIONS_KEY = "_config_changed_sections"
+_DISPLAY_TIMEZONE_KEY = "display_timezone"
 _RESTART_REQUIRED_SECTIONS = frozenset({"gerrit", "llm", "review"})
 _LEGACY_FULL_SECTION_KEYS: dict[str, frozenset[str]] = {
     "gerrit": frozenset(
@@ -163,6 +164,24 @@ class ControlStore:
             "changed_sections": list(stored.get(_CONFIG_CHANGED_SECTIONS_KEY) or []),
         }
 
+    async def display_timezone(self, default: str) -> str:
+        async with self._sessions() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY)
+            if row is None:
+                return default
+            value = dict(row.json_value or {}).get(_DISPLAY_TIMEZONE_KEY)
+            return value if isinstance(value, str) and value else default
+
+    async def set_display_timezone(self, timezone_name: str) -> None:
+        async with self._sessions.begin() as session:
+            row = await session.get(ServiceState, _RUNTIME_CONFIG_KEY, with_for_update=True)
+            if row is None:
+                raise RuntimeError("runtime configuration is not initialized")
+            stored = dict(row.json_value or {})
+            stored[_DISPLAY_TIMEZONE_KEY] = timezone_name
+            row.json_value = stored
+            row.updated_at = datetime.now(UTC)
+
     async def patch_runtime_config(
         self,
         settings: Settings,
@@ -289,7 +308,7 @@ class ControlStore:
             return {
                 key
                 for key in row.json_value
-                if key != "service_enabled" and not key.startswith("_")
+                if key not in {"service_enabled", _DISPLAY_TIMEZONE_KEY} and not key.startswith("_")
             }
 
     async def legacy_runtime_snapshot_sections(self, settings: Settings) -> set[str]:

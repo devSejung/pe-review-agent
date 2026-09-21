@@ -213,21 +213,26 @@
       return 'bg-blue-lt';
     }
 
-    function formatSeoulTime(value) {
+    function formatDisplayTime(value) {
       if (!value) return '';
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return value;
-      const parts = new Intl.DateTimeFormat('sv-SE', {
-        timeZone: 'Asia/Seoul',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hourCycle: 'h23',
-      }).format(date);
-      return `${parts} KST`;
+      try {
+        const formatter = new Intl.DateTimeFormat('sv-SE', {
+          timeZone: logsBody.dataset.timezone || 'UTC',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hourCycle: 'h23',
+          timeZoneName: 'short',
+        });
+        return formatter.format(date);
+      } catch (_) {
+        return value;
+      }
     }
 
     function renderLogs(entries) {
@@ -245,7 +250,7 @@
         const row = document.createElement('tr');
         const time = document.createElement('td');
         time.className = 'text-secondary text-nowrap';
-        time.textContent = formatSeoulTime(entry.ts);
+        time.textContent = formatDisplayTime(entry.ts);
 
         const levelCell = document.createElement('td');
         const level = document.createElement('span');

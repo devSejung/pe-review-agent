@@ -932,6 +932,7 @@ admin:
   auth_mode: "basic"
   username: "admin"
   password_env: "PE_REVIEW_ADMIN_PASSWORD"
+  timezone: "Asia/Seoul"
 ```
 
 `max_candidate_chunks`, `max_llm_calls_per_job`, `max_tool_calls_per_job`은 과도한 코드 탐색과

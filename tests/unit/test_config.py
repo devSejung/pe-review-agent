@@ -59,6 +59,13 @@ def test_admin_and_worker_ports_do_not_conflict() -> None:
     assert ServiceSettings().health_port == 8081
 
 
+def test_admin_timezone_defaults_to_seoul_and_validates_iana_name() -> None:
+    assert AdminSettings().timezone == "Asia/Seoul"
+    assert AdminSettings(timezone="America/New_York").timezone == "America/New_York"
+    with pytest.raises(ValidationError, match="unknown IANA timezone"):
+        AdminSettings(timezone="Mars/Olympus")
+
+
 def test_gerrit_projects_can_start_empty_for_admin_web_bootstrap(tmp_path: Path) -> None:
     settings = GerritSettings(
         ssh_host="gerrit",

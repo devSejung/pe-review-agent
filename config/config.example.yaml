@@ -91,3 +91,4 @@ admin:
   username: "admin"
   password_env: "PE_REVIEW_ADMIN_PASSWORD"
   log_root: "/var/lib/pe-review-agent/logs"
+  timezone: "Asia/Seoul"
