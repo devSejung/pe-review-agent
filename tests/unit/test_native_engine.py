@@ -113,6 +113,8 @@ async def test_two_pass_engine_uses_tools_then_verifies(tmp_path: Path) -> None:
     assert "unrelated/1999.c" not in llm.seen_messages[0][1]["content"]
     assert "natural Korean" in llm.seen_messages[0][1]["content"]
     assert "natural Korean" in llm.seen_messages[2][1]["content"]
+    assert "Return every independently actionable defect" in llm.seen_messages[0][1]["content"]
+    assert "Keep the final JSON compact" in llm.seen_messages[2][1]["content"]
     assert '"subject": "Handle training timeout"' in llm.seen_messages[0][1]["content"]
     assert '"branch": "main"' in llm.seen_messages[0][1]["content"]
     assert "Propagate poll_done() failures." in llm.seen_messages[0][1]["content"]

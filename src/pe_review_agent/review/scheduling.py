@@ -13,7 +13,7 @@ from typing import Any
 from pe_review_agent.config import ReviewSettings
 from pe_review_agent.llm.client import LlmClient, ToolCall, assistant_message_for_tool_loop
 from pe_review_agent.repos.tools import RepositoryToolExecutor
-from pe_review_agent.retry import ContextLengthError, TransientError
+from pe_review_agent.retry import ContextLengthError, PermanentError, TransientError
 from pe_review_agent.review.progress import (
     Invocation,
     Phase,
@@ -212,7 +212,8 @@ class RoundRobinReview:
                             "Using only evidence already in this conversation, return the "
                             "requested final JSON now. Do not invent missing code or contracts. "
                             "Return only evidence-supported findings; insufficient evidence is not "
-                            "proof that an earlier issue was fixed. Do not request any more tools."
+                            "proof that an earlier issue was fixed. Do not request any more tools. "
+                            f"{self._compact_output_instruction(phase)}"
                         ),
                     },
                 ]
@@ -224,11 +225,63 @@ class RoundRobinReview:
                     reason=final_reason,
                 )
             try:
+                completion_was_final = final
                 completion = await self._llm_step(phase, session, transcript, final=final)
                 if completion.finish_reason == "length":
-                    raise TransientError("review response was truncated at the model output limit")
+                    self._refund_incomplete_llm_usage(session, completion)
+                    await self._trace(
+                        event="output_truncation_recovery",
+                        phase=phase,
+                        work_key=session.work.key,
+                        round=session.calls + 1,
+                        output_tokens=completion.output_tokens,
+                    )
+                    recovery_transcript = [
+                        *transcript,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response hit the model output limit and is "
+                                "unusable. Do not continue it. Recreate the requested JSON from "
+                                "scratch using "
+                                "only evidence already in this conversation. "
+                                f"{self._compact_output_instruction(phase)}"
+                            ),
+                        },
+                    ]
+                    completion = await self._llm_step(
+                        phase,
+                        session,
+                        recovery_transcript,
+                        final=True,
+                    )
+                    completion_was_final = True
+                    if completion.finish_reason == "length":
+                        self._refund_incomplete_llm_usage(session, completion)
+                        try:
+                            children = split(session.work)
+                        except PermanentError as exc:
+                            raise TransientError(
+                                "review response was truncated again during compact finalization "
+                                "and the work item cannot be split further"
+                            ) from exc
+                        if not children:
+                            raise TransientError(
+                                "review response was truncated again during compact finalization "
+                                "and the work item cannot be split further"
+                            )
+                        await self._checkpoint(phase, session, "SPLIT")
+                        outcome.saved += 1
+                        waiting.extend(children)
+                        await self._trace(
+                            event="output_truncation_split",
+                            phase=phase,
+                            work_key=session.work.key,
+                            child_count=len(children),
+                        )
+                        continue
                 if completion.tool_calls:
-                    if final:
+                    if completion_was_final:
                         raise TransientError(
                             "review model emitted tools in the final no-tools turn"
                         )
@@ -267,6 +320,35 @@ class RoundRobinReview:
         outcome.limitations = list(dict.fromkeys(outcome.limitations))
         return outcome
 
+    def _compact_output_instruction(self, phase: Phase) -> str:
+        finding_instruction = (
+            "Return every independently actionable finding supported by this chunk; do not pad "
+            "with speculative, duplicate, stylistic, or low-signal findings. "
+            if phase == "candidate"
+            else "Return at most 8 findings because verifier batches contain at most 8 candidates. "
+        )
+        return (
+            "Be extremely concise. Emit JSON only, with no chain-of-thought, analysis, Markdown, "
+            f"preamble, or code fences. {finding_instruction}"
+            "Do not repeat source code or the same evidence in multiple fields. Keep summary text "
+            "under 800 characters; each title under 120; message under 500; impact under 300; "
+            "evidence under 700; remediation under 300 characters."
+        )
+
+    def _refund_incomplete_llm_usage(
+        self,
+        session: _Session,
+        completion: Any,
+    ) -> None:
+        """Do not charge an unusable truncated response to the reusable operational allowance."""
+
+        input_tokens = completion.input_tokens or 0
+        output_tokens = completion.output_tokens or 0
+        for usage in (session.usage, self.budget.usage):
+            usage.llm_calls = max(0, usage.llm_calls - 1)
+            usage.input_tokens = max(0, usage.input_tokens - input_tokens)
+            usage.output_tokens = max(0, usage.output_tokens - output_tokens)
+
     async def _llm_step(
         self,
         phase: Phase,
@@ -301,7 +383,19 @@ class RoundRobinReview:
             await self.backend.record_invocation(invocation)
             self._tokens(session, invocation.input_tokens, invocation.output_tokens)
             raise
-        invocation.status = "completed"
+        if completion.finish_reason == "length":
+            invocation.status = "failed"
+            reasoning = completion.raw_message.get("reasoning_content")
+            reasoning_chars = len(reasoning) if isinstance(reasoning, str) else 0
+            max_output_tokens = getattr(self.llm.settings, "max_output_tokens", None)
+            invocation.error = (
+                "finish_reason=length; "
+                f"configured_max_output_tokens={max_output_tokens}; "
+                f"response_chars={len(completion.content)}; "
+                f"reasoning_chars={reasoning_chars}"
+            )
+        else:
+            invocation.status = "completed"
         invocation.input_tokens = completion.input_tokens
         invocation.output_tokens = completion.output_tokens
         await self.backend.record_invocation(invocation)
