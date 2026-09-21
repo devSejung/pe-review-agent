@@ -40,6 +40,7 @@ from pe_review_agent.jobs.models import (
     ServiceState,
 )
 from pe_review_agent.jobs.state_machine import require_transition, valid_retry_target
+from pe_review_agent.retry import ProviderUnavailableError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 from pe_review_agent.review.lineage import FindingHistory
 
@@ -61,6 +62,13 @@ class JobRecord:
     event_payload: dict[str, Any]
     superseded_by_job_id: uuid.UUID | None = None
     retry_epoch_start_attempt: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRetryStatus:
+    count: int
+    first_failed_at: datetime | None
+    last_failed_at: datetime | None
 
 
 class PublishGuardStatus(StrEnum):
@@ -174,6 +182,10 @@ def _count_consumed_retry_attempts_select(job_id: uuid.UUID, stage: AttemptStage
             Attempt.stage == stage.value,
             Attempt.attempt_number > Job.retry_epoch_start_attempt,
             or_(Attempt.success.is_(False), Attempt.finished_at.is_(None)),
+            or_(
+                Attempt.error_class.is_(None),
+                Attempt.error_class != ProviderUnavailableError.__name__,
+            ),
         )
     )
 
@@ -676,6 +688,46 @@ class JobStore:
         async with self._sessions() as session:
             count = await session.scalar(_count_consumed_retry_attempts_select(job_id, stage))
             return int(count or 0)
+
+    async def provider_retry_status(
+        self,
+        job_id: uuid.UUID,
+        *,
+        stage: AttemptStage,
+    ) -> ProviderRetryStatus:
+        """Return the trailing provider-unavailable streak in the current retry epoch."""
+
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(Attempt.error_class, Attempt.finished_at)
+                    .join(Job, Job.id == Attempt.job_id)
+                    .where(
+                        Attempt.job_id == job_id,
+                        Attempt.stage == stage.value,
+                        Attempt.attempt_number > Job.retry_epoch_start_attempt,
+                    )
+                    .order_by(Attempt.attempt_number.desc())
+                )
+            ).all()
+            count = 0
+            first_failed_at: datetime | None = None
+            last_failed_at: datetime | None = None
+            for error_class, finished_at in rows:
+                if (
+                    error_class != ProviderUnavailableError.__name__
+                    or finished_at is None
+                ):
+                    break
+                count += 1
+                if last_failed_at is None:
+                    last_failed_at = finished_at
+                first_failed_at = finished_at
+            return ProviderRetryStatus(
+                count=count,
+                first_failed_at=first_failed_at,
+                last_failed_at=last_failed_at,
+            )
 
     async def finish_attempt(
         self,

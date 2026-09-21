@@ -18,7 +18,21 @@
   <div class="col-md-3"><div class="card"><div class="card-body"><div class="subheader">Revision</div><div class="font-monospace small text-break">{{ audit.revision_sha }}</div></div></div></div>
 </div>
 
-{% if audit.last_error %}
+{% if audit.last_error_class == 'ProviderUnavailableError' and audit.state in ['RETRY_WAIT', 'REVIEWING'] %}
+<div class="card border-warning mb-4">
+  <div class="card-header"><h3 class="card-title text-warning">{% if audit.state == 'RETRY_WAIT' %}Waiting for LLM provider{% else %}Retrying after LLM provider outage{% endif %}</h3></div>
+  <div class="card-body">
+    <div class="row g-3 mb-3">
+      <div class="col-md-4"><div class="subheader">Provider retry</div><div class="h3 mb-0">{{ audit.provider_retry.count }} / {{ audit.provider_retry.limit }}</div></div>
+      <div class="col-md-4"><div class="subheader">{% if audit.state == 'RETRY_WAIT' %}Retry scheduled{% else %}Retry status{% endif %}</div><div>{% if audit.state == 'RETRY_WAIT' %}{{ audit.next_attempt_at | display_time(display_timezone) }}{% else %}in progress{% endif %}</div></div>
+      <div class="col-md-4"><div class="subheader">Provider wait budget</div><div>{{ audit.provider_retry.max_wait_seconds // 60 }} min</div></div>
+    </div>
+    {% if audit.provider_retry.first_failed_at %}<div class="text-secondary small mb-2">Unavailable since {{ audit.provider_retry.first_failed_at | display_time(display_timezone) }}</div>{% endif %}
+    <pre class="audit-pre text-warning">{{ audit.last_error }}</pre>
+    <div class="text-secondary small mt-2">This is an LLM deployment/gateway availability retry and does not consume the REVIEW retry budget.</div>
+  </div>
+</div>
+{% elif audit.last_error %}
 <div class="card border-danger mb-4">
   <div class="card-header"><h3 class="card-title text-danger">Current failure</h3></div>
   <div class="card-body">

@@ -29,7 +29,7 @@ from pe_review_agent.jobs import (
     PublishGuardStatus,
 )
 from pe_review_agent.jobs.progress import PostgresProgressBackend
-from pe_review_agent.retry import TransientError
+from pe_review_agent.retry import ProviderUnavailableError, TransientError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
 from pe_review_agent.review.progress import Invocation, ReviewProgress, Usage
 
@@ -479,6 +479,55 @@ async def test_manual_requeue_starts_new_retry_epoch_without_erasing_attempt_his
     assert requeued.retry_epoch_start_attempt == 1
     assert await jobs.count_attempts(job.id, stage=AttemptStage.FETCH) == 1
     assert await jobs.count_consumed_retry_attempts(job.id, stage=AttemptStage.FETCH) == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_unavailable_attempts_do_not_consume_review_retry_budget(store) -> None:
+    jobs, _database = store
+    job, _ = await jobs.enqueue(
+        _event(patchset=1, revision="f" * 40), review_policy_version="firmware-v1"
+    )
+    claim = await jobs.claim_next(worker_id="worker", lease_seconds=120)
+    assert claim is not None and claim.id == job.id
+    await jobs.transition(job.id, JobState.FETCHING, worker_id="worker")
+    await jobs.transition(job.id, JobState.REVIEWING, worker_id="worker")
+
+    provider_attempt = await jobs.start_attempt(
+        job.id, stage=AttemptStage.REVIEW, worker_id="worker"
+    )
+    await jobs.finish_attempt(
+        provider_attempt,
+        success=False,
+        retryable=True,
+        error=ProviderUnavailableError("LLM HTTP 429", retry_after_seconds=5),
+    )
+
+    assert await jobs.count_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    assert await jobs.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    provider = await jobs.provider_retry_status(job.id, stage=AttemptStage.REVIEW)
+    assert provider.count == 1
+    assert provider.first_failed_at is not None
+    assert provider.last_failed_at == provider.first_failed_at
+
+    review_attempt = await jobs.start_attempt(
+        job.id, stage=AttemptStage.REVIEW, worker_id="worker"
+    )
+    await jobs.finish_attempt(
+        review_attempt,
+        success=False,
+        retryable=True,
+        error=TransientError("invalid model response"),
+    )
+
+    assert await jobs.count_attempts(job.id, stage=AttemptStage.REVIEW) == 2
+    assert await jobs.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    assert (await jobs.provider_retry_status(job.id, stage=AttemptStage.REVIEW)).count == 0
+
+    await jobs.mark_failed_permanent(job.id, error="operator retry", worker_id="worker")
+    requeued = await jobs.requeue_failed(job.id)
+    assert requeued.retry_epoch_start_attempt == 2
+    assert await jobs.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    assert (await jobs.provider_retry_status(job.id, stage=AttemptStage.REVIEW)).count == 0
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,12 @@ from pe_review_agent.jobs.progress import PostgresProgressBackend
 from pe_review_agent.llm import LlmClient
 from pe_review_agent.observability import METRICS, log_event
 from pe_review_agent.repos import RepositoryManager, RepositoryToolExecutor
-from pe_review_agent.retry import PermanentError, TransientError, exponential_backoff
+from pe_review_agent.retry import (
+    PermanentError,
+    ProviderUnavailableError,
+    TransientError,
+    exponential_backoff,
+)
 from pe_review_agent.review import NativeFirmwareReviewEngine
 from pe_review_agent.review.lineage import (
     FindingHistory,
@@ -800,15 +805,50 @@ class ReviewWorker:
         job = await self.store.get(job_id)
         if job is None:
             return
+        provider_retry = (
+            isinstance(error, ProviderUnavailableError) and stage is AttemptStage.REVIEW
+        )
         stage_attempts = await self.store.count_consumed_retry_attempts(job_id, stage=stage)
         budget = self._retry_budget(stage)
+        retry_after: float | None = None
+        if provider_retry:
+            provider = await self.store.provider_retry_status(job_id, stage=stage)
+            now = datetime.now(UTC)
+            elapsed = (
+                max(0.0, (now - provider.first_failed_at).total_seconds())
+                if provider.first_failed_at is not None
+                else 0.0
+            )
+            provider_attempt_limit = self.settings.retry.llm_provider_attempts
+            provider_wait_limit = float(self.settings.retry.llm_provider_max_wait_seconds)
+            if provider.count >= provider_attempt_limit or elapsed >= provider_wait_limit:
+                await self._provider_retry_exhausted(
+                    job,
+                    worker_id=worker_id,
+                    count=provider.count,
+                    elapsed=elapsed,
+                    last_error=error,
+                )
+                return
+            retry_after = error.retry_after_seconds
+            if retry_after is None:
+                retry_after = exponential_backoff(
+                    provider.count,
+                    base_seconds=self.settings.retry.base_seconds,
+                    max_seconds=self.settings.retry.max_seconds,
+                    jitter_ratio=self.settings.retry.jitter_ratio,
+                )
+            remaining_provider_wait = max(0.0, provider_wait_limit - elapsed)
+            retry_after = min(max(1.0, retry_after), remaining_provider_wait)
+
         # RECONCILE and explicit recovery-only passes do not authorize a new expensive or
         # side-effecting attempt. A previously ambiguous Gerrit POST or an already-complete review
         # may be waiting
         # only for a transient read to recover, so ordinary stage-attempt exhaustion cannot prove
         # those durable facts absent.
         if (
-            stage is not AttemptStage.RECONCILE
+            not provider_retry
+            and stage is not AttemptStage.RECONCILE
             and stage_attempts >= budget
             and not allow_recovery_pass
         ):
@@ -822,7 +862,8 @@ class ReviewWorker:
             METRICS.failed_total.labels(project=job.project, stage=stage.value).inc()
             return
 
-        retry_after = error.retry_after_seconds if isinstance(error, TransientError) else None
+        if retry_after is None:
+            retry_after = error.retry_after_seconds if isinstance(error, TransientError) else None
         if retry_after is None:
             retry_after = exponential_backoff(
                 stage_attempts,
@@ -858,12 +899,50 @@ class ReviewWorker:
         )
         METRICS.stage_retries_total.labels(stage=stage.value, reason=type(error).__name__).inc()
 
+    async def _provider_retry_exhausted(
+        self,
+        job: JobRecord,
+        *,
+        worker_id: str,
+        count: int,
+        elapsed: float,
+        last_error: BaseException | str | None = None,
+    ) -> None:
+        suffix = f"; last error: {last_error}" if last_error is not None else ""
+        await self.store.mark_failed_permanent(
+            job.id,
+            worker_id=worker_id,
+            error=PermanentError(
+                "LLM provider remained unavailable after "
+                f"{count} provider retries over {int(elapsed)}s{suffix}"
+            ),
+        )
+        METRICS.failed_total.labels(project=job.project, stage="LLM_PROVIDER").inc()
+
     async def _can_start_attempt(
         self,
         job: JobRecord,
         stage: AttemptStage,
         worker_id: str,
     ) -> bool:
+        if stage is AttemptStage.REVIEW:
+            provider = await self.store.provider_retry_status(job.id, stage=stage)
+            if provider.count and provider.first_failed_at is not None:
+                elapsed = max(
+                    0.0,
+                    (datetime.now(UTC) - provider.first_failed_at).total_seconds(),
+                )
+                if (
+                    provider.count >= self.settings.retry.llm_provider_attempts
+                    or elapsed >= self.settings.retry.llm_provider_max_wait_seconds
+                ):
+                    await self._provider_retry_exhausted(
+                        job,
+                        worker_id=worker_id,
+                        count=provider.count,
+                        elapsed=elapsed,
+                    )
+                    return False
         consumed = await self.store.count_consumed_retry_attempts(job.id, stage=stage)
         if stage is AttemptStage.RECONCILE:
             return True

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
@@ -10,7 +11,12 @@ import httpx
 
 from pe_review_agent.config import LlmSettings
 from pe_review_agent.observability.metrics import METRICS
-from pe_review_agent.retry import ContextLengthError, PermanentError, TransientError
+from pe_review_agent.retry import (
+    ContextLengthError,
+    PermanentError,
+    ProviderUnavailableError,
+    TransientError,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,9 +122,11 @@ class LlmClient:
                 httpx.ConnectTimeout,
                 httpx.RemoteProtocolError,
             ) as exc:
-                raise TransientError(f"LLM transport failure: {type(exc).__name__}: {exc}") from exc
+                raise ProviderUnavailableError(
+                    f"LLM transport failure: {type(exc).__name__}: {exc}"
+                ) from exc
             except httpx.HTTPError as exc:
-                raise TransientError(f"LLM HTTP transport failure: {exc}") from exc
+                raise ProviderUnavailableError(f"LLM HTTP transport failure: {exc}") from exc
             finally:
                 METRICS.llm_latency_seconds.observe(perf_counter() - started)
 
@@ -177,12 +185,12 @@ class LlmClient:
     def _raise_for_status(self, response: httpx.Response) -> None:
         status = response.status_code
         detail = response.text[:2000]
-        retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+        retry_after = _provider_retry_after_seconds(response)
         message = f"LLM HTTP {status}: {detail}"
         if status in (400, 413, 422) and _looks_like_context_length_error(detail):
             raise ContextLengthError(message)
         if status == 429 or 500 <= status <= 599:
-            raise TransientError(message, retry_after_seconds=retry_after)
+            raise ProviderUnavailableError(message, retry_after_seconds=retry_after)
         if status in (408, 409, 425):
             raise TransientError(message, retry_after_seconds=retry_after)
         if status in (400, 401, 403, 404, 422):
@@ -218,6 +226,18 @@ def _retry_after_seconds(value: str | None) -> float | None:
         return max(0.0, float(value))
     except ValueError:
         return None
+
+
+def _provider_retry_after_seconds(response: httpx.Response) -> float | None:
+    retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+    if retry_after is not None:
+        return retry_after
+    match = re.search(
+        r"\b(?:try\s+again|retry)\s+in\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b",
+        response.text,
+        flags=re.IGNORECASE,
+    )
+    return max(0.0, float(match.group(1))) if match else None
 
 
 def _int_or_none(value: Any) -> int | None:

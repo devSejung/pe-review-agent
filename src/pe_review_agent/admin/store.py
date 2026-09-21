@@ -24,6 +24,7 @@ from pe_review_agent.jobs.models import (
     ReviewResultRow,
     ServiceState,
 )
+from pe_review_agent.retry import ProviderUnavailableError
 
 _RUNTIME_CONFIG_KEY = "admin-runtime-config"
 _RUNTIME_STORAGE_VERSION_KEY = "_storage_version"
@@ -675,6 +676,29 @@ class ControlStore:
             ).one()
             audit = _job_dict(job)
             audit["current_failure_at"] = _current_failure_at(job, attempts, publication)
+            provider_attempts: list[Attempt] = []
+            for attempt in reversed(attempts):
+                if attempt.attempt_number <= job.retry_epoch_start_attempt:
+                    break
+                if (
+                    attempt.error_class != ProviderUnavailableError.__name__
+                    or attempt.finished_at is None
+                ):
+                    break
+                provider_attempts.append(attempt)
+            audit["provider_retry"] = {
+                "count": len(provider_attempts),
+                "first_failed_at": (
+                    min(attempt.finished_at for attempt in provider_attempts)
+                    if provider_attempts
+                    else None
+                ),
+                "last_failed_at": (
+                    max(attempt.finished_at for attempt in provider_attempts)
+                    if provider_attempts
+                    else None
+                ),
+            }
             audit["review_progress"] = [
                 {"input_key": row.input_key, "updated_at": row.updated_at, **row.payload}
                 for row in progress_rows

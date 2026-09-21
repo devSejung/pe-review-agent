@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,7 @@ from pe_review_agent.jobs import JobStore, PublicationStatus
 from pe_review_agent.jobs.progress import PostgresProgressBackend
 from pe_review_agent.llm.client import LlmCompletion
 from pe_review_agent.repos.manager import RepositoryWorkspace
-from pe_review_agent.retry import PermanentError, TransientError
+from pe_review_agent.retry import PermanentError, ProviderUnavailableError, TransientError
 from pe_review_agent.review import NativeFirmwareReviewEngine
 from pe_review_agent.service import ReviewWorker
 
@@ -130,6 +131,22 @@ class _FakeEngine:
         )
 
 
+class _ProviderFlakyEngine(_FakeEngine):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+
+    async def review(self, *args, **kwargs) -> ReviewResult:  # type: ignore[no-untyped-def]
+        if self.failures:
+            self.failures -= 1
+            self.calls += 1
+            raise ProviderUnavailableError(
+                "LLM HTTP 429: No deployments available; Try again in 0 seconds.",
+                retry_after_seconds=0,
+            )
+        return await super().review(*args, **kwargs)
+
+
 class _HistoryAwareFakeEngine:
     def __init__(self) -> None:
         self.contexts: list[ReviewContext] = []
@@ -226,6 +243,8 @@ def _settings(
     fetch_attempts: int = 3,
     review_attempts: int = 3,
     publish_attempts: int = 3,
+    llm_provider_attempts: int = 12,
+    llm_provider_max_wait_seconds: int = 1800,
 ) -> Settings:
     assert DSN is not None
     return Settings.model_validate(
@@ -247,6 +266,8 @@ def _settings(
                 "fetch_attempts": fetch_attempts,
                 "review_attempts": review_attempts,
                 "publish_attempts": publish_attempts,
+                "llm_provider_attempts": llm_provider_attempts,
+                "llm_provider_max_wait_seconds": llm_provider_max_wait_seconds,
                 "base_seconds": 0.01,
                 "max_seconds": 0.1,
                 "jitter_ratio": 0,
@@ -915,6 +936,8 @@ async def test_real_engine_verifier_retry_uses_postgres_progress_and_refunds_fai
     await _run_review_once(worker, store)
     failed = await store.get(job.id)
     assert failed is not None and failed.state is JobState.RETRY_WAIT
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 1
+    assert (await store.provider_retry_status(job.id, stage=AttemptStage.REVIEW)).count == 0
     await _run_review_once(worker, store)
     ready = await store.get(job.id)
     assert ready is not None and ready.state is JobState.READY_TO_PUBLISH
@@ -1066,6 +1089,143 @@ async def test_lost_complete_progress_commit_ack_recovers_without_new_review_att
     await database.close()
 
 
+@pytest.mark.asyncio
+async def test_llm_provider_outage_does_not_consume_review_retry_budget(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        review_attempts=1,
+        llm_provider_attempts=3,
+        llm_provider_max_wait_seconds=300,
+    )
+    database = Database(settings.database)
+    await _truncate(database)
+    _write_source(tmp_path)
+    store = JobStore(database.sessions)
+    job = await _enqueue_default(store, settings)
+    engine = _ProviderFlakyEngine(failures=2)
+    worker = ReviewWorker(
+        settings,
+        store,
+        _FakeGerrit(),  # type: ignore[arg-type]
+        _FakeRepos(tmp_path),  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+    )
+
+    await _run_review_once(worker, store)
+    first_retry = await store.get(job.id)
+    assert first_retry is not None and first_retry.state is JobState.RETRY_WAIT
+    assert first_retry.next_attempt_at > datetime.now(UTC)
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    await _make_retry_due(database, job.id)
+
+    await _run_review_once(worker, store)
+    second_retry = await store.get(job.id)
+    assert second_retry is not None and second_retry.state is JobState.RETRY_WAIT
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    await _make_retry_due(database, job.id)
+
+    await _run_review_once(worker, store)
+    ready = await store.get(job.id)
+    assert ready is not None and ready.state is JobState.READY_TO_PUBLISH
+    provider = await store.provider_retry_status(job.id, stage=AttemptStage.REVIEW)
+    assert provider.count == 0
+    assert await store.count_attempts(job.id, stage=AttemptStage.REVIEW) == 3
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    assert engine.calls == 3
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_provider_has_separate_retry_attempt_limit(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        review_attempts=1,
+        llm_provider_attempts=2,
+        llm_provider_max_wait_seconds=300,
+    )
+    database = Database(settings.database)
+    await _truncate(database)
+    _write_source(tmp_path)
+    store = JobStore(database.sessions)
+    job = await _enqueue_default(store, settings)
+    worker = ReviewWorker(
+        settings,
+        store,
+        _FakeGerrit(),  # type: ignore[arg-type]
+        _FakeRepos(tmp_path),  # type: ignore[arg-type]
+        _ProviderFlakyEngine(failures=99),  # type: ignore[arg-type]
+    )
+
+    await _run_review_once(worker, store)
+    first_retry = await store.get(job.id)
+    assert first_retry is not None and first_retry.state is JobState.RETRY_WAIT
+    await _make_retry_due(database, job.id)
+    await _run_review_once(worker, store)
+
+    failed = await store.get(job.id)
+    assert failed is not None and failed.state is JobState.FAILED_PERMANENT
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    assert (await store.provider_retry_status(job.id, stage=AttemptStage.REVIEW)).count == 2
+    async with database.session() as session:
+        last_error = await session.scalar(
+            text("SELECT last_error FROM review_jobs WHERE id = CAST(:job_id AS uuid)"),
+            {"job_id": str(job.id)},
+        )
+    assert "LLM provider remained unavailable after 2 provider retries" in str(last_error)
+    assert "REVIEW retry budget exhausted" not in str(last_error)
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_provider_has_separate_max_wait_window(tmp_path: Path) -> None:
+    settings = _settings(
+        tmp_path,
+        review_attempts=1,
+        llm_provider_attempts=20,
+        llm_provider_max_wait_seconds=30,
+    )
+    database = Database(settings.database)
+    await _truncate(database)
+    _write_source(tmp_path)
+    store = JobStore(database.sessions)
+    job = await _enqueue_default(store, settings)
+    engine = _ProviderFlakyEngine(failures=99)
+    worker = ReviewWorker(
+        settings,
+        store,
+        _FakeGerrit(),  # type: ignore[arg-type]
+        _FakeRepos(tmp_path),  # type: ignore[arg-type]
+        engine,  # type: ignore[arg-type]
+    )
+
+    await _run_review_once(worker, store)
+    async with database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE review_attempts "
+                "SET finished_at = now() - interval '31 seconds' "
+                "WHERE job_id = CAST(:job_id AS uuid) "
+                "AND error_class = 'ProviderUnavailableError'"
+            ),
+            {"job_id": str(job.id)},
+        )
+        await session.commit()
+    await _make_retry_due(database, job.id)
+
+    await _run_review_once(worker, store)
+    failed = await store.get(job.id)
+    assert failed is not None and failed.state is JobState.FAILED_PERMANENT
+    assert await store.count_consumed_retry_attempts(job.id, stage=AttemptStage.REVIEW) == 0
+    assert engine.calls == 1
+    async with database.session() as session:
+        last_error = await session.scalar(
+            text("SELECT last_error FROM review_jobs WHERE id = CAST(:job_id AS uuid)"),
+            {"job_id": str(job.id)},
+        )
+    assert "provider retries over 3" in str(last_error)
+    await database.close()
+
+
 async def _truncate(database: Database) -> None:
     async with database.session() as session:
         await session.execute(
@@ -1111,6 +1271,18 @@ async def _expire_lease(database: Database, job_id) -> None:
         await session.execute(
             text(
                 "UPDATE review_jobs SET lease_expires_at = now() - interval '1 second' "
+                "WHERE id = CAST(:job_id AS uuid)"
+            ),
+            {"job_id": str(job_id)},
+        )
+        await session.commit()
+
+
+async def _make_retry_due(database: Database, job_id) -> None:
+    async with database.session() as session:
+        await session.execute(
+            text(
+                "UPDATE review_jobs SET next_attempt_at = now() "
                 "WHERE id = CAST(:job_id AS uuid)"
             ),
             {"job_id": str(job_id)},
