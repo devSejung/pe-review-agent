@@ -177,6 +177,74 @@ async def test_tool_round_limit_forces_final_json_instead_of_failing(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_candidate_summary_list_is_normalized_after_forced_finalization(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "fw.c"
+    target.write_text("changed();\n", encoding="utf-8")
+    first = ToolCall(
+        id="call-1",
+        name="read_file",
+        arguments={"path": "fw.c"},
+        raw_arguments='{"path":"fw.c"}',
+    )
+    llm = FakeLlm(
+        [
+            _completion("", first),
+            _completion(
+                json.dumps(
+                    {
+                        "change_summary": [
+                            "changed() 호출 경로를 수정합니다.",
+                            "training 상태 처리를 갱신합니다.",
+                        ],
+                        "findings": [],
+                    },
+                    ensure_ascii=False,
+                )
+            ),
+        ]
+    )
+    settings = ReviewSettings(max_tool_rounds=1)
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=130,
+        patchset_number=1,
+        revision_sha="f" * 40,
+        diff="+changed();",
+        changed_files=["fw.c"],
+        changed_lines=[ChangedLine(path="fw.c", line=1, text="changed();")],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    assert result.findings == []
+    assert "changed() 호출 경로를 수정합니다." in result.summary
+    assert "training 상태 처리를 갱신합니다." in result.summary
+    assert llm.seen_tools[-1] is None
+
+
+def test_candidate_schema_error_distinguishes_valid_json_from_json_syntax_error() -> None:
+    llm = FakeLlm([])
+    engine = NativeFirmwareReviewEngine(llm, ReviewSettings())  # type: ignore[arg-type]
+
+    with pytest.raises(TransientError, match="failed review schema validation"):
+        engine._parse_candidate_review(  # noqa: SLF001
+            json.dumps({"change_summary": ["valid", 7], "findings": []}),
+            stage="candidate test",
+        )
+
+    with pytest.raises(TransientError, match="not valid review JSON"):
+        engine._parse_candidate_review(  # noqa: SLF001
+            '{"change_summary": ',
+            stage="candidate test",
+        )
+
+
+@pytest.mark.asyncio
 async def test_duplicate_repository_tool_call_is_suppressed_and_finalized(tmp_path: Path) -> None:
     target = tmp_path / "fw.c"
     target.write_text("changed();\n", encoding="utf-8")
