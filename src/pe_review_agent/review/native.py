@@ -487,7 +487,7 @@ intent; never copy claims from the subject or commit message when the diff does 
 
 Return ONLY a JSON object with this shape:
 {{
-  "change_summary": "1-3 factual bullets about this diff chunk; no review verdict",
+  "change_summary": "single JSON string; 1-3 factual bullets separated by \\n; no verdict",
   "findings": [
     {{
       "severity": "P0|P1|P2",
@@ -688,10 +688,24 @@ Return ONLY a JSON object with this shape:
         raw = _extract_json_object(content)
         try:
             data = json.loads(raw)
-            return _CandidateReview.model_validate(data)
-        except (json.JSONDecodeError, ValidationError) as exc:
+        except json.JSONDecodeError as exc:
             raise TransientError(
                 f"{stage} model output was not valid review JSON: {content[:1500]}"
+            ) from exc
+        if isinstance(data, dict) and isinstance(data.get("change_summary"), list):
+            summary_items = data["change_summary"]
+            if all(isinstance(item, str) for item in summary_items):
+                data["change_summary"] = "\n".join(
+                    f"- {item.strip().lstrip('-•* ').strip()}"
+                    for item in summary_items
+                    if item.strip()
+                )
+        try:
+            return _CandidateReview.model_validate(data)
+        except ValidationError as exc:
+            raise TransientError(
+                f"{stage} model output failed review schema validation: {exc}; "
+                f"output: {content[:1500]}"
             ) from exc
 
     def _parse_verification_review(self, content: str, *, stage: str) -> _VerificationReview:
