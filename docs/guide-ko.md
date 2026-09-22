@@ -1199,18 +1199,33 @@ Settings
 예:
 
 ```markdown
-**[P1] timeout 이후에도 training state가 진행됨**
+### `P1` timeout 이후에도 training state가 진행됨
 
 poll_done()이 -ETIMEDOUT을 반환하지만 호출부에서 반환값을 무시합니다.
 
-**Impact:** ...
-**Evidence:** ...
-**Suggested fix:** ...
+`영향`
+
+> ...
+
+`근거`
+
+> ...
+
+`수정 방향`
+
+> ...
 ```
 
-Gerrit inline comment는 Markdown을 사용해 severity/title과 `Impact`/`Evidence`/`Suggested fix`
-label을 bold로 표시합니다. 한국어 review에서는 `영향`/`근거`/`수정 방향` label을 같은 방식으로
-강조합니다.
+Gerrit inline comment는 Markdown heading + inline-code label + blockquote를 사용합니다. 제목은
+`###` heading으로, severity와 `영향`/`근거`/`수정 방향` label은 inline-code chip으로, 각 section
+본문은 별도 blockquote로 표시하여 좁은 inline comment에서도 section 경계와 줄바꿈이 분명하게
+보이도록 합니다. 영어 review는 `Impact`/`Evidence`/`Suggested fix`를 같은 방식으로 표시합니다.
+
+이 포맷은 **새 publication intent를 만들 때** 적용됩니다. 이미 `PUBLISHING` 상태에서 durable
+`request_payload`가 만들어진 Job은 재시작/업그레이드 후에도 payload를 다시 포맷하지 않습니다.
+Gerrit POST의 idempotency와 lost-ACK 복구를 위해 저장된 ReviewInput을 그대로 재사용하기 때문입니다.
+따라서 formatter 배포 전에 만들어진 `PENDING`/`AMBIGUOUS` publication은 예전 평문 형식으로 게시될
+수 있으며, 새 Job부터 현재 포맷이 적용됩니다.
 
 모델이 `end_character <= start_character` 같은 유효하지 않은 optional character range를 반환해도
 finding 전체를 실패시키지 않습니다. `path + side + start_line`이 유효하면 해당 잘못된 character
