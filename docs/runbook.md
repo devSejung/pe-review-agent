@@ -197,6 +197,12 @@ when the round budget is exhausted, disables repository tools for one final JSON
 discarding the whole review. The Job Audit page records the bounded tool trace and forced-finalization
 reason for diagnosis.
 
+`search_text` includes ±12 lines of context for only the top six matches and leaves later matches as
+locations. `batch_read` can fetch at most six explicit file/line ranges in one model-visible tool call;
+each range is capped at 200 lines and the combined output is capped. A batch counts as one charged tool
+call, while the trace records how many range operations it attempted. Requests above six are truncated
+to the first six with a hint to request the remainder separately.
+
 Upgrade note: older releases stored a full runtime snapshot. At startup, a legacy section that is
 identical to the current `config.yaml` is removed automatically. A differing full snapshot is retained
 to avoid deleting a potentially intentional Admin edit; Connections or Settings shows a warning for
