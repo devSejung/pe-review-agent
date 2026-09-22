@@ -780,7 +780,9 @@ async def test_persisting_finding_is_tracked_but_not_reposted_inline(tmp_path: P
     assert engine.contexts[-1].previous_findings[0].semantic_id == semantic_id
     assert ps2_result.findings[0].semantic_id == semantic_id
     assert ps2_result.findings[0].lineage.value == "PERSISTING"
-    assert "지속 1건" in ps2_result.summary
+    assert "### Patch Set 추적" in ps2_result.summary
+    assert "- `기준` PS 1" in ps2_result.summary
+    assert "- `지속` 1건" in ps2_result.summary
 
     ps2_publish = await store.claim_next(worker_id="ps2-publisher", lease_seconds=120)
     assert ps2_publish is not None
@@ -790,7 +792,8 @@ async def test_persisting_finding_is_tracked_but_not_reposted_inline(tmp_path: P
     ps2_done = await store.get(ps2.id)
     assert ps2_done is not None and ps2_done.state == JobState.DONE
     assert "comments" not in gerrit.seen_payloads[-1]
-    assert "지속 1건" in gerrit.seen_payloads[-1]["message"]
+    assert "### Patch Set 추적" in gerrit.seen_payloads[-1]["message"]
+    assert "- `지속` 1건" in gerrit.seen_payloads[-1]["message"]
     assert len(gerrit.seen_payloads) == 2
     await database.close()
 

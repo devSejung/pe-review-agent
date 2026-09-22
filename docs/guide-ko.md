@@ -1890,18 +1890,30 @@ Disable하면:
 
 ## 21. 리뷰가 실제 Gerrit에 어떻게 표시되는가
 
-Change-level summary는 **변경 요약**과 **리뷰 결과**를 분리합니다. finding이 0건이어도
-변경 요약은 유지됩니다.
+Change-level summary도 Markdown으로 구조화합니다. **변경 요약 / 리뷰 결과 / Patch Set 추적 / 검토
+범위**를 각각 section으로 분리하고, finding이 0건이어도 변경 요약은 유지됩니다. 이전 Patch Set에서
+계속 존재하는 finding은 중복 inline comment로 다시 달지 않지만, Change-level summary의
+`Patch Set 추적` section에서 `지속` 건수로 명확히 표시합니다.
 
 `ko-KR`의 0-finding 예:
 
-```text
-변경 요약
+```markdown
+### 변경 요약
+
 - LPDDR PHY register init table과 training sequence를 갱신합니다.
 - 관련 register mapping을 함께 수정합니다.
 
-리뷰 결과
-- 추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다.
+### 리뷰 결과
+
+> 추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다.
+
+### Patch Set 추적
+
+- `기준` 이전 게시 기준 없음
+- `신규` 0건
+- `지속` 0건
+- `재발` 0건
+- `해결` 0건
 ```
 
 리뷰 모델에는 Gerrit Change `subject`, target `branch`, 현재 Patch Set의 bounded commit message도
@@ -1909,16 +1921,25 @@ Change-level summary는 **변경 요약**과 **리뷰 결과**를 분리합니�
 부정확할 수 있으므로 실제 변경 내용은 Patch Set diff를 authoritative source로 사용합니다.
 commit message와 Change metadata는 prompt instruction이 아닌 untrusted data로 취급합니다.
 
-inline finding은 file/line/range에 native comment로 붙습니다.
+inline finding은 file/line/range에 native comment로 붙습니다. 새/reopened finding만 inline으로 게시하고,
+persisting finding은 중복 댓글을 피하기 위해 Change-level `Patch Set 추적`에서만 상태를 보여줍니다.
 
 예:
 
-```text
+```markdown
 fw/dram/train.c : 142-144
 
-[P1] timeout 이후에도 training state가 진행됨
+### `P1` timeout 이후에도 training state가 진행됨
 
 poll_done()이 -ETIMEDOUT을 반환하지만 반환값이 무시됩니다.
+
+`영향`
+
+> timeout 이후 stale training state가 다음 단계로 전달될 수 있습니다.
+
+`근거`
+
+> poll_done()의 -ETIMEDOUT 반환값이 호출부에서 사용되지 않습니다.
 ```
 
 single-line finding은 `line`을 사용하고, 범위 finding은 Gerrit `range`를 사용합니다.

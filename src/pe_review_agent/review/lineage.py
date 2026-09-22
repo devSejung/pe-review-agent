@@ -116,55 +116,65 @@ def _tracking_summary(
 ) -> str:
     if language == "ko-KR":
         baseline = (
-            f"PS {baseline_patchset} 대비"
+            f"PS {baseline_patchset}"
             if baseline_patchset is not None
             else "이전 게시 기준 없음"
         )
-        header = (
-            f"Patch Set 추적 ({baseline}{'' if complete else ', 부분 검토'}): "
-            f"신규 {new_count}건, 지속 {persisting_count}건, 재발 {reopened_count}건"
-        )
-        header += (
-            f", 해결 {len(resolved)}건."
-            if complete
-            else (". 미검토된 이전 이슈는 해결된 것으로 판정하지 않았습니다.")
-        )
-        sections = [header, original.strip()]
+        tracking = [
+            "### Patch Set 추적",
+            "",
+            f"- `기준` {baseline}",
+            f"- `신규` {new_count}건",
+            f"- `지속` {persisting_count}건",
+            f"- `재발` {reopened_count}건",
+        ]
+        if complete:
+            tracking.append(f"- `해결` {len(resolved)}건")
+        else:
+            tracking.extend(
+                [
+                    "- `상태` 부분 검토",
+                    "- 미검토된 이전 이슈는 해결된 것으로 판정하지 않았습니다.",
+                ]
+            )
+        sections = [original.strip(), "\n".join(tracking)]
         if resolved:
-            lines = [f"- [{f.severity.value}] {f.title} ({f.location.path})" for f in resolved[:10]]
+            lines = [
+                f"- `{f.severity.value}` {f.title} (`{f.location.path}`)" for f in resolved[:10]
+            ]
             if len(resolved) > 10:
                 lines.append(f"- 외 {len(resolved) - 10}건")
-            sections.append("이전 게시 Patch Set 이후 해결된 이슈:\n" + "\n".join(lines))
+            sections.append("#### 해결된 이슈\n\n" + "\n".join(lines))
         return "\n\n".join(section for section in sections if section)
-    if baseline_patchset is None and complete:
-        header = (
-            f"Patch Set tracking: {new_count} new finding(s); no previously published baseline."
-        )
-    elif baseline_patchset is None:
-        header = (
-            f"Patch Set tracking (partial review): {new_count} new finding(s); "
-            "no previously published baseline."
-        )
-    elif not complete:
-        header = (
-            f"Patch Set tracking vs PS {baseline_patchset} (partial review): {new_count} new, "
-            f"{persisting_count} still present, {reopened_count} reopened. "
-            "Unreviewed prior findings were not classified as fixed."
-        )
+    baseline = (
+        f"PS {baseline_patchset}"
+        if baseline_patchset is not None
+        else "no published baseline"
+    )
+    tracking = [
+        "### Patch Set tracking",
+        "",
+        f"- `Baseline` {baseline}",
+        f"- `New` {new_count}",
+        f"- `Persisting` {persisting_count}",
+        f"- `Reopened` {reopened_count}",
+    ]
+    if complete:
+        tracking.append(f"- `Fixed` {len(resolved)}")
     else:
-        header = (
-            f"Patch Set tracking vs PS {baseline_patchset}: {new_count} new, "
-            f"{persisting_count} still present, {reopened_count} reopened, {len(resolved)} fixed."
+        tracking.extend(
+            [
+                "- `Status` partial review",
+                "- Unreviewed prior findings were not classified as fixed.",
+            ]
         )
-    sections = [header, original.strip()]
+    sections = [original.strip(), "\n".join(tracking)]
     if resolved:
         resolved_lines = [
-            f"- [{finding.severity.value}] {finding.title} ({finding.location.path})"
+            f"- `{finding.severity.value}` {finding.title} (`{finding.location.path}`)"
             for finding in resolved[:10]
         ]
         if len(resolved) > 10:
             resolved_lines.append(f"- ... and {len(resolved) - 10} more")
-        sections.append(
-            "Fixed since the previous published Patch Set:\n" + "\n".join(resolved_lines)
-        )
+        sections.append("#### Fixed findings\n\n" + "\n".join(resolved_lines))
     return "\n\n".join(section for section in sections if section)
