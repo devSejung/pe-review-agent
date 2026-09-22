@@ -194,10 +194,15 @@ async def test_publish_review_builds_summary_inline_and_range_comments() -> None
     line_comment, range_comment = payload["comments"]["drivers/dma.c"]
     assert line_comment["line"] == 88
     assert line_comment["side"] == "REVISION"
-    assert "**[P1] Unchecked descriptor index**" in line_comment["message"]
-    assert "**Impact:** Out-of-bounds MMIO access." in line_comment["message"]
-    assert "**Evidence:** idx is incremented without modulo reduction." in line_comment["message"]
-    assert "**Suggested fix:** Mask or reduce idx before dereference." in line_comment["message"]
+    assert "### `P1` Unchecked descriptor index" in line_comment["message"]
+    assert "`Impact`\n\n> Out-of-bounds MMIO access." in line_comment["message"]
+    assert (
+        "`Evidence`\n\n> idx is incremented without modulo reduction." in line_comment["message"]
+    )
+    assert (
+        "`Suggested fix`\n\n> Mask or reduce idx before dereference."
+        in line_comment["message"]
+    )
     assert range_comment["range"] == {
         "start_line": 120,
         "start_character": 4,
@@ -206,6 +211,32 @@ async def test_publish_review_builds_summary_inline_and_range_comments() -> None
     }
     assert range_comment["side"] == "PARENT"
     assert "line" not in range_comment
+
+
+def test_finding_message_preserves_multiline_section_readability() -> None:
+    review = ReviewResult(
+        summary="summary",
+        findings=[
+            Finding(
+                severity=Severity.P1,
+                category="mmio",
+                title="Shared register is overwritten",
+                message="The marker overwrites the address channel.",
+                impact="First consequence.\nSecond consequence.",
+                evidence="fw.c:10 — address source\ninit.c:20 — marker write",
+                remediation="Use a separate register.",
+                location=FindingLocation(path="fw.c", start_line=10),
+            )
+        ],
+        review_metadata={"output_language": "ko-KR"},
+    )
+
+    message = build_review_input(review)["comments"]["fw.c"][0]["message"]
+
+    assert message.startswith("### `P1` Shared register is overwritten\n\n")
+    assert "`영향`\n\n> First consequence.\n> Second consequence." in message
+    assert "`근거`\n\n> fw.c:10 — address source\n> init.c:20 — marker write" in message
+    assert "`수정 방향`\n\n> Use a separate register." in message
 
 
 @pytest.mark.asyncio
@@ -231,9 +262,7 @@ async def test_publish_review_rejects_superseded_revision_before_post() -> None:
 
 
 @pytest.mark.asyncio
-async def test_publish_review_input_posts_persisted_payload_unchanged_after_revision_guard() -> (
-    None
-):
+async def test_publish_review_input_preserves_legacy_plain_persisted_payload() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -251,7 +280,12 @@ async def test_publish_review_input_posts_persisted_payload_unchanged_after_revi
             "drivers/dma.c": [
                 {
                     "line": 88,
-                    "message": "Stored inline comment",
+                    "message": (
+                        "[P1] Legacy plain title\n\n"
+                        "Legacy description\n\n"
+                        "Impact: legacy impact\n\n"
+                        "Evidence: legacy evidence"
+                    ),
                 }
             ]
         },

@@ -583,14 +583,19 @@ def _finding_message(finding: Finding, language: str = "en-US") -> str:
         if language == "ko-KR"
         else ("Impact", "Evidence", "Suggested fix")
     )
-    sections = [f"**[{finding.severity}] {finding.title}**", finding.message]
+    sections = [f"### `{finding.severity}` {finding.title}", finding.message]
     if finding.impact:
-        sections.append(f"**{impact}:** {finding.impact}")
+        sections.append(_finding_section(impact, finding.impact))
     if finding.evidence:
-        sections.append(f"**{evidence}:** {finding.evidence}")
+        sections.append(_finding_section(evidence, finding.evidence))
     if finding.remediation:
-        sections.append(f"**{remediation}:** {finding.remediation}")
+        sections.append(_finding_section(remediation, finding.remediation))
     return "\n\n".join(sections)
+
+
+def _finding_section(label: str, value: str) -> str:
+    quoted = "\n".join(f"> {line}" if line else ">" for line in value.splitlines())
+    return f"`{label}`\n\n{quoted}"
 
 
 def _truncate_utf8_comment(value: str, max_bytes: int) -> str:

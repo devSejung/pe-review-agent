@@ -522,8 +522,8 @@ async def test_review_language_can_be_switched_to_english(tmp_path: Path) -> Non
 
     assert "clear English" in llm.seen_messages[0][1]["content"]
     assert "natural Korean" not in llm.seen_messages[0][1]["content"]
-    assert result.summary.startswith("Change summary\n- Updates changed().")
-    assert "Review result\n- No actionable firmware correctness issues" in result.summary
+    assert result.summary.startswith("### Change summary\n\n- Updates changed().")
+    assert "### Review result\n\n> No actionable firmware correctness issues" in result.summary
 
 
 @pytest.mark.asyncio
@@ -566,9 +566,9 @@ async def test_verifier_can_drop_candidate(tmp_path: Path) -> None:
     result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
 
     assert result.findings == []
-    assert "변경 요약" in result.summary
+    assert "### 변경 요약" in result.summary
     assert "fw.c의 호출 경로를 변경합니다." in result.summary
-    assert "리뷰 결과" in result.summary
+    assert "### 리뷰 결과" in result.summary
     assert "추가로 조치가 필요한 펌웨어 동작상 문제는 발견되지 않았습니다." in result.summary
 
 
@@ -867,7 +867,7 @@ async def test_candidate_chunk_budget_returns_partial_coverage_without_failing(
     assert budget["reviewable_files_total"] == 2
     assert budget["stop_reasons"] == ["max_candidate_chunks"]
     assert result.review_metadata["lineage_complete"] is False
-    assert "리뷰 범위" in result.summary
+    assert "### 검토 범위" in result.summary
     assert "1/2" in result.summary
 
 
@@ -1001,7 +1001,7 @@ async def test_job_tool_budget_forces_final_answer_and_discloses_limit(tmp_path:
         and event.get("reason") == "candidate_tool_budget"
         for event in trace
     )
-    assert "리뷰 범위" in result.summary
+    assert "### 검토 범위" in result.summary
 
 
 @pytest.mark.asyncio

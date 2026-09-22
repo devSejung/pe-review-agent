@@ -5,6 +5,7 @@ from pe_review_agent.domain import (
     ReviewResult,
     Severity,
 )
+from pe_review_agent.gerrit.client import build_review_input
 from pe_review_agent.review.lineage import (
     FindingHistory,
     findings_for_inline_publication,
@@ -65,7 +66,12 @@ def test_lineage_reconciles_new_persisting_reopened_and_resolved() -> None:
         FindingLineage.NEW,
     ]
     assert result.review.findings[2].semantic_id is not None
-    assert "vs PS 4: 1 new, 1 still present, 1 reopened, 1 fixed" in result.review.summary
+    assert "### Patch Set tracking" in result.review.summary
+    assert "- `Baseline` PS 4" in result.review.summary
+    assert "- `New` 1" in result.review.summary
+    assert "- `Persisting` 1" in result.review.summary
+    assert "- `Reopened` 1" in result.review.summary
+    assert "- `Fixed` 1" in result.review.summary
     assert "Clock stays enabled" in result.review.summary
     assert result.review.review_metadata["finding_lineage"]["resolved"] == 1
 
@@ -85,6 +91,42 @@ def test_persisting_finding_is_not_reposted_as_inline_comment() -> None:
     assert [finding.semantic_id for finding in published] == ["b" * 32, "c" * 32]
 
 
+def test_persisting_only_followup_uses_markdown_change_summary_without_inline_comment() -> None:
+    semantic_id = "d" * 32
+    previous = _finding("Timeout is ignored", semantic_id=semantic_id)
+    current = _finding("Timeout is ignored", semantic_id=semantic_id, line=14)
+    review = ReviewResult(
+        summary=(
+            "### 변경 요약\n\n- timeout 경로를 수정합니다.\n\n"
+            "### 리뷰 결과\n\n> 기존 이슈가 계속 존재합니다."
+        ),
+        findings=[current],
+        review_metadata={"output_language": "ko-KR"},
+    )
+    reconciled = reconcile_finding_lineage(
+        project="soc/fw",
+        review=review,
+        history=FindingHistory(
+            baseline_patchset=4,
+            previous_findings=(previous,),
+            seen_semantic_ids=frozenset({semantic_id}),
+        ),
+    ).review
+    inline_review = reconciled.model_copy(
+        update={"findings": findings_for_inline_publication(reconciled)},
+        deep=True,
+    )
+
+    payload = build_review_input(inline_review)
+
+    assert "comments" not in payload
+    assert "### 변경 요약" in payload["message"]
+    assert "### 리뷰 결과" in payload["message"]
+    assert "### Patch Set 추적" in payload["message"]
+    assert "- `기준` PS 4" in payload["message"]
+    assert "- `지속` 1건" in payload["message"]
+
+
 def test_initial_review_marks_every_verified_finding_new() -> None:
     current = _finding("Timeout is ignored")
     result = reconcile_finding_lineage(
@@ -99,7 +141,7 @@ def test_initial_review_marks_every_verified_finding_new() -> None:
 
     assert result.review.findings[0].lineage is FindingLineage.NEW
     assert result.review.findings[0].semantic_id is not None
-    assert "no previously published baseline" in result.review.summary
+    assert "- `Baseline` no published baseline" in result.review.summary
 
 
 def test_partial_review_tracks_seen_findings_without_resolving_unseen_prior_findings() -> None:
@@ -128,6 +170,6 @@ def test_partial_review_tracks_seen_findings_without_resolving_unseen_prior_find
     assert result.resolved_findings == ()
     assert result.review.review_metadata["finding_lineage"]["complete"] is False
     assert result.review.review_metadata["finding_lineage"]["resolved"] == 0
-    assert "partial review" in result.review.summary
-    assert "not classified as fixed" in result.review.summary
+    assert "- `Status` partial review" in result.review.summary
+    assert "Unreviewed prior findings were not classified as fixed." in result.review.summary
     assert findings_for_inline_publication(result.review) == []

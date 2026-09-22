@@ -892,14 +892,24 @@ Return ONLY a JSON object with this shape:
         budget_metadata: dict[str, Any] | None = None,
     ) -> str:
         if self.settings.output_language == "ko-KR":
-            summary = f"변경 요약\n{change_summary}\n\n리뷰 결과\n- {review_summary}"
+            summary = (
+                f"### 변경 요약\n\n{change_summary}\n\n"
+                f"### 리뷰 결과\n\n{self._quote_summary(review_summary)}"
+            )
             if budget_metadata is not None and not budget_metadata["complete"]:
                 summary += self._coverage_summary_ko(budget_metadata)
             return summary
-        summary = f"Change summary\n{change_summary}\n\nReview result\n- {review_summary}"
+        summary = (
+            f"### Change summary\n\n{change_summary}\n\n"
+            f"### Review result\n\n{self._quote_summary(review_summary)}"
+        )
         if budget_metadata is not None and not budget_metadata["complete"]:
             summary += self._coverage_summary_en(budget_metadata)
         return summary
+
+    @staticmethod
+    def _quote_summary(value: str) -> str:
+        return "\n".join(f"> {line}" if line else ">" for line in value.splitlines())
 
     @staticmethod
     def _coverage_summary_ko(metadata: dict[str, Any]) -> str:
@@ -910,11 +920,11 @@ Return ONLY a JSON object with this shape:
         reasons = ", ".join(metadata["stop_reasons"]) or "verification incomplete"
         verification = "완료" if metadata["verification_complete"] else "미완료"
         return (
-            "\n\n리뷰 범위\n"
-            f"- diff chunk {chunks}개 검토\n"
-            f"- diff 기준 변경 파일 {files}개 전체 범위 처리\n"
-            f"- finding 검증: {verification}\n"
-            f"- 제한 도달: `{reasons}`. 미검토 범위에는 추가 이슈가 있을 수 있습니다."
+            "\n\n### 검토 범위\n\n"
+            f"- `diff chunk` {chunks}개 검토\n"
+            f"- `변경 파일` {files}개 전체 범위 처리\n"
+            f"- `finding 검증` {verification}\n"
+            f"- `제한` `{reasons}` — 미검토 범위에는 추가 이슈가 있을 수 있습니다."
         )
 
     @staticmethod
@@ -926,11 +936,11 @@ Return ONLY a JSON object with this shape:
         reasons = ", ".join(metadata["stop_reasons"]) or "verification incomplete"
         verification = "complete" if metadata["verification_complete"] else "incomplete"
         return (
-            "\n\nReview coverage\n"
-            f"- Diff chunks reviewed: {chunks}\n"
-            f"- Files with complete diff coverage: {files}\n"
-            f"- Finding verification: {verification}\n"
-            f"- Limit reached: `{reasons}`. Unreviewed scope may contain additional issues."
+            "\n\n### Review coverage\n\n"
+            f"- `Diff chunks` {chunks} reviewed\n"
+            f"- `Files fully covered` {files}\n"
+            f"- `Finding verification` {verification}\n"
+            f"- `Limit` `{reasons}` — unreviewed scope may contain additional issues."
         )
 
     def _language_instruction(self) -> str:

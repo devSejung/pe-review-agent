@@ -125,6 +125,6 @@ def test_server_generated_tracking_and_finding_labels_follow_language():
     assert "해결된 것으로 판정하지 않았습니다" in tracked.summary
     payload = build_review_input(tracked)
     message = payload["comments"]["fw.c"][0]["message"]
-    assert "**[P1] Timeout ignored**" in message
-    assert "**영향:**" in message
-    assert "**근거:**" in message
+    assert "### `P1` Timeout ignored" in message
+    assert "`영향`" in message
+    assert "`근거`" in message
