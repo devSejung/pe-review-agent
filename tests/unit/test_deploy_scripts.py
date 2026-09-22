@@ -88,3 +88,13 @@ def test_corporate_build_args_are_supported() -> None:
     assert "ARG PIP_TRUSTED_HOST" in dockerfile
     assert 'ARG APT_DEBIAN_MIRROR_URL=""' in dockerfile
     assert 'ARG APT_DEBIAN_SECURITY_MIRROR_URL=""' in dockerfile
+
+
+def test_runtime_migration_files_are_owned_by_service_user() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert (
+        "COPY --chown=pe-review-agent:pe-review-agent alembic.ini /app/alembic.ini" in dockerfile
+    )
+    assert (
+        "COPY --chown=pe-review-agent:pe-review-agent migrations /app/migrations" in dockerfile
+    )

@@ -54,8 +54,8 @@ COPY --from=build /wheels /wheels
 RUN python -m pip install --no-index --find-links=/wheels gerrit-ai-reviewer \
     && rm -rf /wheels
 
-COPY alembic.ini /app/alembic.ini
-COPY migrations /app/migrations
+COPY --chown=pe-review-agent:pe-review-agent alembic.ini /app/alembic.ini
+COPY --chown=pe-review-agent:pe-review-agent migrations /app/migrations
 
 RUN mkdir -p /var/lib/pe-review-agent/repos /var/lib/pe-review-agent/work \
     && chown -R pe-review-agent:pe-review-agent /var/lib/pe-review-agent
