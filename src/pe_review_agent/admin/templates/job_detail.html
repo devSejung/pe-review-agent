@@ -226,6 +226,7 @@
                 </td>
                 <td>
                   {% if event.arguments %}<div class="font-monospace small text-break">{{ event.arguments | tojson }}</div>{% endif %}
+                  {% if event.operations is defined %}<div class="text-secondary small mt-1">Repository operations: {{ event.operations }} · charged tool calls: {% if event.status in ['duplicate_suppressed','job_budget_suppressed'] %}0{% else %}1{% endif %}</div>{% endif %}
                   {% if event.result_preview %}<details class="mt-1"><summary>Result preview · {{ event.result_bytes }} bytes</summary><pre class="audit-pre mt-2">{{ event.result_preview }}</pre></details>{% endif %}
                 </td>
               </tr>

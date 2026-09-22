@@ -459,6 +459,13 @@ class RoundRobinReview:
             if status != "error":
                 session.seen.add(key)
         session.transcript.append({"role": "tool", "tool_call_id": call.id, "content": result})
+        operations = (
+            0
+            if status in {"duplicate_suppressed", "job_budget_suppressed"}
+            else getattr(self.tools, "operation_count", lambda _name, _args: 1)(
+                call.name, call.arguments
+            )
+        )
         await self._trace(
             event="tool_call",
             phase=phase,
@@ -467,6 +474,7 @@ class RoundRobinReview:
             tool=call.name,
             arguments=call.arguments,
             status=status,
+            operations=operations,
             result_bytes=len(result.encode("utf-8", errors="replace")),
             result_preview=_bounded_preview(result),
         )
@@ -535,6 +543,27 @@ def _canonical_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str,
             "start_line": start,
             "end_line": end,
         }
+    if name == "batch_read":
+        ranges = arguments.get("ranges")
+        if not isinstance(ranges, list):
+            return arguments
+        normalized: list[Any] = []
+        for item in ranges[:6]:
+            if not isinstance(item, dict):
+                normalized.append(item)
+                continue
+            start = item.get("start_line")
+            end = item.get("end_line")
+            if type(start) is int and start >= 1 and type(end) is int and end >= 1:
+                end = min(end, start + 199)
+            normalized.append(
+                {
+                    "path": _canonical_path(item.get("path")),
+                    "start_line": start,
+                    "end_line": end,
+                }
+            )
+        return {"ranges": normalized}
     if name == "search_text":
         path = arguments.get("path")
         return {

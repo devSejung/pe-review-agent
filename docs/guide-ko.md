@@ -2117,7 +2117,7 @@ job은 PostgreSQL에 남아 있습니다.
 
 과거처럼 `max_tool_rounds`만 계속 키우는 방식으로 대응하지 않습니다.
 
-- Job Audit의 **Repository tool trace**에서 실제 `read_file`, `search_text`, `list_files` 호출을 확인
+- Job Audit의 **Repository tool trace**에서 실제 `read_file`, `batch_read`, `search_text`, `list_files` 호출을 확인
 - 동일 tool + 동일 args 반복은 두 번째부터 자동 suppress됨
 - 한 round 전체가 duplicate이면 즉시 tool 사용을 중단하고 final JSON 생성을 강제
 - round budget을 다 써도 리뷰 전체를 transient failure로 버리지 않고, tools를 제거한 마지막
@@ -2128,6 +2128,15 @@ job은 PostgreSQL에 남아 있습니다.
 Job Audit trace에서 어떤 탐색을 반복했는지 확인합니다.
 
 큰 register dump / CSV도 `read_file`에서 파일 전체를 모델 context로 올리지 않습니다.
+`search_text`는 일반 match 목록을 유지하면서 상위 최대 6개 match에만 기본 ±12줄 context를
+붙입니다. 같은 파일에서 context window가 겹치면 합치고, 나머지 match는 `path:line` 위치만
+보여줍니다. 추가 확인이 필요하면 `batch_read`로 `path + start_line + end_line` 범위를 한 번에 최대
+6개 읽습니다. 6개를 넘겨 요청하더라도 앞의 6개만 처리하고 남은 범위를 다음 `batch_read`로
+요청하라는 안내를 돌려줍니다. 한 range는 최대 200줄이며 batch 전체 출력도 약 64 KiB로 제한됩니다.
+`batch_read` 1회는 `max_tool_calls_per_job`에서 1 tool call로 계산하고, 실제 처리한 range 수는
+Repository tool trace의 `operations`로 별도 기록합니다. 이렇게 tool budget을 늘리지 않고 LLM ↔ tool
+왕복 횟수를 줄입니다.
+
 `search_text`로 register/symbol 위치를 찾은 뒤 필요한 line range만 스트리밍해서 읽고,
 한 번의 tool 결과는 `review.max_tool_output_bytes`(기본 256 KB)로 제한됩니다. 따라서 수 MB급
 텍스트 파일이라고 해서 파일 전체 크기만으로 `file exceeds context size limit` 처리하지 않습니다.

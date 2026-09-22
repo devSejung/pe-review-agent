@@ -147,11 +147,13 @@ async def test_malformed_tool_arguments_return_error_instead_of_raising(tmp_path
     executor = RepositoryToolExecutor(tmp_path, ReviewSettings())
 
     missing_path = await executor.execute("read_file", {})
+    missing_ranges = await executor.execute("batch_read", {})
     bad_query = await executor.execute("search_text", {"query": 123})
     bad_list_path = await executor.execute("list_files", {"path": ["nope"]})
     bad_end_line = await executor.execute("read_file", {"path": "missing", "end_line": [1]})
 
     assert "requires non-empty string path" in missing_path
+    assert "requires a non-empty ranges array" in missing_ranges
     assert "requires non-empty string query" in bad_query
     assert "path must be a string" in bad_list_path
     assert "end_line must be an integer" in bad_end_line
@@ -174,6 +176,166 @@ async def test_repository_tool_output_is_byte_bounded(tmp_path: Path) -> None:
 
     assert "<tool output truncated by byte limit>" in result
     assert len(result.encode("utf-8")) < 5000
+
+
+@pytest.mark.asyncio
+async def test_search_text_adds_plus_minus_twelve_lines_only_for_top_six_matches(
+    tmp_path: Path,
+) -> None:
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q", str(tmp_path)], check=True)
+    lines = [f"filler-{index}" for index in range(1, 301)]
+    for ordinal, line_number in enumerate((20, 60, 100, 140, 180, 220, 260), start=1):
+        lines[line_number - 1] = f"needle-{ordinal}"
+    (tmp_path / "fw.c").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(tmp_path), "add", "fw.c"], check=True
+    )
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings(max_tool_output_bytes=256_000))
+
+    result = await executor.search_text("needle", max_results=40)
+
+    assert "fw.c:20:needle-1" in result
+    assert "fw.c:260" in result
+    assert "fw.c:260:needle-7" not in result
+    assert "--- fw.c:8-32 (match line(s): 20) ---" in result
+    assert "8: filler-8" in result
+    assert "32: filler-32" in result
+    assert result.count("--- fw.c:") == 6
+    assert "--- fw.c:248-272" not in result
+    assert "248: filler-248" not in result
+    assert "context shown only for the top 6 matches" in result
+    assert len(result.encode("utf-8")) <= 32 * 1024
+
+
+@pytest.mark.asyncio
+async def test_search_text_merges_overlapping_top_match_context_windows(tmp_path: Path) -> None:
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q", str(tmp_path)], check=True)
+    lines = [f"line-{index}-" + "x" * 80 for index in range(1, 180)]
+    lines[99] = "needle-first-" + "a" * 80
+    lines[119] = "needle-second-" + "b" * 80
+    lines[139] = "needle-third-" + "c" * 80
+    (tmp_path / "fw.c").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(tmp_path), "add", "fw.c"], check=True
+    )
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings())
+
+    result = await executor.search_text("needle")
+
+    assert "--- fw.c:88-152 (match line(s): 100, 120, 140) ---" in result
+    assert result.count("--- fw.c:") == 1
+    assert "88: line-88-" in result
+    assert "100: needle-first-" in result
+    assert "120: needle-second-" in result
+    assert "140: needle-third-" in result
+    assert "152: line-152-" in result
+
+
+def test_batch_read_processes_only_first_six_ranges_and_returns_followup_hint(
+    tmp_path: Path,
+) -> None:
+    for index in range(1, 9):
+        (tmp_path / f"file{index}.c").write_text(
+            "\n".join(f"f{index}-{line}" for line in range(1, 10)) + "\n",
+            encoding="utf-8",
+        )
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings())
+    ranges = [
+        {"path": f"file{index}.c", "start_line": 2, "end_line": 4}
+        for index in range(1, 9)
+    ]
+
+    result = executor.batch_read(ranges)
+    batch_schema = next(
+        item for item in executor.tool_schemas if item["function"]["name"] == "batch_read"
+    )
+
+    for index in range(1, 7):
+        assert f"[{index}] file{index}.c:2-4" in result
+        assert f"2: f{index}-2" in result
+    assert "file7.c" not in result
+    assert "file8.c" not in result
+    assert "processed the first 6 of 8 requested ranges" in result
+    assert "remaining 2 range(s) in a separate batch_read" in result
+    assert executor.operation_count("batch_read", {"ranges": ranges}) == 6
+    assert batch_schema["function"]["parameters"]["properties"]["ranges"]["maxItems"] == 6
+
+
+def test_batch_read_caps_each_range_at_two_hundred_lines_and_keeps_partial_errors(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "good.c").write_text(
+        "\n".join(f"line-{index}" for index in range(1, 301)) + "\n",
+        encoding="utf-8",
+    )
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings(max_tool_output_bytes=256_000))
+
+    result = executor.batch_read(
+        [
+            {"path": "good.c", "start_line": 1, "end_line": 250},
+            {"path": "missing.c", "start_line": 1, "end_line": 10},
+            {"path": "../escape.c", "start_line": 1, "end_line": 10},
+        ]
+    )
+
+    assert "[1] good.c:1-200 <clipped from requested end_line 250; max 200 lines/range>" in result
+    assert "200: line-200" in result
+    assert "201: line-201" not in result
+    assert "[2] missing.c:1-10 ERROR: file not found" in result
+    assert "[3] ../escape.c:1-10 ERROR:" in result
+    assert "escapes workspace" in result
+    assert len(result.encode("utf-8")) <= 64 * 1024
+
+
+def test_batch_read_single_range_can_use_available_batch_bytes_for_all_two_hundred_lines(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "wide.c"
+    target.write_text(
+        "\n".join(f"line-{index}-" + "x" * 90 for index in range(1, 201)) + "\n",
+        encoding="utf-8",
+    )
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings(max_tool_output_bytes=256_000))
+
+    result = executor.batch_read(
+        [{"path": "wide.c", "start_line": 1, "end_line": 200}]
+    )
+
+    assert "1: line-1-" in result
+    assert "200: line-200-" in result
+    assert "<tool output truncated by byte limit>" not in result
+    assert len(result.encode("utf-8")) <= 64 * 1024
+
+
+def test_batch_read_multiple_ranges_from_same_large_file_use_one_file_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "large.c"
+    target.write_text(
+        "\n".join(f"line-{index}" for index in range(1, 20_001)) + "\n",
+        encoding="utf-8",
+    )
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings())
+    original_open = Path.open
+    opens = 0
+
+    def tracking_open(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal opens
+        if path == target and args and args[0] == "rb":
+            opens += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    ranges = [
+        {"path": "large.c", "start_line": start, "end_line": start + 10}
+        for start in (15_000, 16_000, 17_000, 18_000, 19_000, 19_500)
+    ]
+
+    result = executor.batch_read(ranges)
+
+    assert opens == 1
+    assert "15000: line-15000" in result
+    assert "19500: line-19500" in result
 
 
 def test_repository_read_file_obeys_tool_output_byte_limit(tmp_path: Path) -> None:
@@ -209,7 +371,7 @@ def test_repository_read_file_streams_range_from_large_file(tmp_path: Path) -> N
 
 
 def test_repository_read_file_stops_at_output_limit_before_rest_of_large_file(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     target = tmp_path / "registers.csv"
     with target.open("wb") as handle:
@@ -223,12 +385,84 @@ def test_repository_read_file_stops_at_output_limit_before_rest_of_large_file(
         tmp_path,
         ReviewSettings(max_context_file_bytes=1024, max_tool_output_bytes=4096),
     )
+    original_open = Path.open
+    lines_read = 0
+
+    class CountingReader:
+        def __init__(self, handle):  # type: ignore[no-untyped-def]
+            self.handle = handle
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return self.handle.__exit__(*args)
+
+        def readline(self, size=-1):  # type: ignore[no-untyped-def]
+            nonlocal lines_read
+            value = self.handle.readline(size)
+            if value.endswith(b"\n"):
+                lines_read += 1
+            return value
+
+    def tracking_open(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        handle = original_open(path, *args, **kwargs)
+        if path == target and args and args[0] == "rb":
+            return CountingReader(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracking_open)
 
     result = executor.read_file("registers.csv", start_line=1, end_line=100_000)
 
     assert result.endswith("<tool output truncated by byte limit>")
     assert "binary/non-UTF8" not in result
     assert len(result.encode("utf-8")) <= 4096
+    assert lines_read < 100
+
+
+def test_repository_read_file_drains_huge_physical_lines_with_bounded_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "minified.js"
+    target.write_bytes(b"x" * (2 * 1024 * 1024) + b"\nneedle\n")
+    executor = RepositoryToolExecutor(tmp_path, ReviewSettings(max_tool_output_bytes=4096))
+    original_open = Path.open
+    max_requested_read = 0
+
+    class BoundedReader:
+        def __init__(self, handle):  # type: ignore[no-untyped-def]
+            self.handle = handle
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return self.handle.__exit__(*args)
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("unbounded file iteration is not allowed")
+
+        def readline(self, size=-1):  # type: ignore[no-untyped-def]
+            nonlocal max_requested_read
+            assert 0 < size <= 64 * 1024
+            max_requested_read = max(max_requested_read, size)
+            return self.handle.readline(size)
+
+    def tracking_open(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        handle = original_open(path, *args, **kwargs)
+        if path == target and args and args[0] == "rb":
+            return BoundedReader(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+
+    result = executor.read_file("minified.js", start_line=2, end_line=2)
+
+    assert result == "2: needle"
+    assert max_requested_read == 64 * 1024
 
 
 @pytest.mark.asyncio

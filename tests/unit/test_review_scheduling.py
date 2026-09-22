@@ -16,7 +16,12 @@ from pe_review_agent.retry import ContextLengthError, TransientError
 from pe_review_agent.review.lineage import FindingHistory, reconcile_finding_lineage
 from pe_review_agent.review.native import NativeFirmwareReviewEngine
 from pe_review_agent.review.progress import MemoryProgressBackend, ReviewProgress, Usage
-from pe_review_agent.review.scheduling import ReviewBudget, RoundRobinReview, WorkItem
+from pe_review_agent.review.scheduling import (
+    ReviewBudget,
+    RoundRobinReview,
+    WorkItem,
+    _tool_call_key,
+)
 
 
 def completion(content: str = '{"findings":[]}', *calls: ToolCall) -> LlmCompletion:
@@ -28,6 +33,16 @@ def read_call(key: str, number: int = 1) -> ToolCall:
     return ToolCall(f"{key}-{number}", "read_file", args, json.dumps(args))
 
 
+def batch_call(key: str, count: int = 6) -> ToolCall:
+    args = {
+        "ranges": [
+            {"path": f"{key}-{index}.c", "start_line": 1, "end_line": 10}
+            for index in range(count)
+        ]
+    }
+    return ToolCall(f"{key}-batch", "batch_read", args, json.dumps(args))
+
+
 class Tools:
     tool_schemas = [{"type": "function", "function": {"name": "read_file"}}]
 
@@ -37,6 +52,22 @@ class Tools:
     async def execute(self, name: str, arguments: dict) -> str:
         self.executed.append(arguments["path"])
         return "concrete evidence"
+
+
+class BatchTools:
+    tool_schemas = [{"type": "function", "function": {"name": "batch_read"}}]
+
+    def __init__(self) -> None:
+        self.executed = 0
+
+    async def execute(self, name: str, arguments: dict) -> str:
+        assert name == "batch_read"
+        self.executed += 1
+        return "batched concrete evidence"
+
+    def operation_count(self, name: str, arguments: dict) -> int:
+        assert name == "batch_read"
+        return min(len(arguments["ranges"]), 6)
 
 
 class DemandLlm:
@@ -143,6 +174,73 @@ async def test_tool_round_limit_counts_only_allowed_tool_rounds_then_one_final(r
     assert len(tools.executed) == rounds
     assert llm.requests[-1] == ("one", False)
     assert "max_tool_rounds" in result.limitations
+
+
+@pytest.mark.asyncio
+async def test_batch_read_charges_one_tool_call_and_traces_six_operations() -> None:
+    settings = ReviewSettings(max_tool_rounds=4, max_tool_calls_per_job=20)
+    backend = MemoryProgressBackend()
+    progress = ReviewProgress(input_key="b" * 64)
+    llm = ScriptLlm([completion("", batch_call("fw", 6)), completion()])
+    tools = BatchTools()
+    budget = ReviewBudget(settings)
+    runner = RoundRobinReview(
+        llm=llm,
+        tools=tools,  # type: ignore[arg-type]
+        settings=settings,
+        budget=budget,
+        backend=backend,
+        progress=progress,
+    )
+    trace: list[dict] = []
+
+    async def capture(event: dict) -> None:
+        trace.append(event)
+
+    runner.trace = capture
+    result = await runner.run(
+        "candidate",
+        [WorkItem(key="one", payload=None)],
+        messages=lambda _: [{"role": "user", "content": "review"}],
+        parse=lambda text, _: json.loads(text),
+        split=lambda _: [],
+        max_units=1,
+    )
+
+    assert len(result.completed) == 1
+    assert tools.executed == 1
+    assert budget.usage.tool_calls == 1
+    assert (await backend.totals())["tool_calls"] == 1
+    tool_event = next(event for event in trace if event.get("event") == "tool_call")
+    assert tool_event["tool"] == "batch_read"
+    assert tool_event["operations"] == 6
+
+
+def test_batch_read_duplicate_key_matches_executor_two_hundred_line_clipping() -> None:
+    exact = {
+        "ranges": [{"path": "fw.c", "start_line": 1, "end_line": 200}]
+    }
+    oversized = {
+        "ranges": [{"path": "./fw.c", "start_line": 1, "end_line": 250}]
+    }
+
+    assert _tool_call_key("batch_read", exact) == _tool_call_key("batch_read", oversized)
+
+
+def test_batch_read_invalid_bounds_do_not_alias_a_valid_duplicate_key() -> None:
+    valid = {"ranges": [{"path": "fw.c", "start_line": 1, "end_line": 200}]}
+    string_bounds = {
+        "ranges": [{"path": "./fw.c", "start_line": "1", "end_line": "200"}]
+    }
+    missing_bounds = {"ranges": [{"path": "fw.c"}]}
+    bool_bounds = {
+        "ranges": [{"path": "fw.c", "start_line": True, "end_line": 200}]
+    }
+
+    valid_key = _tool_call_key("batch_read", valid)
+    assert _tool_call_key("batch_read", string_bounds) != valid_key
+    assert _tool_call_key("batch_read", missing_bounds) != valid_key
+    assert _tool_call_key("batch_read", bool_bounds) != valid_key
 
 
 class ScriptLlm:
