@@ -641,7 +641,7 @@ async def test_no_reviewable_text_skips_llm_entirely(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_explicit_merge_skip_publishes_summary_without_llm(tmp_path: Path) -> None:
     llm = FakeLlm([])
-    settings = ReviewSettings()
+    settings = ReviewSettings(output_language="en-US")
     engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
     context = ReviewContext(
         project="soc/fw",
@@ -660,6 +660,50 @@ async def test_explicit_merge_skip_publishes_summary_without_llm(tmp_path: Path)
 
     assert result.summary == "Automated review skipped for this merge commit."
     assert result.review_metadata["skipped_reason"] == result.summary
+    assert llm.seen_messages == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skip_reason, expected",
+    [
+        ("Automated review skipped for this merge commit.", "merge commit이므로 자동 리뷰를"),
+        (
+            "Automated review skipped because this Patch Set exceeds the configured repository "
+            "diff safety ceiling (12345 bytes). No AI findings or review vote were emitted. Split "
+            "the Change or raise repos.max_diff_bytes after validating model and host capacity.",
+            "12345 bytes",
+        ),
+        (None, "리뷰할 텍스트 변경이 없어 자동 리뷰를"),
+    ],
+)
+async def test_korean_review_language_localizes_server_generated_skip_summaries(
+    tmp_path: Path, skip_reason: str | None, expected: str
+) -> None:
+    llm = FakeLlm([])
+    settings = ReviewSettings(output_language="ko-KR")
+    engine = NativeFirmwareReviewEngine(llm, settings)  # type: ignore[arg-type]
+    context = ReviewContext(
+        project="soc/fw",
+        change_number=8,
+        patchset_number=2,
+        revision_sha="f" * 40,
+        diff="",
+        changed_files=[],
+        changed_lines=[],
+        policy_text="policy",
+        repository_root=str(tmp_path),
+        skip_reason=skip_reason,
+    )
+
+    result = await engine.review(context, RepositoryToolExecutor(tmp_path, settings))
+
+    assert expected in result.summary
+    assert result.review_metadata["output_language"] == "ko-KR"
+    if skip_reason is not None:
+        assert result.review_metadata["skipped_reason"] == skip_reason
+    else:
+        assert result.review_metadata["skipped_no_reviewable_text"] is True
     assert llm.seen_messages == []
 
 

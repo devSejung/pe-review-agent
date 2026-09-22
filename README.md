@@ -63,7 +63,8 @@ summary plus native inline/range comments.
 - Event-stream reconnects are supplemented by reconciliation; polling is not the primary trigger.
 - Project allowlists are enforced in the service even though Gerrit's `Stream Events` is a global
   capability.
-- Bot is comment-only by default: no Submit and no Code-Review vote.
+- Bot is comment-only by default. Projects can explicitly opt into Code-Review +1 / 0;
+  Submit, +2, negative votes, and voting on behalf of another account are never requested.
 - A newer Patch Set waits while an older Patch Set has an unresolved/ambiguous publication side
   effect, preserving finding lineage and preventing the same published finding from being reposted
   as new.
@@ -433,6 +434,8 @@ The UI has six operational surfaces:
   project to **Include current open Changes** when a backfill is actually wanted. Switching back to
   **From now on** stops queued, unleased pre-cutoff backfill jobs as `SKIPPED_SCOPE`; publication
   intents are preserved for safe Gerrit reconciliation.
+  Each project also has **Review settings**: Global default / 한국어 / English, and optional
+  automatic Code-Review voting (OFF by default).
 - **Connections** — edit/test Gerrit SSH + REST and the OpenAI-compatible Qwen endpoint. The page
   shows whether connection values come directly from `config.yaml` or from saved Admin overrides;
   **Use config.yaml values** clears only the saved Gerrit/LLM overrides. Required REST secret state
@@ -451,6 +454,45 @@ The UI has six operational surfaces:
   explicitly keeps code identifiers, paths, macros, register names, literals, and error codes in
   their original form. Review-budget ceilings are configurable here as DB overrides; the page and
   save response explicitly warn that review-policy/budget changes require service restart.
+
+### Per-project language and optional Code-Review voting
+
+Projects → **Review settings** applies to newly starting reviews without a process restart.
+Language and voting policy are snapshotted once per Job and survive retry/restart; editing one
+repository never mutates another Job's settings or creates a separate LLM concurrency allowance.
+`INHERIT` resolves the worker's loaded global `review.output_language` at review start. Existing
+in-progress pre-feature reviews remain comment-only; already published Jobs are not reprocessed.
+Changing voting later affects newly starting reviews only. An in-progress Job keeps the voting
+policy it snapshotted at review start; no setting change revokes an existing vote.
+
+When enabled, a valid review with **zero validated findings receives +1**, including a partial review
+stopped by a tool/round/call budget. A valid result with findings receives **0 (neutral)**. The count
+is taken before publication caps and before suppressing previously published inline comments.
+Generation failures and skipped reviews never become zero-finding votes. Partial-review warnings
+remain visible: +1 is a repository policy decision, **not** proof of complete analysis or human approval.
+
+Comments and votes are separate durable operations. Comments are posted first; vote failure does not
+erase them. Job Audit records the target value, count, bot account, POST attempts, retry failures,
+timestamps, and exact vote request/response. `DONE` means the review comments are published; inspect
+the separate vote status (`APPLIED`, `FAILED`, or `SKIPPED`). Jobs also flag failed/pending votes.
+Vote transient failures use an independent counter bounded by `retry.publish_attempts`; completed
+review inference and comments are not repeated. After the last ambiguous POST one recovery check
+is still allowed. An unconfirmed terminal vote is explicitly reported as such, not asserted absent.
+
+The bot must have **Code-Review +1** permission on the actual target branch. Permission and current
+Patch Set are checked when voting; the Projects **Test** button remains a read/fetch test and never
+casts a test vote. Only the authenticated bot's label is written. A unique vote marker plus the
+bot's current label resolves lost acknowledgements; a subsequently changed label is not overwritten.
+Gerrit 3.8.10 may silently ignore an unknown label when its server-side `change.strictLabels` is
+disabled, so a successful HTTP response without the requested label is not treated as applied.
+
+No reset is triggered by uploading a new Patch Set. Gerrit's `copyCondition` may carry an older +1
+until this Patch Set's review finishes; then this review applies +1 or 0. Check local submit rules
+and downstream automation before enabling this policy. The app itself never submits a Change.
+
+Upgrade: stop all old processes, apply migration **0012_project_review_policy**, then start the new
+version. Existing projects migrate to `INHERIT` / voting OFF. Downgrade drops project-policy/vote audit
+data; take a backup and drain pending votes before any rollback. No new secret or config key is required.
 
 Project enable/disable and the global service switch are live DB-backed controls. Disabled projects
 are filtered at event ingestion, reconciliation, **and the PostgreSQL claim query**, so queued work is
