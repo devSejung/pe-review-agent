@@ -83,8 +83,7 @@ class NativeFirmwareReviewEngine:
     ) -> ReviewResult:
         if context.skip_reason or not context.changed_files or not context.diff.strip():
             return ReviewResult(
-                summary=context.skip_reason
-                or "No reviewable text changes were found after generated/binary filtering.",
+                summary=self._skip_summary(context.skip_reason),
                 findings=[],
                 model=self.llm.settings.model,
                 input_tokens=0,
@@ -766,6 +765,35 @@ Return ONLY a JSON object with this shape:
                 "this is not a clean verdict."
             )
         return "No actionable firmware correctness issues were found in this Patch Set."
+
+    def _skip_summary(self, reason: str | None) -> str:
+        if self.settings.output_language != "ko-KR":
+            return reason or (
+                "No reviewable text changes were found after generated/binary filtering."
+            )
+        if reason is None:
+            return (
+                "generated/binary filtering 후 리뷰할 텍스트 변경이 없어 자동 리뷰를 "
+                "건너뛰었습니다. "
+                "이 Patch Set에는 AI finding이나 review vote를 생성하지 않았습니다."
+            )
+        if reason.startswith("Automated review skipped for this merge commit."):
+            return (
+                "이 Patch Set은 merge commit이므로 자동 리뷰를 건너뛰었습니다. Gerrit 3.8은 merge "
+                "revision을 auto-merge base와 비교하므로 로컬 first-parent diff를 사용하면 changed "
+                "line과 inline anchor가 달라질 수 있습니다. 이 Patch Set에는 AI finding이나 review "
+                "vote를 생성하지 않았습니다."
+            )
+        if reason.startswith("Automated review skipped because this Patch Set exceeds"):
+            match = re.search(r"\((\d+) bytes\)", reason)
+            limit = f" ({match.group(1)} bytes)" if match else ""
+            return (
+                "이 Patch Set이 설정된 repository diff 안전 한도를 초과하여 자동 리뷰를 "
+                f"건너뛰었습니다{limit}. AI finding이나 review vote를 생성하지 않았습니다. "
+                "Change를 "
+                "분할하거나 model/host 용량을 검증한 뒤 repos.max_diff_bytes를 조정하십시오."
+            )
+        return reason
 
     @staticmethod
     def _coverage(

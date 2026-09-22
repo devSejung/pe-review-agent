@@ -36,6 +36,26 @@ def upgrade() -> None:
         "ck_review_managed_projects_policy_gen", "review_managed_projects", "policy_generation >= 0"
     )
     op.add_column("review_jobs", sa.Column("project_review_policy", postgresql.JSONB()))
+    # Jobs that had already entered the review pipeline before this migration must not be
+    # retroactively opted into a repository policy that did not exist when they started.  A small
+    # marker is enough; the worker converts it to a normal legacy ProjectReviewPolicy on first
+    # resume, using the loaded global language and keeping automatic voting disabled.
+    op.execute(
+        sa.text(
+            """
+            UPDATE review_jobs
+            SET project_review_policy = '{"legacy_pre_feature": true}'::jsonb
+            WHERE project_review_policy IS NULL
+              AND (
+                state IN ('FETCHING', 'REVIEWING', 'VALIDATING')
+                OR (
+                  state = 'RETRY_WAIT'
+                  AND retry_state IN ('FETCHING', 'REVIEWING', 'VALIDATING')
+                )
+              )
+            """
+        )
+    )
     op.create_table(
         "review_votes",
         sa.Column(

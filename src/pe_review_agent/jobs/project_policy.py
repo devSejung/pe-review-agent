@@ -31,6 +31,17 @@ async def bind_project_review_policy(
             raise KeyError(job_id)
         _require_live_lease(job, worker_id)
         if job.project_review_policy is not None:
+            if job.project_review_policy.get("legacy_pre_feature") is True:
+                policy = ProjectReviewPolicy(
+                    review_language="INHERIT",
+                    output_language=default_language,
+                    auto_code_review=False,
+                    generation=0,
+                    source="legacy",
+                    bound_at=datetime.now(UTC),
+                )
+                job.project_review_policy = policy.model_dump(mode="json")
+                return policy
             return ProjectReviewPolicy.model_validate(job.project_review_policy)
         legacy = bool(
             await session.scalar(

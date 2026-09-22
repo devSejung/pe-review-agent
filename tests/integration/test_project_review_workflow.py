@@ -387,6 +387,28 @@ async def test_pre_feature_in_progress_job_never_inherits_new_auto_vote(env):
     assert bound.source == "legacy" and not bound.auto_code_review
 
 
+async def test_migrated_pre_feature_fetching_job_without_review_attempt_stays_legacy(env):
+    claim = await env.store.claim_next(worker_id="old", lease_seconds=120)
+    assert claim is not None
+    await env.store.transition(claim.id, JobState.FETCHING, worker_id="old")
+    async with env.db.sessions.begin() as session:
+        row = await session.get(Job, claim.id)
+        assert row is not None
+        row.project_review_policy = {"legacy_pre_feature": True}
+
+    bound = await bind_project_review_policy(
+        env.db.sessions, claim.id, worker_id="old", default_language="en-US"
+    )
+    assert bound.source == "legacy"
+    assert bound.output_language == "en-US"
+    assert bound.review_language == "INHERIT"
+    assert not bound.auto_code_review
+    async with env.db.sessions() as session:
+        row = await session.get(Job, claim.id)
+        assert row is not None
+        assert row.project_review_policy == bound.model_dump(mode="json")
+
+
 @pytest.mark.parametrize("failure", ["permission", "403", "ignored_label"])
 async def test_vote_failure_preserves_comments_and_has_separate_audit(env, failure):
     if failure == "permission":
