@@ -17,6 +17,14 @@ Request only what the service needs:
 
 Do not request Gerrit Administrator, Submit, automatic merge authority, or Code-Review +2.
 
+For repositories explicitly opted into automatic Code-Review voting, additionally grant the bot
+Code-Review +1 on the applicable branches. Default remains OFF. Zero validated findings, even from
+a budget-limited partial review, get +1; nonzero findings get 0. Failed/skipped reviews do not vote.
+Confirm that this policy is acceptable to local submit requirements and external automation.
+No proactive reset occurs on a new Patch Set; Gerrit may copy an older label until the new review.
+Comment publication and voting have separate durable audit results; a vote failure does not discard
+comments. See the repository-policy section in README and the Korean guide for retry/upgrade details.
+
 An authenticated probe can be run with:
 
 ```bash

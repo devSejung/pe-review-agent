@@ -22,9 +22,11 @@ from pe_review_agent.jobs.models import (
     ReviewInvocationRow,
     ReviewProgressRow,
     ReviewResultRow,
+    ReviewVote,
     ServiceState,
 )
 from pe_review_agent.retry import ProviderUnavailableError
+from pe_review_agent.review.project_policy import ReviewLanguage
 
 _RUNTIME_CONFIG_KEY = "admin-runtime-config"
 _RUNTIME_STORAGE_VERSION_KEY = "_storage_version"
@@ -54,6 +56,9 @@ class ManagedProjectRecord:
     review_start_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    review_language: ReviewLanguage = "INHERIT"
+    auto_code_review: bool = False
+    policy_generation: int = 0
 
 
 class ControlStore:
@@ -460,17 +465,30 @@ class ControlStore:
             rows = (
                 await session.scalars(select(ManagedProject).order_by(ManagedProject.project.asc()))
             ).all()
-            return [
-                ManagedProjectRecord(
-                    project=row.project,
-                    enabled=row.enabled,
-                    review_start_mode=ProjectReviewStartMode(row.review_start_mode),
-                    review_start_at=row.review_start_at,
-                    created_at=row.created_at,
-                    updated_at=row.updated_at,
-                )
-                for row in rows
-            ]
+            return [_managed_project_record(row) for row in rows]
+
+    async def set_project_review_policy(
+        self,
+        project: str,
+        *,
+        review_language: ReviewLanguage,
+        auto_code_review: bool,
+        expected_generation: int,
+    ) -> ManagedProjectRecord:
+        _validate_project_policy(review_language, auto_code_review)
+        async with self._sessions.begin() as session:
+            row = await session.get(ManagedProject, project, with_for_update=True)
+            if row is None:
+                raise KeyError(project)
+            if row.policy_generation != expected_generation:
+                raise RuntimeError("Project policy changed in another session; reload and retry.")
+            if (row.review_language, row.auto_code_review) != (review_language, auto_code_review):
+                row.review_language = review_language
+                row.auto_code_review = auto_code_review
+                row.policy_generation += 1
+                row.updated_at = datetime.now(UTC)
+            await session.flush()
+            return _managed_project_record(row)
 
     async def enabled_projects(self, *, fallback: tuple[str, ...] = ()) -> tuple[str, ...]:
         async with self._sessions() as session:
@@ -503,7 +521,13 @@ class ControlStore:
         *,
         enabled: bool = True,
         review_start_mode: ProjectReviewStartMode = ProjectReviewStartMode.FROM_NOW,
+        review_language: ReviewLanguage | None = None,
+        auto_code_review: bool | None = None,
     ) -> ManagedProjectRecord:
+        _validate_project_policy(
+            review_language if review_language is not None else "INHERIT",
+            auto_code_review if auto_code_review is not None else False,
+        )
         normalized = project.strip()
         if not normalized or len(normalized) > 512:
             raise ValueError("project must be between 1 and 512 characters")
@@ -513,6 +537,13 @@ class ControlStore:
             now = await session.scalar(select(func.now()))
             assert now is not None
             review_start_at = now if review_start_mode is ProjectReviewStartMode.FROM_NOW else None
+            policy_updates: dict[str, Any] = {}
+            if review_language is not None:
+                policy_updates["review_language"] = review_language
+            if auto_code_review is not None:
+                policy_updates["auto_code_review"] = auto_code_review
+            if policy_updates:
+                policy_updates["policy_generation"] = ManagedProject.policy_generation + 1
             statement = (
                 pg_insert(ManagedProject)
                 .values(
@@ -520,6 +551,8 @@ class ControlStore:
                     enabled=enabled,
                     review_start_mode=review_start_mode.value,
                     review_start_at=review_start_at,
+                    review_language=review_language or "INHERIT",
+                    auto_code_review=auto_code_review if auto_code_review is not None else False,
                 )
                 .on_conflict_do_update(
                     index_elements=[ManagedProject.project],
@@ -528,6 +561,7 @@ class ControlStore:
                         "review_start_mode": review_start_mode.value,
                         "review_start_at": review_start_at,
                         "updated_at": func.now(),
+                        **policy_updates,
                     },
                 )
                 .returning(ManagedProject)
@@ -592,15 +626,17 @@ class ControlStore:
         project: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = min(max(limit, 1), 500)
-        statement = select(Job)
+        statement = select(Job, ReviewVote.status).outerjoin(
+            ReviewVote, ReviewVote.job_id == Job.id
+        )
         if state:
             statement = statement.where(Job.state == state)
         if project:
             statement = statement.where(Job.project == project)
         statement = statement.order_by(Job.updated_at.desc()).limit(limit)
         async with self._sessions() as session:
-            rows = (await session.scalars(statement)).all()
-            return [_job_dict(job) for job in rows]
+            rows = (await session.execute(statement)).all()
+            return [{**_job_dict(job), "vote_status": vote_status} for job, vote_status in rows]
 
     async def get_job(self, job_id: uuid.UUID) -> dict[str, Any] | None:
         async with self._sessions() as session:
@@ -675,6 +711,29 @@ class ControlStore:
                 )
             ).one()
             audit = _job_dict(job)
+            vote = await session.get(ReviewVote, job_id)
+            audit["vote"] = (
+                {
+                    key: getattr(vote, key)
+                    for key in (
+                        "value",
+                        "status",
+                        "reason",
+                        "finding_count",
+                        "account_id",
+                        "attempts",
+                        "retry_count",
+                        "request_payload",
+                        "response",
+                        "last_error",
+                        "events",
+                        "created_at",
+                        "updated_at",
+                    )
+                }
+                if vote is not None
+                else None
+            )
             audit["current_failure_at"] = _current_failure_at(job, attempts, publication)
             provider_attempts: list[Attempt] = []
             for attempt in reversed(attempts):
@@ -928,6 +987,7 @@ def _job_dict(job: Job) -> dict[str, Any]:
         "patchset_number": job.patchset_number,
         "revision_sha": job.revision_sha,
         "policy_version": job.review_policy_version,
+        "project_review_policy": job.project_review_policy,
         "state": job.state,
         "retry_state": job.retry_state,
         "attempt_count": job.attempt_count,
@@ -950,7 +1010,17 @@ def _managed_project_record(row: ManagedProject) -> ManagedProjectRecord:
         review_start_at=row.review_start_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        review_language=row.review_language,
+        auto_code_review=row.auto_code_review,
+        policy_generation=row.policy_generation,
     )
+
+
+def _validate_project_policy(language: str, auto_code_review: bool) -> None:
+    if language not in {"INHERIT", "ko-KR", "en-US"}:
+        raise ValueError("Review language must be INHERIT, ko-KR or en-US")
+    if type(auto_code_review) is not bool:
+        raise ValueError("auto_code_review must be a boolean")
 
 
 async def _skip_pre_cutoff_jobs(

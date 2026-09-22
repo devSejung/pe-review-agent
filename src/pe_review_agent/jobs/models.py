@@ -100,6 +100,7 @@ class Job(Base):
     patchset_number: Mapped[int] = mapped_column(Integer, nullable=False)
     revision_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     review_policy_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    project_review_policy: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default=JobState.RECEIVED.value)
     retry_state: Mapped[str | None] = mapped_column(String(32))
     event_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -444,16 +445,65 @@ class ManagedProject(Base):
             "(review_start_mode = 'INCLUDE_OPEN' AND review_start_at IS NULL)",
             name="ck_review_managed_projects_start_scope",
         ),
+        CheckConstraint(
+            "review_language IN ('INHERIT', 'ko-KR', 'en-US')",
+            name="ck_review_managed_projects_language",
+        ),
+        CheckConstraint("policy_generation >= 0", name="ck_review_managed_projects_policy_gen"),
     )
 
     project: Mapped[str] = mapped_column(String(512), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    review_language: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="INHERIT", server_default="INHERIT"
+    )
+    auto_code_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    policy_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     review_start_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default=ProjectReviewStartMode.FROM_NOW.value
     )
     review_start_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=lambda: datetime.now(UTC)
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ReviewVote(Base):
+    """Separate, durable optional side effect; a vote failure never discards review comments."""
+
+    __tablename__ = "review_votes"
+    __table_args__ = (
+        CheckConstraint("value IS NULL OR value IN (0, 1)", name="ck_review_votes_value"),
+        CheckConstraint(
+            "status IN ('PENDING','AMBIGUOUS','APPLIED','SKIPPED','FAILED')",
+            name="ck_review_votes_status",
+        ),
+        CheckConstraint("attempts >= 0", name="ck_review_votes_attempts"),
+    )
+
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("review_jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    value: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    finding_count: Mapped[int | None] = mapped_column(Integer)
+    account_id: Mapped[int | None] = mapped_column(BigInteger)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    request_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    events: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

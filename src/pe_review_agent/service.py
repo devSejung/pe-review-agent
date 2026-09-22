@@ -5,7 +5,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 
@@ -35,6 +35,8 @@ from pe_review_agent.jobs import (
     PublishGuardStatus,
 )
 from pe_review_agent.jobs.progress import PostgresProgressBackend
+from pe_review_agent.jobs.project_policy import bind_project_review_policy
+from pe_review_agent.jobs.votes import VoteStore
 from pe_review_agent.llm import LlmClient
 from pe_review_agent.observability import METRICS, log_event
 from pe_review_agent.repos import RepositoryManager, RepositoryToolExecutor
@@ -51,6 +53,8 @@ from pe_review_agent.review.lineage import (
     reconcile_finding_lineage,
 )
 from pe_review_agent.review.policy import load_policy
+from pe_review_agent.review.project_policy import ProjectReviewPolicy, decide_code_review_vote
+from pe_review_agent.voting import VotePublisher, vote_payload
 
 logger = logging.getLogger(__name__)
 _RECONCILIATION_WATERMARK_KEY = "gerrit-open-changes"
@@ -260,6 +264,19 @@ class ReviewWorker:
                     )
 
                 failure_stage = AttemptStage.REVIEW
+                project_policy = await bind_project_review_policy(
+                    self.store._sessions,
+                    job.id,
+                    worker_id=worker_id,
+                    default_language=self.settings.review.output_language,
+                )
+                job = replace(job, project_review_policy=project_policy.model_dump(mode="json"))
+                language_engine = getattr(self.engine, "with_output_language", None)
+                engine = (
+                    language_engine(project_policy.output_language)
+                    if language_engine is not None
+                    else self.engine
+                )
                 policy_text = await load_policy(
                     base_revision_sha=workspace.base_revision_sha,
                     settings=self.settings.review,
@@ -297,6 +314,7 @@ class ReviewWorker:
                         worker_id=worker_id,
                         lease=lease,
                         review_started=review_started,
+                        engine=engine,
                     )
                 except TransientError as exc:
                     # This is a read-only recovery probe, not permission to run inference. Keep
@@ -347,7 +365,7 @@ class ReviewWorker:
                         worker_id=worker_id,
                         attempt_id=review_attempt.id,
                     )
-                    review = await self.engine.review(
+                    review = await engine.review(
                         context,
                         tools,
                         tool_trace=tool_trace,
@@ -384,6 +402,7 @@ class ReviewWorker:
                             worker_id=worker_id,
                             lease=lease,
                             review_started=review_started,
+                            engine=engine,
                         )
                     except TransientError as recovery_error:
                         await self._schedule_retry(
@@ -431,8 +450,11 @@ class ReviewWorker:
         worker_id: str,
         lease: LeaseGuard,
         review_started: float,
+        engine: NativeFirmwareReviewEngine | None = None,
     ) -> ReviewResult | None:
-        recover_completed = getattr(self.engine, "recover_completed", None)
+        recover_completed = getattr(
+            engine if engine is not None else self.engine, "recover_completed", None
+        )
         if recover_completed is None:
             return None
         backend = PostgresProgressBackend(
@@ -472,6 +494,13 @@ class ReviewWorker:
         worker_id: str,
         lease: LeaseGuard,
     ) -> tuple[JobRecord, ReviewResult]:
+        if job.project_review_policy is not None:
+            policy = ProjectReviewPolicy.model_validate(job.project_review_policy)
+            review.review_metadata = {
+                **review.review_metadata,
+                "output_language": policy.output_language,
+                "project_review_policy": policy.model_dump(mode="json"),
+            }
         lineage_complete = review.review_metadata.get("lineage_complete", True)
         if lineage_complete or "review_budget" in review.review_metadata:
             review = reconcile_finding_lineage(
@@ -540,13 +569,13 @@ class ReviewWorker:
                 finding_fingerprints=[finding.fingerprint or "" for finding in inline_findings],
             )
         if publication.status == PublicationStatus.POSTED.value:
-            await self.store.complete_publication_and_mark_done(
+            await self._complete_comment_publication(
+                job,
+                review,
                 publication.id,
-                job_id=job.id,
                 worker_id=worker_id,
                 gerrit_response=publication.gerrit_response,
             )
-            METRICS.success_total.labels(project=job.project).inc()
             return
         if publication.status == PublicationStatus.FAILED.value:
             await self._permanent_failure(
@@ -576,13 +605,13 @@ class ReviewWorker:
             )
             if already_posted:
                 await self._finish_attempt(reconcile_attempt, success=True)
-                await self.store.complete_publication_and_mark_done(
+                await self._complete_comment_publication(
+                    job,
+                    review,
                     publication.id,
-                    job_id=job.id,
                     worker_id=worker_id,
                     gerrit_response={"recovered": True},
                 )
-                METRICS.success_total.labels(project=job.project).inc()
                 return
 
             # A successful message lookup proves an earlier ambiguous POST did not leave this
@@ -620,13 +649,13 @@ class ReviewWorker:
             finally:
                 METRICS.gerrit_publish_latency_seconds.observe(perf_counter() - publish_started)
             await self._finish_attempt(publish_attempt, success=True)
-            await self.store.complete_publication_and_mark_done(
+            await self._complete_comment_publication(
+                job,
+                review,
                 publication.id,
-                job_id=job.id,
                 worker_id=worker_id,
                 gerrit_response=response,
             )
-            METRICS.success_total.labels(project=job.project).inc()
         except SupersededRevisionError:
             if reconcile_attempt is not None:
                 await self._finish_attempt_if_open(reconcile_attempt, success=True)
@@ -685,6 +714,55 @@ class ReviewWorker:
                 )
             await self._permanent_failure(job, worker_id=worker_id, error=exc)
 
+    async def _complete_comment_publication(
+        self,
+        job: JobRecord,
+        review: ReviewResult,
+        publication_id: int,
+        *,
+        worker_id: str,
+        gerrit_response: dict | None,
+        allow_vote: bool = True,
+    ) -> None:
+        # Old already-published jobs are never retroactively opted into voting on upgrade.
+        policy = (
+            ProjectReviewPolicy.model_validate(job.project_review_policy)
+            if job.project_review_policy is not None
+            else None
+        )
+        if policy is None or job.state != JobState.PUBLISHING:
+            await self.store.complete_publication_and_mark_done(
+                publication_id,
+                job_id=job.id,
+                worker_id=worker_id,
+                gerrit_response=gerrit_response,
+            )
+            METRICS.success_total.labels(project=job.project).inc()
+            return
+        decision = decide_code_review_vote(policy, review)
+        votes = VoteStore(self.store._sessions)
+        await votes.ensure(
+            job,
+            worker_id=worker_id,
+            decision=decision,
+            payload=vote_payload(job, policy, decision, review, self._effective_review_tag(job)),
+        )
+        job = await self.store.complete_publication_and_mark_done(
+            publication_id,
+            job_id=job.id,
+            worker_id=worker_id,
+            gerrit_response=gerrit_response,
+            defer_done=True,
+        )
+        completed = await VotePublisher(self.settings, self.store, self.gerrit).process(
+            job,
+            worker_id=worker_id,
+            allow_vote=allow_vote,
+            guard=lambda: self._publish_guard(job.id, worker_id=worker_id),
+        )
+        if completed:
+            METRICS.success_total.labels(project=job.project).inc()
+
     async def _resolve_superseded_publish(
         self,
         job: JobRecord,
@@ -699,13 +777,14 @@ class ReviewWorker:
             METRICS.superseded_total.labels(project=job.project).inc()
             return
         if publication.status == PublicationStatus.POSTED.value:
-            await self.store.complete_publication_and_mark_done(
+            await self._complete_comment_publication(
+                job,
+                review,
                 publication.id,
-                job_id=job.id,
                 worker_id=worker_id,
                 gerrit_response=publication.gerrit_response,
+                allow_vote=False,
             )
-            METRICS.success_total.labels(project=job.project).inc()
             return
         if publication.status == PublicationStatus.FAILED.value:
             await self.store.mark_superseded(job.id, worker_id=worker_id)
@@ -740,13 +819,14 @@ class ReviewWorker:
             METRICS.superseded_total.labels(project=job.project).inc()
             return
         if already_posted:
-            await self.store.complete_publication_and_mark_done(
+            await self._complete_comment_publication(
+                job,
+                review,
                 publication.id,
-                job_id=job.id,
                 worker_id=worker_id,
                 gerrit_response={"recovered_after_supersession": True},
+                allow_vote=False,
             )
-            METRICS.success_total.labels(project=job.project).inc()
         else:
             await self.store.mark_superseded(job.id, worker_id=worker_id)
             METRICS.superseded_total.labels(project=job.project).inc()

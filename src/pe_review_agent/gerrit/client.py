@@ -17,6 +17,7 @@ from pe_review_agent.domain import Finding, GerritPatchsetEvent, ReviewResult
 from pe_review_agent.retry import PermanentError, TransientError
 
 from .allowlist import ProjectAllowlist
+from .votes import VoteObservation, parse_vote_observation
 
 _XSSI_PREFIX = ")]}'"
 _PATCH_SET_PREFIX = re.compile(r"^\s*Patch\s+Set\s+\d+\s*:\s*", re.IGNORECASE)
@@ -90,6 +91,60 @@ class GerritRestClient:
         if auth.mode != "none" and not root.endswith("/a"):
             root = f"{root}/a"
         self._api_root = root
+
+    async def authenticated_account_id(self) -> int:
+        payload = await self._request_json("GET", "accounts/self")
+        if not isinstance(payload, Mapping) or type(payload.get("_account_id")) is not int:
+            raise PermanentError("Gerrit did not identify an authenticated bot account")
+        if payload["_account_id"] <= 0:
+            raise PermanentError("Gerrit bot account id is invalid")
+        return payload["_account_id"]
+
+    async def code_review_vote_observation(
+        self,
+        *,
+        project: str,
+        change_number: int,
+        revision_sha: str,
+        patchset_number: int,
+        account_id: int,
+        tag: str,
+        marker: str,
+        target: int,
+    ) -> VoteObservation:
+        self._allowlist.require(project)
+        detail = await self._request_json(
+            "GET",
+            f"changes/{_change_identifier(project, change_number)}/detail",
+            params=[("o", "CURRENT_REVISION"), ("o", "DETAILED_LABELS")],
+        )
+        if not isinstance(detail, Mapping):
+            raise TransientError("Gerrit vote preflight returned invalid ChangeInfo")
+        change = _parse_change(detail, expected_project=project, expected_number=change_number)
+        if change.current_revision != revision_sha or change.patchset_number != patchset_number:
+            raise SupersededRevisionError(
+                project=project,
+                change_number=change_number,
+                expected=revision_sha,
+                actual=change.current_revision,
+            )
+        if change.status != "NEW":
+            raise PermanentError(f"Gerrit change is not open (status={change.status})")
+        messages = await self._request_json(
+            "GET",
+            f"changes/{_change_identifier(project, change_number)}/messages",
+        )
+        if not isinstance(messages, list):
+            raise TransientError("Gerrit vote recovery returned invalid messages")
+        return parse_vote_observation(
+            detail,
+            messages,
+            account_id=account_id,
+            patchset_number=patchset_number,
+            tag=tag,
+            marker=marker,
+            target=target,
+        )
 
     def replace_projects(self, projects: list[str] | tuple[str, ...]) -> None:
         """Refresh the exact project allowlist from the durable control-plane configuration."""
@@ -470,10 +525,13 @@ def build_review_input(
     if max_comment_bytes < 1024:
         raise ValueError("max_comment_bytes must be at least 1024")
     comments: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    language = str(review.review_metadata.get("output_language", "en-US"))
     for finding in review.findings:
         location = finding.location
         comment: dict[str, Any] = {
-            "message": _truncate_utf8_comment(_finding_message(finding), max_comment_bytes),
+            "message": _truncate_utf8_comment(
+                _finding_message(finding, language), max_comment_bytes
+            ),
             "side": location.side.value,
         }
         if location.end_line is None:
@@ -498,14 +556,19 @@ def build_review_input(
     return payload
 
 
-def _finding_message(finding: Finding) -> str:
+def _finding_message(finding: Finding, language: str = "en-US") -> str:
+    impact, evidence, remediation = (
+        ("영향", "근거", "수정 방향")
+        if language == "ko-KR"
+        else ("Impact", "Evidence", "Suggested fix")
+    )
     sections = [f"[{finding.severity}] {finding.title}", finding.message]
     if finding.impact:
-        sections.append(f"Impact: {finding.impact}")
+        sections.append(f"{impact}: {finding.impact}")
     if finding.evidence:
-        sections.append(f"Evidence: {finding.evidence}")
+        sections.append(f"{evidence}: {finding.evidence}")
     if finding.remediation:
-        sections.append(f"Suggested fix: {finding.remediation}")
+        sections.append(f"{remediation}: {finding.remediation}")
     return "\n\n".join(sections)
 
 
@@ -644,9 +707,7 @@ def _gerrit_timestamp(value: str | None) -> datetime | None:
 def _gerrit_search_boundary(value: str) -> str:
     """Ceil Gerrit's nanosecond UTC timestamp to a search-safe millisecond boundary."""
 
-    match = re.fullmatch(
-        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?", value
-    )
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?", value)
     if match is None:
         raise TransientError(f"Gerrit response has invalid updated timestamp {value!r}")
     try:

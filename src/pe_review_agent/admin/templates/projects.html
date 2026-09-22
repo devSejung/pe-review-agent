@@ -7,9 +7,16 @@
   </div>
 </div>
 
+<div class="alert alert-info">
+  Review language and voting policy are fixed when each Job starts reviewing. Project changes apply
+  to newly starting reviews without a restart.
+  Optional Code-Review voting sends +1 for zero validated findings (including budget-limited partial
+  reviews), or 0 when findings remain. Failures and skipped reviews do not vote. This does not
+  replace human approval. No old Patch Set vote is proactively revoked.
+</div>
 <div class="row row-cards">
-  <div class="col-lg-4">
-    <form class="card" data-api-form="/api/projects" data-method="POST" data-reload="true">
+  <div class="col-xl-3">
+    <form class="card" data-api-form="/api/projects" data-method="POST" data-reload="true" data-vote-enabled="false">
       <div class="card-header"><h3 class="card-title">Add Gerrit project</h3></div>
       <div class="card-body">
         <label class="form-label" for="project-name">Exact Gerrit project name</label>
@@ -21,6 +28,17 @@
           <option value="INCLUDE_OPEN">Include current open Changes — backfill</option>
         </select>
         <div class="form-hint mt-2">From now on avoids scanning historical open Changes. Backfill can enqueue a large amount of work on established repositories.</div>
+        <label class="form-label mt-4" for="project-language">Review language</label>
+        <select id="project-language" class="form-select" name="review_language">
+          <option value="INHERIT">Global default ({{ default_review_language }})</option>
+          <option value="ko-KR">한국어</option>
+          <option value="en-US">English</option>
+        </select>
+        <label class="form-check form-switch mt-4">
+          <input class="form-check-input" type="checkbox" name="auto_code_review">
+          <span class="form-check-label">Automatic Code-Review +1 / 0</span>
+        </label>
+        <div class="form-hint">Default OFF. The bot needs Code-Review +1 permission on each target branch.</div>
         <label class="form-check form-switch mt-4">
           <input class="form-check-input" type="checkbox" name="enabled" checked>
           <span class="form-check-label">Enable reviews immediately</span>
@@ -29,7 +47,7 @@
       <div class="card-footer"><button class="btn btn-primary w-100" type="submit">Add project</button></div>
     </form>
   </div>
-  <div class="col-lg-8">
+  <div class="col-xl-9">
     <div class="card">
       <div class="card-header"><h3 class="card-title">Managed projects</h3></div>
       <div class="table-responsive">
@@ -38,7 +56,32 @@
           <tbody>
           {% for item in projects %}
           <tr>
-            <td><div class="fw-semibold">{{ item.project }}</div></td>
+            <td>
+              <div class="fw-semibold">{{ item.project }}</div>
+              <div class="text-secondary small mt-1">
+                {% if item.review_language == 'INHERIT' %}Global ({{ default_review_language }}){% elif item.review_language == 'ko-KR' %}한국어{% else %}English{% endif %}
+                · Code-Review {% if item.auto_code_review %}+1 / 0{% else %}OFF{% endif %}
+              </div>
+              <details class="mt-2">
+                <summary>Review settings</summary>
+                <form class="mt-2" data-api-form="/api/projects/review-policy" data-method="POST" data-reload="true" data-vote-enabled="{{ 'true' if item.auto_code_review else 'false' }}">
+                  <input type="hidden" name="project" value="{{ item.project }}">
+                  <input type="number" name="policy_generation" value="{{ item.policy_generation }}" hidden>
+                  <label class="form-label">Review language
+                    <select class="form-select form-select-sm" name="review_language">
+                      <option value="INHERIT" {% if item.review_language == 'INHERIT' %}selected{% endif %}>Global default ({{ default_review_language }})</option>
+                      <option value="ko-KR" {% if item.review_language == 'ko-KR' %}selected{% endif %}>한국어</option>
+                      <option value="en-US" {% if item.review_language == 'en-US' %}selected{% endif %}>English</option>
+                    </select>
+                  </label>
+                  <label class="form-check form-switch mt-2">
+                    <input class="form-check-input" type="checkbox" name="auto_code_review" {% if item.auto_code_review %}checked{% endif %}>
+                    <span class="form-check-label">Automatic Code-Review +1 / 0</span>
+                  </label>
+                  <button class="btn btn-sm btn-primary mt-2" type="submit">Save review settings</button>
+                </form>
+              </details>
+            </td>
             <td>{% if item.enabled %}<span class="badge bg-green-lt">Enabled</span>{% else %}<span class="badge bg-secondary-lt">Disabled</span>{% endif %}</td>
             <td style="min-width: 15rem">
               <select class="form-select form-select-sm" data-project-review-start="{{ item.project }}">

@@ -46,6 +46,18 @@ class NativeFirmwareReviewEngine:
         self.settings = settings
         self.validator = FindingValidator(settings)
 
+    def with_output_language(self, language: str) -> NativeFirmwareReviewEngine:
+        if language == self.settings.output_language:
+            return self
+        settings = ReviewSettings.model_validate(
+            {
+                **self.settings.model_dump(),
+                "output_language": language,
+            }
+        )
+        # Share the provider client/semaphore, not mutable per-job settings.
+        return NativeFirmwareReviewEngine(self.llm, settings)
+
     async def recover_completed(
         self,
         context: ReviewContext,
@@ -79,6 +91,7 @@ class NativeFirmwareReviewEngine:
                 output_tokens=0,
                 review_metadata={
                     "engine": PROGRESS_VERSION,
+                    "output_language": self.settings.output_language,
                     "lineage_complete": False,
                     "candidate_count": 0,
                     "verified_model_count": 0,
@@ -277,6 +290,7 @@ class NativeFirmwareReviewEngine:
             output_tokens=budget.usage.output_tokens,
             review_metadata={
                 "engine": PROGRESS_VERSION,
+                "output_language": self.settings.output_language,
                 "lineage_complete": complete,
                 "diff_chunks": progress.coverage["candidate_chunks_reviewed"],
                 "initial_diff_chunks": len(initial_chunks),

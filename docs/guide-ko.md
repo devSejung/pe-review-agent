@@ -788,6 +788,11 @@ pe-review-agent
 
 이 bot은 기본적으로 **comment-only reviewer**입니다.
 
+Repo별 **Automatic Code-Review +1 / 0**를 켤 경우에만 해당 project/대상 branch에 대한
+`Code-Review +1` 권한을 추가로 부여합니다. +2, Submit, 다른 계정 대신 투표하는 권한은 불필요합니다.
+Projects의 Test 버튼은 REST/SSH 읽기 검사이며 투표 권한까지 보장하지 않습니다. 실제 투표 직전에
+대상 Change의 label 권한과 최신 Patch Set을 확인합니다.
+
 ### 관리자에게 권한 요청할 때 예시
 
 다음 수준으로 요청하면 됩니다.
@@ -1620,6 +1625,59 @@ Company HTTPS / SSO reverse proxy
 - project enable/disable
 - Gerrit REST + Git/SSH read/fetch 테스트
 - review 시작 범위 선택
+
+#### Repo별 리뷰 언어와 자동 Code-Review 투표
+
+각 repo의 **Review settings**에서 언어를 `Global default / 한국어 / English`로 선택하고
+자동 투표를 ON/OFF할 수 있습니다. 기존 repo 및 신규 repo의 기본값은 **전역 언어 상속 / 투표 OFF**입니다.
+저장하면 이후 새로 REVIEW를 시작하는 Job부터 적용되며 서비스 재시작은 필요 없습니다.
+프로젝트 정책 저장은 기존 From now on cutoff나 backfill 범위를 변경하지 않습니다.
+
+Job이 리뷰를 시작할 때 실제 적용 언어와 투표 정책을 한 번 저장합니다. 이후 언어를 바꾸거나
+프로세스를 재시작해도 해당 Job의 candidate/verifier/요약/이력 안내 언어는 유지합니다. 코드 식별자,
+레지스터명, 경로와 기존 finding의 인용 내용은 그대로 보존합니다. 동시에 한국어/영어 repo를 처리해도
+서로의 설정을 바꾸지 않으며 LLM client/concurrency 제한은 계속 공유합니다. `Global default`는
+worker가 이미 읽은 전역 설정을 따르므로, 전역 Settings 변경 자체에 필요한 재시작은 기존과 같습니다.
+
+자동 투표 ON인 repo에서는 현재 Patch Set의 **유효 finding 총수**로 다음을 결정합니다.
+
+| 결과 | Code-Review |
+|---|---|
+| 유효한 리뷰 결과, finding 0건 | +1 |
+| budget/max_tool_rounds 제한으로 부분 리뷰지만 유효한 결과가 있으며 finding 0건 | +1 |
+| finding 1건 이상 | 0 (명시적 중립 투표) |
+| API/JSON 오류 등으로 결과 생성 실패 | 투표하지 않음 |
+| merge/generated-only 등 리뷰 자체를 skip | 투표하지 않음 |
+| 해당 repo 투표 OFF | 댓글만 게시, 표를 건드리지 않음 |
+
+총수는 `max_findings` 게시 제한이나 기존 inline 댓글 중복 제거 **이전**의 검증 결과로 셉니다.
+따라서 지속 중인 finding 때문에 새 댓글이 0개이거나 `max_findings=0`으로 댓글이 숨겨져도 +1이 되지
+않습니다. 예산 초과에 따른 미완료/미검토 경고와 이전 finding 해결 판정은 기존대로 유지합니다.
+부분 리뷰에도 +1을 주는 것은 운영자가 선택한 정책이며 **무결함 보장·전체 검토 완료·사람 승인 대체가
+아닙니다.** LLM의 요약 문구가 아니라 서버의 검증된 finding 집계로 투표합니다.
+
+새 Patch Set 업로드만으로 이전 표를 자동 초기화하는 동작은 없습니다. Gerrit `copyCondition`에 따라
+예전 +1이 새 Patch Set으로 복사될 수 있으며, 이번 리뷰가 끝나면 현재 Patch Set에 +1 또는 0을
+적용합니다. 실패/skip일 때는 기존 표를 변경하지 않습니다. 로컬 Submit Requirements나 외부 자동화가
+Code-Review +1을 어떻게 해석하는지 확인한 뒤 기능을 켜십시오. 앱은 Submit/+2/-1을 요청하지 않습니다.
+
+댓글과 투표는 별도 처리합니다. 댓글이 먼저 게시되고, 권한 부족 등으로 투표가 실패하더라도
+댓글 게시 결과는 보존됩니다. Job Audit의 **Applied repository review policy / Code-Review vote**에
+적용 언어, 정책 세대, 판단 총수, 목표 +1/0, bot 계정, POST 횟수, 재시도 오류, 시간, 실제 요청과 결과를
+표시합니다. Job `DONE`은 리뷰 댓글 게시 완료를 뜻하며, 투표는 별도로 `APPLIED / FAILED / SKIPPED`를
+확인해야 합니다. Jobs 목록에도 투표 실패/대기 표시가 나옵니다.
+
+투표 중 일시 오류는 `retry.publish_attempts`를 상한으로 한 별도 카운터로 재시도합니다. 댓글이나
+LLM 리뷰를 다시 실행하지 않습니다. 마지막 POST 응답이 유실돼도 한 번의 복구 확인을 허용하며,
+Gerrit에서 해당 bot·Patch Set·고유 투표 메시지·실제 label을 확인합니다. 메시지는 있는데 표가 이후
+변경됐다면 다시 덮어쓰지 않습니다. 최종 확인 불가 상태는 실제로 미적용됐다고 단정하지 않고
+별도 오류로 남깁니다. 투표 설정 변경은 **새로 REVIEW를 시작하는 Job부터** 적용됩니다. 이미 리뷰를
+시작한 Job은 시작 시 저장한 투표 정책을 유지하며, 기존에 적용된 표를 자동으로 되돌리지도 않습니다.
+
+업그레이드는 구 프로세스 전체 중지 → migration **0012_project_review_policy** → 최신 프로세스
+시작 순서입니다. 새로운 환경변수나 secret은 없습니다. 업그레이드 전 이미 진행 중이던 Job은
+자동 투표에 소급 편입하지 않고 과거 DONE 리뷰도 재게시하지 않습니다. Downgrade는 정책/투표 Audit
+테이블을 삭제하므로 백업하고 pending vote를 정리한 뒤 수행해야 합니다.
 
 ### Connections
 

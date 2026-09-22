@@ -49,11 +49,14 @@
   document.querySelectorAll('[data-api-form]').forEach((form) => {
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
+      const payload = formPayload(form);
+      if (payload.auto_code_review === true && form.dataset.voteEnabled === 'false'
+          && !window.confirm('Enable Code-Review voting for this repository? Zero validated findings will receive +1 even for a partial/budget-limited review. Findings receive 0. This is not human approval.')) return;
       form.classList.add('api-busy');
       try {
         const result = await api(form.dataset.apiForm, {
           method: form.dataset.method || 'POST',
-          body: JSON.stringify(formPayload(form)),
+          body: JSON.stringify(payload),
         });
         show(result.detail || 'Saved.');
         if (form.dataset.reload === 'true') window.location.reload();

@@ -24,7 +24,7 @@ from pe_review_agent.domain import (
     Severity,
 )
 from pe_review_agent.jobs import JobStore, ProjectReviewStartMode
-from pe_review_agent.jobs.models import Job, ServiceState
+from pe_review_agent.jobs.models import Job, ReviewVote, ServiceState
 from pe_review_agent.operations import settings_fingerprint
 from pe_review_agent.retry import PermanentError, ProviderUnavailableError, TransientError
 from pe_review_agent.review.checkpoints import CandidateChunkCheckpoint
@@ -1309,6 +1309,95 @@ def test_repository_tool_trace_collapses_old_attempts_and_shows_event_time(
     assert "2026-09-21 14:00:02 KST" in response.text
     assert "Attempt 1 · REVIEW" in response.text
     assert "Attempt 2 · REVIEW" in response.text
+
+
+def test_project_language_voting_form_validation_and_concurrent_edit_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PE_REVIEW_TEST_ADMIN_PASSWORD", "correct-horse")
+    settings = _settings(tmp_path)
+    asyncio.run(_truncate(settings))
+    auth = ("ops", "correct-horse")
+    with TestClient(create_admin_app(settings)) as client:
+        page = client.get("/projects", auth=auth)
+        csrf = client.cookies.get("pe_review_csrf")
+        assert page.status_code == 200 and csrf
+        assert 'name="review_language"' in page.text
+        assert 'name="auto_code_review"' in page.text
+        assert 'Global default (ko-KR)' in page.text
+        assert "including budget-limited partial" in page.text
+        update = {"project": "team/fw", "review_language": "en-US",
+                  "auto_code_review": True, "policy_generation": 0}
+        assert client.post("/api/projects/review-policy", auth=auth, json=update).status_code == 403
+        headers = {"X-CSRF-Token": csrf}
+        for bad in ({"review_language": "ja-JP"}, {"auto_code_review": "true"},
+                    {"policy_generation": "0"}, {"surprise": 1}):
+            rejected = client.post("/api/projects/review-policy", auth=auth, headers=headers,
+                                   json={**update, **bad})
+            assert rejected.status_code == 422
+        saved = client.post("/api/projects/review-policy", auth=auth, headers=headers, json=update)
+        assert saved.status_code == 200
+        assert saved.json()["review_language"] == "en-US"
+        assert saved.json()["auto_code_review"] is True
+        assert saved.json()["policy_generation"] == 1
+        assert saved.json()["restart_required"] is False
+        stale = client.post("/api/projects/review-policy", auth=auth, headers=headers, json=update)
+        assert stale.status_code == 409
+        changed = client.get("/projects", auth=auth)
+        assert 'data-vote-enabled="true"' in changed.text
+        assert 'value="en-US" selected' in changed.text
+        added = client.post("/api/projects", auth=auth, headers=headers,
+                            json={"project": "team/new-policy"})
+        assert added.json()["review_language"] == "INHERIT"
+        assert added.json()["auto_code_review"] is False
+
+
+async def _seed_failed_vote_audit(settings: Settings):
+    job_id = await _published_job(settings)
+    database = Database(settings.database)
+    try:
+        async with database.sessions.begin() as session:
+            job = await session.get(Job, job_id)
+            assert job is not None
+            job.project_review_policy = {
+                "version": 1, "review_language": "ko-KR", "output_language": "ko-KR",
+                "auto_code_review": True, "generation": 2, "source": "project",
+                "bound_at": "2026-09-22T04:00:00+00:00",
+            }
+            session.add(
+                ReviewVote(
+                    job_id=job_id,
+                    value=0,
+                    status="FAILED",
+                    reason="findings_present",
+                    finding_count=1,
+                    account_id=7,
+                    request_payload={"labels": {"Code-Review": 0}},
+                    events=[{"event": "failed", "ts": "2026-09-22T04:01:00+00:00"}],
+                    last_error="Permission <denied>",
+                )
+            )
+        return job_id
+    finally:
+        await database.close()
+
+
+def test_job_audit_and_jobs_list_expose_vote_failure_separately(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PE_REVIEW_TEST_ADMIN_PASSWORD", "correct-horse")
+    settings = _settings(tmp_path)
+    asyncio.run(_truncate(settings))
+    job_id = asyncio.run(_seed_failed_vote_audit(settings))
+    with TestClient(create_admin_app(settings)) as client:
+        page = client.get(f"/jobs/{job_id}", auth=("ops", "correct-horse"))
+        jobs = client.get("/jobs", auth=("ops", "correct-horse"))
+    assert page.status_code == 200 and jobs.status_code == 200
+    assert "Applied repository review policy" in page.text
+    assert "Code-Review vote" in page.text
+    assert "0 (neutral)" in page.text
+    assert "Permission &lt;denied&gt;" in page.text
+    assert "2026-09-22 13:01:00 KST" in page.text
+    assert "Review comments remain published" in page.text
+    assert "Vote failed; comments posted" in jobs.text
 
 
 def test_job_audit_shows_exact_review_findings_attempts_and_publication(

@@ -18,7 +18,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 
 from pe_review_agent.config import Settings
@@ -44,6 +44,16 @@ class ProjectCreate(BaseModel):
     project: str = Field(min_length=1, max_length=512)
     enabled: bool = True
     review_start_mode: Literal["FROM_NOW", "INCLUDE_OPEN"] = "FROM_NOW"
+    review_language: Literal["INHERIT", "ko-KR", "en-US"] | None = None
+    auto_code_review: bool | None = Field(default=None, strict=True)
+
+
+class ProjectPolicyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project: str = Field(min_length=1, max_length=512)
+    review_language: Literal["INHERIT", "ko-KR", "en-US"]
+    auto_code_review: bool = Field(strict=True)
+    policy_generation: int = Field(ge=0, strict=True)
 
 
 class ProjectToggle(BaseModel):
@@ -173,11 +183,13 @@ def create_admin_app(settings: Settings) -> FastAPI:
     @app.get("/projects", response_class=HTMLResponse)
     async def projects(request: Request, _: str = Depends(auth_dependency)):
         control: ControlStore = request.app.state.control
+        effective = await control.effective_settings(settings)
         return await _render(
             request,
             "projects.html",
             page="projects",
             projects=await control.list_projects(),
+            default_review_language=effective.review.output_language,
         )
 
     @app.get("/connections", response_class=HTMLResponse)
@@ -326,6 +338,8 @@ def create_admin_app(settings: Settings) -> FastAPI:
             payload.project,
             enabled=payload.enabled,
             review_start_mode=ProjectReviewStartMode(payload.review_start_mode),
+            review_language=payload.review_language,
+            auto_code_review=payload.auto_code_review,
         )
         return {
             "ok": True,
@@ -333,6 +347,41 @@ def create_admin_app(settings: Settings) -> FastAPI:
             "enabled": project.enabled,
             "review_start_mode": project.review_start_mode.value,
             "review_start_at": project.review_start_at,
+            "review_language": project.review_language,
+            "auto_code_review": project.auto_code_review,
+            "policy_generation": project.policy_generation,
+        }
+
+    @app.post("/api/projects/review-policy")
+    async def set_project_review_policy(
+        request: Request,
+        payload: ProjectPolicyUpdate,
+        _: str = Depends(auth_dependency),
+    ):
+        _verify_csrf(request)
+        control: ControlStore = request.app.state.control
+        try:
+            project = await control.set_project_review_policy(
+                payload.project,
+                review_language=payload.review_language,
+                auto_code_review=payload.auto_code_review,
+                expected_generation=payload.policy_generation,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="project not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "project": project.project,
+            "review_language": project.review_language,
+            "auto_code_review": project.auto_code_review,
+            "policy_generation": project.policy_generation,
+            "restart_required": False,
+            "detail": (
+                "Saved for newly starting reviews. In-progress reviews retain their snapshotted "
+                "language and voting policy."
+            ),
         }
 
     @app.post("/api/projects/toggle")

@@ -81,6 +81,7 @@ def reconcile_finding_lineage(
         reopened_count=reopened_count,
         resolved=resolved,
         complete=complete,
+        language=str(review.review_metadata.get("output_language", "en-US")),
     )
     reconciled = review.model_copy(
         update={"summary": summary, "review_metadata": metadata},
@@ -111,7 +112,30 @@ def _tracking_summary(
     reopened_count: int,
     resolved: tuple[Finding, ...],
     complete: bool,
+    language: str = "en-US",
 ) -> str:
+    if language == "ko-KR":
+        baseline = (
+            f"PS {baseline_patchset} 대비"
+            if baseline_patchset is not None
+            else "이전 게시 기준 없음"
+        )
+        header = (
+            f"Patch Set 추적 ({baseline}{'' if complete else ', 부분 검토'}): "
+            f"신규 {new_count}건, 지속 {persisting_count}건, 재발 {reopened_count}건"
+        )
+        header += (
+            f", 해결 {len(resolved)}건."
+            if complete
+            else (". 미검토된 이전 이슈는 해결된 것으로 판정하지 않았습니다.")
+        )
+        sections = [header, original.strip()]
+        if resolved:
+            lines = [f"- [{f.severity.value}] {f.title} ({f.location.path})" for f in resolved[:10]]
+            if len(resolved) > 10:
+                lines.append(f"- 외 {len(resolved) - 10}건")
+            sections.append("이전 게시 Patch Set 이후 해결된 이슈:\n" + "\n".join(lines))
+        return "\n\n".join(section for section in sections if section)
     if baseline_patchset is None and complete:
         header = (
             f"Patch Set tracking: {new_count} new finding(s); no previously published baseline."

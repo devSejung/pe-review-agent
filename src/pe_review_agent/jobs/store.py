@@ -62,6 +62,7 @@ class JobRecord:
     event_payload: dict[str, Any]
     superseded_by_job_id: uuid.UUID | None = None
     retry_epoch_start_attempt: int = 0
+    project_review_policy: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,10 +715,7 @@ class JobStore:
             first_failed_at: datetime | None = None
             last_failed_at: datetime | None = None
             for error_class, finished_at in rows:
-                if (
-                    error_class != ProviderUnavailableError.__name__
-                    or finished_at is None
-                ):
+                if error_class != ProviderUnavailableError.__name__ or finished_at is None:
                     break
                 count += 1
                 if last_failed_at is None:
@@ -1148,6 +1146,7 @@ class JobStore:
         job_id: uuid.UUID,
         worker_id: str,
         gerrit_response: dict[str, Any] | None = None,
+        defer_done: bool = False,
     ) -> JobRecord:
         """Atomically record Gerrit's side effect and the job's published terminal state.
 
@@ -1188,17 +1187,25 @@ class JobStore:
                 )
 
             publication.status = PublicationStatus.POSTED.value
-            publication.gerrit_response = gerrit_response
-            publication.posted_at = func.now()
+            if publication.posted_at is None:
+                publication.gerrit_response = gerrit_response
+                publication.posted_at = func.now()
             publication.last_error = None
             publication.updated_at = func.now()
 
-            job.state = JobState.DONE.value
+            # Optional voting is a distinct durable side effect AFTER comments. Keep the lease
+            # while the vote runs; a reclaimed POSTED publication must never repost comments.
+            if defer_done:
+                _require_live_lease(job, worker_id)
+                if state != JobState.PUBLISHING:
+                    raise RuntimeError("deferred publication completion requires PUBLISHING")
+            job.state = JobState.PUBLISHING.value if defer_done else JobState.DONE.value
             job.retry_state = None
             job.last_error_class = None
             job.last_error = None
-            job.lease_owner = None
-            job.lease_expires_at = None
+            if not defer_done:
+                job.lease_owner = None
+                job.lease_expires_at = None
             job.updated_at = func.now()
             await session.flush()
             return _record(job)
@@ -1290,6 +1297,7 @@ def _record(job: Job) -> JobRecord:
         superseded_by_job_id=job.superseded_by_job_id,
         event_payload=job.event_payload,
         retry_epoch_start_attempt=job.retry_epoch_start_attempt,
+        project_review_policy=job.project_review_policy,
     )
 
 
