@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import quote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import uvicorn
@@ -222,6 +223,13 @@ def create_admin_app(settings: Settings) -> FastAPI:
     ):
         control: ControlStore = request.app.state.control
         jobs = await control.list_jobs(limit=200, state=state_filter, project=project)
+        effective = await control.effective_settings(settings)
+        for job in jobs:
+            job["cr_url"] = _gerrit_change_url(
+                effective.gerrit.rest_url,
+                job["project"],
+                job["change_number"],
+            )
         return await _render(
             request,
             "jobs.html",
@@ -242,6 +250,12 @@ def create_admin_app(settings: Settings) -> FastAPI:
         audit = await control.get_job_audit(job_id)
         if audit is None:
             raise HTTPException(status_code=404, detail="job not found")
+        effective = await control.effective_settings(settings)
+        audit["cr_url"] = _gerrit_change_url(
+            effective.gerrit.rest_url,
+            audit["project"],
+            audit["change_number"],
+        )
         audit["provider_retry"]["limit"] = settings.retry.llm_provider_attempts
         audit["provider_retry"]["max_wait_seconds"] = settings.retry.llm_provider_max_wait_seconds
         return await _render(
@@ -707,6 +721,18 @@ def _auth_dependency(settings: Settings):  # type: ignore[no-untyped-def]
         return credentials.username
 
     return authenticate
+
+
+def _gerrit_change_url(rest_url: str, project: str, change_number: int) -> str | None:
+    parts = urlsplit(rest_url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return None
+    base_path = parts.path.rstrip("/")
+    if base_path.endswith("/a"):
+        base_path = base_path[:-2]
+    project_path = quote(project.strip("/"), safe="/")
+    change_path = f"{base_path}/c/{project_path}/+/{change_number}"
+    return urlunsplit((parts.scheme, parts.netloc, change_path, "", ""))
 
 
 def _validate_admin_auth(settings: Settings) -> None:

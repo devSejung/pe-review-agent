@@ -7,7 +7,12 @@
       <div class="page-pretitle">Review audit trail</div>
       <h2 class="page-title">{{ audit.project }} · Change #{{ audit.change_number }} · PS{{ audit.patchset_number }}</h2>
     </div>
-    <div class="col-auto ms-auto"><a href="/jobs" class="btn btn-outline-secondary">Back to jobs</a></div>
+    <div class="col-auto ms-auto">
+      <div class="btn-list">
+        {% if audit.cr_url %}<a href="{{ audit.cr_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-primary">Open CR ↗</a>{% endif %}
+        <a href="/jobs" class="btn btn-outline-secondary">Back to jobs</a>
+      </div>
+    </div>
   </div>
 </div>
 

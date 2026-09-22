@@ -13,9 +13,10 @@ summary plus native inline/range comments.
 - Durable job identity: `(project, change_number, revision_sha, review_policy_version)`.
 - Duplicate Gerrit events do not create duplicate jobs or comments.
 - The worker refuses publication when either Gerrit `current_revision` or the durable job store
-  knows a newer Patch Set. The final Gerrit GET/local-guard/POST window is minimized; an absolute
-  atomic guarantee against a Patch Set created inside that last network race requires a Gerrit-side
-  compare-and-post extension (see the runbook).
+  knows a newer Patch Set, and applies the same final preflight to publishable Change status. The
+  final Gerrit GET/local-guard/POST window is minimized; an absolute atomic guarantee against a Patch
+  Set or status transition inside that last network race requires a Gerrit-side compare-and-post
+  extension (see the runbook).
 - Review results are persisted before publication, so Gerrit publication retries never rerun the
   LLM unnecessarily.
 - Deleted-code findings are represented explicitly on Gerrit's `PARENT` side, so deletion-only
@@ -65,6 +66,10 @@ summary plus native inline/range comments.
   capability.
 - Bot is comment-only by default. Projects can explicitly opt into Code-Review +1 / 0;
   Submit, +2, negative votes, and voting on behalf of another account are never requested.
+- If a review result is already durable and that exact current revision becomes `MERGED` before
+  publication, the bot still posts the completed summary/inline comments to that revision and skips
+  the optional Code-Review vote. A newer current revision still supersedes the stale review;
+  `ABANDONED` changes are not published.
 - A newer Patch Set waits while an older Patch Set has an unresolved/ambiguous publication side
   effect, preserving finding lineage and preventing the same published finding from being reposted
   as new.

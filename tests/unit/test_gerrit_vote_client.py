@@ -12,11 +12,11 @@ from pe_review_agent.retry import PermanentError, TransientError
 SHA = "a" * 40
 
 
-def detail(sha=SHA):
+def detail(sha=SHA, *, status="NEW"):
     return {
         "project": "team/fw",
         "_number": 12,
-        "status": "NEW",
+        "status": status,
         "current_revision": sha,
         "revisions": {sha: {"_number": 2, "ref": "refs/changes/12/12/2"}},
         "labels": {
@@ -108,6 +108,44 @@ async def test_authenticated_identity_and_current_ps_label_preflight_are_read_on
     assert result.marker_found
     assert all(req.method == "GET" for req in requests)
     assert "team%2Ffw~12" in requests[1].url.raw_path.decode()
+
+
+@pytest.mark.asyncio
+async def test_merged_vote_observation_recovers_existing_marker_but_cannot_vote():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("/detail"):
+            body = detail(status="MERGED")
+        else:
+            body = [message()]
+        return httpx.Response(200, text=")]}'\n" + json.dumps(body))
+
+    settings = GerritSettings(
+        ssh_host="gerrit",
+        ssh_user="bot",
+        ssh_key_path=Path("key"),
+        rest_url="https://gerrit",
+        projects=["team/fw"],
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        observation = await GerritRestClient(settings, client=http).code_review_vote_observation(
+            project="team/fw",
+            change_number=12,
+            revision_sha=SHA,
+            patchset_number=2,
+            account_id=7,
+            tag="unique-vote",
+            marker="result [vote:123]",
+            target=1,
+        )
+
+    assert observation.marker_found
+    assert observation.current_value == 1
+    assert observation.change_status == "MERGED"
+    assert observation.can_vote is False
+    assert [request.method for request in requests] == ["GET", "GET"]
 
 
 @pytest.mark.asyncio

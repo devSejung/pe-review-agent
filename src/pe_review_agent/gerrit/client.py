@@ -38,6 +38,14 @@ class SupersededRevisionError(PermanentError):
         self.actual = actual
 
 
+class ChangeNotOpenError(PermanentError):
+    def __init__(self, *, project: str, change_number: int, status: str) -> None:
+        super().__init__(f"Gerrit change {project}~{change_number} is not open (status={status})")
+        self.project = project
+        self.change_number = change_number
+        self.status = status
+
+
 @dataclass(frozen=True, slots=True)
 class GerritChange:
     project: str
@@ -128,8 +136,12 @@ class GerritRestClient:
                 expected=revision_sha,
                 actual=change.current_revision,
             )
-        if change.status != "NEW":
-            raise PermanentError(f"Gerrit change is not open (status={change.status})")
+        if change.status not in {"NEW", "MERGED"}:
+            raise ChangeNotOpenError(
+                project=project,
+                change_number=change_number,
+                status=change.status,
+            )
         messages = await self._request_json(
             "GET",
             f"changes/{_change_identifier(project, change_number)}/messages",
@@ -217,11 +229,14 @@ class GerritRestClient:
         revision_sha: str,
         *,
         include_commit: bool = False,
+        allow_merged: bool = False,
     ) -> GerritChange:
         change = await self.get_change(project, change_number, include_commit=include_commit)
-        if change.status != "NEW":
-            raise PermanentError(
-                f"Gerrit change {project}~{change_number} is not open (status={change.status})"
+        if change.status != "NEW" and not (allow_merged and change.status == "MERGED"):
+            raise ChangeNotOpenError(
+                project=project,
+                change_number=change_number,
+                status=change.status,
             )
         if change.current_revision != revision_sha:
             raise SupersededRevisionError(
@@ -270,12 +285,18 @@ class GerritRestClient:
         revision_sha: str,
         payload: Mapping[str, Any],
         pre_post_guard: Callable[[], Awaitable[bool]] | None = None,
+        allow_merged: bool = False,
     ) -> dict[str, Any]:
         """Publish a persisted ReviewInput without rebuilding or mutating its payload."""
 
         # Keep this check next to the POST even when the payload was durably built much earlier.
         # A newer patch set must supersede the job before any comments leave this process.
-        await self.ensure_current_revision(project, change_number, revision_sha)
+        await self.ensure_current_revision(
+            project,
+            change_number,
+            revision_sha,
+            allow_merged=allow_merged,
+        )
         if pre_post_guard is not None and not await pre_post_guard():
             raise SupersededRevisionError(
                 project=project,
@@ -562,13 +583,13 @@ def _finding_message(finding: Finding, language: str = "en-US") -> str:
         if language == "ko-KR"
         else ("Impact", "Evidence", "Suggested fix")
     )
-    sections = [f"[{finding.severity}] {finding.title}", finding.message]
+    sections = [f"**[{finding.severity}] {finding.title}**", finding.message]
     if finding.impact:
-        sections.append(f"{impact}: {finding.impact}")
+        sections.append(f"**{impact}:** {finding.impact}")
     if finding.evidence:
-        sections.append(f"{evidence}: {finding.evidence}")
+        sections.append(f"**{evidence}:** {finding.evidence}")
     if finding.remediation:
-        sections.append(f"{remediation}: {finding.remediation}")
+        sections.append(f"**{remediation}:** {finding.remediation}")
     return "\n\n".join(sections)
 
 

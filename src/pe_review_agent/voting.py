@@ -5,7 +5,11 @@ from datetime import UTC, datetime, timedelta
 
 from pe_review_agent.config import Settings
 from pe_review_agent.domain import JobState, ReviewResult
-from pe_review_agent.gerrit.client import GerritRestClient, SupersededRevisionError
+from pe_review_agent.gerrit.client import (
+    ChangeNotOpenError,
+    GerritRestClient,
+    SupersededRevisionError,
+)
 from pe_review_agent.jobs.store import JobRecord, JobStore
 from pe_review_agent.jobs.votes import TERMINAL_VOTE_STATES, VoteStore
 from pe_review_agent.retry import PermanentError, TransientError, exponential_backoff
@@ -67,6 +71,7 @@ class VotePublisher:
         worker_id: str,
         guard: Callable[[], Awaitable[bool]],
         allow_vote: bool = True,
+        skip_reason: str | None = None,
     ) -> bool:
         vote = await self.votes.get(job.id)
         if vote is None:
@@ -93,8 +98,11 @@ class VotePublisher:
         if not allow_vote:
             return await finish(
                 "SKIPPED",
-                "Patch Set superseded; no new vote sent. "
-                "Any earlier unconfirmed vote request remains in the audit.",
+                skip_reason
+                or (
+                    "Patch Set superseded; no new vote sent. "
+                    "Any earlier unconfirmed vote request remains in the audit."
+                ),
             )
         posted = False
         try:
@@ -122,6 +130,13 @@ class VotePublisher:
                     "FAILED",
                     "The vote message exists but the current bot label "
                     "differs or was not applied. It was not overwritten.",
+                )
+            if observation.change_status == "MERGED":
+                return await finish(
+                    "SKIPPED",
+                    "Change merged after review; no prior bot vote marker was found, so no new "
+                    "Code-Review vote was sent.",
+                    account_id=account_id,
                 )
             # A matching value without our unique marker may have been copied from an older
             # Patch Set. Publish this review's own decision, including an explicit neutral 0.
@@ -170,6 +185,14 @@ class VotePublisher:
             )
         except SupersededRevisionError:
             return await finish("SKIPPED", "Patch Set superseded; no further vote requests sent.")
+        except ChangeNotOpenError as exc:
+            if exc.status == "MERGED":
+                return await finish(
+                    "SKIPPED",
+                    "Change merged after review; comments remain published and no Code-Review "
+                    "vote was sent.",
+                )
+            return await finish("FAILED", str(exc))
         except PermanentError as exc:
             return await finish("FAILED", str(exc))
         except TransientError as exc:

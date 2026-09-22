@@ -246,6 +246,16 @@ verify, in order:
 8. a duplicate event does not add duplicate comments;
 9. uploading another Patch Set prevents the old job from publishing stale findings.
 
+Also test the review/merge race: let review inference complete for the current revision, merge that
+same revision before publication, and verify the stored summary/inline comments are still posted while
+the optional Code-Review vote is recorded as skipped. A different current revision must still block
+publication, and ABANDONED changes remain non-publishable.
+
+As with the existing stale-Patch-Set guard, the final Gerrit status/revision GET and Set Review POST
+cannot be made atomic by this service alone. The final GET/local guard/POST window is minimized, but a
+status or Patch Set transition inside that last network race would require a Gerrit-side
+compare-and-post extension for an absolute guarantee.
+
 Deletion-only changes should be included in acceptance: verify that a finding on removed code is
 posted as a native `PARENT`-side inline comment. A merge-commit Patch Set should produce the explicit
 safe-skip summary and no AI findings; first-parent line anchors are intentionally not guessed because

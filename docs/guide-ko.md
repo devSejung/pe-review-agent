@@ -1198,15 +1198,24 @@ Settings
 
 예:
 
-```text
-[P1] timeout 이후에도 training state가 진행됨
+```markdown
+**[P1] timeout 이후에도 training state가 진행됨**
 
 poll_done()이 -ETIMEDOUT을 반환하지만 호출부에서 반환값을 무시합니다.
 
-Impact ...
-Evidence ...
-Suggested fix ...
+**Impact:** ...
+**Evidence:** ...
+**Suggested fix:** ...
 ```
+
+Gerrit inline comment는 Markdown을 사용해 severity/title과 `Impact`/`Evidence`/`Suggested fix`
+label을 bold로 표시합니다. 한국어 review에서는 `영향`/`근거`/`수정 방향` label을 같은 방식으로
+강조합니다.
+
+모델이 `end_character <= start_character` 같은 유효하지 않은 optional character range를 반환해도
+finding 전체를 실패시키지 않습니다. `path + side + start_line`이 유효하면 해당 잘못된 character
+range만 버리고 line-only comment로 안전하게 강등합니다. 정확한 character range를 아는 경우에만
+range comment를 사용하도록 candidate/verifier prompt에도 지시합니다.
 
 JSON schema key, `P0/P1/P2`, `REVISION/PARENT` 같은 enum은 내부 처리 때문에 영어 값을 유지합니다.
 
@@ -2074,7 +2083,8 @@ Logs
 
 ### Jobs
 
-문제 Change의 current state와 last error를 확인합니다.
+문제 Change의 current state와 last error를 확인합니다. 각 Job에는 Gerrit **CR ↗** direct link가 있어
+해당 Change로 바로 이동할 수 있습니다.
 
 ### Job Audit
 
@@ -2087,6 +2097,15 @@ Logs
 - candidate chunk checkpoint가 몇 개 저장/재사용됐는지
 - publication intent가 생겼는지
 - Gerrit response가 있는지
+- 상단 **Open CR ↗** 버튼으로 실제 Gerrit Change 확인
+
+리뷰가 시작될 때는 Change가 `NEW`였지만 Qwen 검토가 끝난 뒤 같은 revision이 `MERGED`된 경우,
+이미 만들어진 결과를 버리지 않고 해당 revision에 summary/inline comment를 게시합니다. 이 경우
+`Code-Review` vote는 보내지 않고 Audit에 `SKIPPED`로 남깁니다. 반면 current revision이 달라졌으면
+기존과 동일하게 stale review로 간주하여 게시하지 않으며, `ABANDONED` Change도 게시 대상이 아닙니다.
+다만 기존 stale Patch Set 보호와 동일하게 최종 Gerrit status/revision GET과 Set Review POST는 하나의
+원자 연산이 아닙니다. 마지막 GET/local guard/POST 사이의 매우 짧은 network race까지 절대적으로
+차단하려면 Gerrit-side compare-and-post 기능이 필요합니다.
 
 ### Logs
 

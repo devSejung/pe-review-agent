@@ -13,6 +13,7 @@ class VoteObservation:
     can_vote: bool
     marker_found: bool
     label_exists: bool
+    change_status: str = "NEW"
 
 
 def parse_vote_observation(
@@ -51,7 +52,8 @@ def parse_vote_observation(
     if not isinstance(allowed, list):
         raise TransientError("Gerrit Code-Review permission range is invalid")
     # Gerrit 3.8.10 PostReview.checkLabels always permits zero for an existing label.
-    can_vote = label is not None and (
+    change_status = detail.get("status") if isinstance(detail.get("status"), str) else "NEW"
+    can_vote = change_status == "NEW" and label is not None and (
         target == 0 or str(target) in [str(v).strip().lstrip("+") for v in allowed]
     )
     marker_found = False
@@ -68,4 +70,4 @@ def parse_vote_observation(
             and " ".join(item["message"].split()).endswith(" ".join(marker.split()))
         ):
             marker_found = True
-    return VoteObservation(value, can_vote, marker_found, label is not None)
+    return VoteObservation(value, can_vote, marker_found, label is not None, change_status)

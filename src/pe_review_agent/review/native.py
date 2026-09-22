@@ -494,6 +494,9 @@ necessary.
 Do not guess. Findings must
 anchor their start_line and side to a changed line from the index above. Use side REVISION for
 added or modified revision lines and side PARENT for removed/deleted lines.
+Character ranges are optional. Prefer a line-only location by setting end_line/end_character to
+null unless the exact range is known. For a same-line range, end_character must be greater than
+start_character.
 
 If a current defect is the same root cause as one of the previously published findings, copy that
 finding's semantic_id exactly even if its line moved. If it is genuinely new, return semantic_id as
@@ -525,8 +528,8 @@ Return ONLY a JSON object with this shape:
         "side": "REVISION|PARENT",
         "start_line": 123,
         "start_character": 0,
-        "end_line": 123,
-        "end_character": 8
+        "end_line": null,
+        "end_character": null
       }},
       "confidence": 0.0
     }}
@@ -653,6 +656,8 @@ containing only findings that survive verification. Correct inaccurate line
         root cause, leave
 semantic_id null. Set confidence conservatively. `review_summary` summarizes the verified review
 result only; do not repeat or rewrite the candidate's change summary.
+Character ranges are optional. Prefer line-only locations (`end_line`/`end_character` null) unless
+the exact range is known. For a same-line range, end_character must be greater than start_character.
 
 Keep the final JSON focused. Return at most {max_response_findings} findings because this batch has
 only {max_response_findings} candidates. Do not restate candidate or repository text, and do not
@@ -677,8 +682,8 @@ Return ONLY a JSON object with this shape:
         "side": "REVISION|PARENT",
         "start_line": 123,
         "start_character": 0,
-        "end_line": 123,
-        "end_character": 8
+        "end_line": null,
+        "end_character": null
       }},
       "confidence": 0.0
     }}
@@ -731,6 +736,7 @@ Return ONLY a JSON object with this shape:
                     for item in summary_items
                     if item.strip()
                 )
+        _normalize_model_finding_locations(data)
         try:
             return _CandidateReview.model_validate(data)
         except ValidationError as exc:
@@ -743,6 +749,7 @@ Return ONLY a JSON object with this shape:
         raw = _extract_json_object(content)
         try:
             data = json.loads(raw)
+            _normalize_model_finding_locations(data)
             return _VerificationReview.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
             raise TransientError(
@@ -953,6 +960,59 @@ def _extract_json_object(content: str) -> str:
     if start >= 0 and end > start:
         return value[start : end + 1]
     return value
+
+
+def _normalize_model_finding_locations(data: Any) -> None:
+    """Salvage valid findings when only optional model-authored range coordinates are malformed."""
+
+    if not isinstance(data, dict):
+        return
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        location = finding.get("location")
+        if not isinstance(location, dict):
+            continue
+        start_line = location.get("start_line")
+        if type(start_line) is not int or start_line < 1:
+            continue
+
+        start_character = location.get("start_character", 0)
+        if type(start_character) is not int or start_character < 0:
+            location.pop("start_character", None)
+            if location.get("end_line") is not None or location.get("end_character") is not None:
+                location.pop("end_line", None)
+                location.pop("end_character", None)
+            continue
+
+        end_line = location.get("end_line")
+        if end_line is None:
+            location.pop("end_character", None)
+            continue
+        if type(end_line) is not int or end_line < start_line:
+            location.pop("end_line", None)
+            location.pop("end_character", None)
+            continue
+
+        end_character = location.get("end_character")
+        if end_character is not None and (
+            type(end_character) is not int or end_character < 0
+        ):
+            location.pop("end_line", None)
+            location.pop("end_character", None)
+            continue
+        if (
+            end_line == start_line
+            and end_character is not None
+            and end_character <= start_character
+        ):
+            # A zero/negative-width same-line range carries no useful precision. Fall back to the
+            # already validated changed-line anchor instead of discarding the entire finding.
+            location.pop("end_line", None)
+            location.pop("end_character", None)
 
 
 def _bounded_metadata(value: str | None, limit: int) -> str | None:
