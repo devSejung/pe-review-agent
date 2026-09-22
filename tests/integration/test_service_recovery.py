@@ -24,7 +24,7 @@ from pe_review_agent.domain import (
     ReviewResult,
     Severity,
 )
-from pe_review_agent.gerrit import SupersededRevisionError
+from pe_review_agent.gerrit import ChangeNotOpenError, SupersededRevisionError
 from pe_review_agent.jobs import JobStore, PublicationStatus
 from pe_review_agent.jobs.progress import PostgresProgressBackend
 from pe_review_agent.llm.client import LlmCompletion
@@ -197,15 +197,25 @@ class _FakeGerrit:
         self.ensure_error: Exception | None = None
         self.before_pre_post_guard = None
         self.after_post_side_effect = None
+        self.status = "NEW"
 
     async def ensure_current_revision(self, *_args, **_kwargs):
         if self.ensure_error is not None:
             raise self.ensure_error
+        if self.status != "NEW" and not (
+            _kwargs.get("allow_merged", False) and self.status == "MERGED"
+        ):
+            raise ChangeNotOpenError(
+                project="team/fw",
+                change_number=101,
+                status=self.status,
+            )
         return SimpleNamespace(
             ref="refs/changes/01/101/1",
             subject="Test timeout path",
             branch="main",
             commit_message="Test timeout path\n\nExercise retry recovery.",
+            status=self.status,
         )
 
     async def has_published_review(self, **_kwargs) -> bool:
@@ -435,11 +445,12 @@ async def test_ambiguous_recovery_closed_change_terminates_after_proving_post_ab
     publication = await store.publication_for_job(job.id)
     assert publication is not None and publication.status == PublicationStatus.AMBIGUOUS.value
 
-    # Gerrit can still list messages for a closed Change. Once that lookup proves the ambiguous
-    # payload absent, a closed status is a permanent publish failure rather than unresolved
-    # uncertainty that should block the queue forever.
+    # Gerrit can still list messages for an abandoned Change. Once that lookup proves the ambiguous
+    # payload absent, ABANDONED remains a permanent publish failure rather than unresolved
+    # uncertainty that should block the queue forever. MERGED is handled separately and may still
+    # receive the already-completed comment review for the same revision.
     gerrit.already_published = False
-    gerrit.ensure_error = PermanentError("Gerrit change team/fw~101 is not open (status=MERGED)")
+    gerrit.ensure_error = PermanentError("Gerrit change team/fw~101 is not open (status=ABANDONED)")
     second_claim = await store.claim_next(worker_id="publisher-2", lease_seconds=120)
     assert second_claim is not None
     await worker._process_publish(  # noqa: SLF001

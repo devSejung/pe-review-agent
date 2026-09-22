@@ -1,5 +1,6 @@
 from .allowlist import ProjectAllowlist
 from .client import (
+    ChangeNotOpenError,
     GerritChange,
     GerritRestClient,
     SupersededRevisionError,
@@ -8,6 +9,7 @@ from .client import (
 from .events import GerritEventStream, parse_patchset_created
 
 __all__ = [
+    "ChangeNotOpenError",
     "GerritChange",
     "GerritEventStream",
     "GerritRestClient",

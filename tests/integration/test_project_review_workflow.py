@@ -24,7 +24,7 @@ from pe_review_agent.domain import (
     ReviewResult,
     Severity,
 )
-from pe_review_agent.gerrit import SupersededRevisionError
+from pe_review_agent.gerrit import ChangeNotOpenError, SupersededRevisionError
 from pe_review_agent.gerrit.votes import VoteObservation
 from pe_review_agent.jobs import JobStore
 from pe_review_agent.jobs.models import Job, ReviewVote
@@ -137,9 +137,11 @@ class Gerrit:
         self.read_error = None
         self.before_vote = None
         self.ignore_label = False
-        self.closed = False
+        self.status = "NEW"
 
-    async def ensure_current_revision(self, project, change_number, revision_sha, **kwargs):
+    async def ensure_current_revision(
+        self, project, change_number, revision_sha, *, allow_merged=False, **kwargs
+    ):
         if revision_sha != self.current:
             raise SupersededRevisionError(
                 project=project,
@@ -147,13 +149,18 @@ class Gerrit:
                 expected=revision_sha,
                 actual=self.current,
             )
-        if self.closed:
-            raise PermanentError("Gerrit change is not open")
+        if self.status != "NEW" and not (allow_merged and self.status == "MERGED"):
+            raise ChangeNotOpenError(
+                project=project,
+                change_number=change_number,
+                status=self.status,
+            )
         return SimpleNamespace(
             ref="refs/changes/01/101/1",
             subject="training",
             branch="main",
             commit_message="training",
+            status=self.status,
         )
 
     async def has_published_review(self, **kwargs):
@@ -164,12 +171,21 @@ class Gerrit:
 
     async def code_review_vote_observation(self, **kwargs):
         await self.ensure_current_revision(
-            kwargs["project"], kwargs["change_number"], kwargs["revision_sha"]
+            kwargs["project"],
+            kwargs["change_number"],
+            kwargs["revision_sha"],
+            allow_merged=True,
         )
         if self.read_error:
             raise self.read_error
         marker = (kwargs["tag"], kwargs["marker"], kwargs["account_id"])
-        return VoteObservation(self.value, self.permission, self.marker == marker, True)
+        return VoteObservation(
+            self.value,
+            self.permission and self.status == "NEW",
+            self.marker == marker,
+            True,
+            self.status,
+        )
 
     async def publish_review_input(self, **kwargs):
         payload = kwargs["payload"]
@@ -177,7 +193,10 @@ class Gerrit:
         if is_vote and self.before_vote:
             await self.before_vote()
         await self.ensure_current_revision(
-            kwargs["project"], kwargs["change_number"], kwargs["revision_sha"]
+            kwargs["project"],
+            kwargs["change_number"],
+            kwargs["revision_sha"],
+            allow_merged=kwargs.get("allow_merged", False),
         )
         guard = kwargs.get("pre_post_guard")
         if guard and not await guard():
@@ -359,6 +378,38 @@ async def test_review_failure_has_no_vote_intent_and_no_post(env):
     assert not env.gerrit.vote_posts and not env.gerrit.comment_posts
 
 
+async def test_change_merged_after_review_still_posts_comments_and_skips_vote(env):
+    await run_review(env)
+    env.gerrit.status = "MERGED"
+
+    await run_publish(env)
+
+    vote = await audit_vote(env)
+    assert env.gerrit.comment_posts == 1
+    assert not env.gerrit.vote_posts
+    assert vote is not None and vote.status == "SKIPPED"
+    assert "merged after review" in (vote.last_error or "")
+    assert (await env.store.publication_for_job(env.job.id)).status == "POSTED"
+    assert (await env.store.get(env.job.id)).state == JobState.DONE
+
+
+async def test_change_merged_during_inference_same_revision_still_publishes(env):
+    async def merge_while_model_is_finishing():
+        env.gerrit.status = "MERGED"
+
+    env.engine.state["after_review"] = merge_while_model_is_finishing
+
+    await run_review(env)
+    assert env.gerrit.status == "MERGED"
+    await run_publish(env)
+
+    vote = await audit_vote(env)
+    assert env.gerrit.comment_posts == 1
+    assert not env.gerrit.vote_posts
+    assert vote is not None and vote.status == "SKIPPED"
+    assert (await env.store.get(env.job.id)).state == JobState.DONE
+
+
 async def test_language_snapshot_survives_project_change_retry_and_restart(env):
     await env.control.set_project_review_policy(
         "team/fw", review_language="en-US", auto_code_review=True, expected_generation=1
@@ -443,6 +494,24 @@ async def test_lost_vote_ack_recovers_without_comment_or_llm_replay(env):
     assert env.gerrit.comment_posts == 1 and len(env.gerrit.vote_posts) == 1
     assert (await env.store.publication_for_job(env.job.id)).posted_at == posted_at
     assert len(env.engine.state["calls"]) == 1
+
+
+async def test_lost_vote_ack_recovers_after_change_merges_without_second_vote_post(env):
+    env.gerrit.lose_ack = True
+    await run_review(env)
+    await run_publish(env)
+    assert (await audit_vote(env)).status == "AMBIGUOUS"
+    assert len(env.gerrit.vote_posts) == 1
+
+    env.gerrit.status = "MERGED"
+    await due(env)
+    await run_publish(env)
+
+    vote = await audit_vote(env)
+    assert vote.status == "APPLIED"
+    assert vote.response["recovered"] is True
+    assert len(env.gerrit.vote_posts) == 1
+    assert env.gerrit.comment_posts == 1
 
 
 async def test_changed_bot_vote_is_not_overwritten_after_ambiguous_response(env):

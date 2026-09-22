@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pe_review_agent.config import ReviewSettings
-from pe_review_agent.domain import DiffSide, Finding, ReviewContext, Severity
+from pe_review_agent.domain import DiffSide, Finding, FindingLocation, ReviewContext, Severity
 
 
 class FindingValidator:
@@ -59,18 +59,20 @@ class FindingValidator:
                 # may no longer contain the file at all, so validate active changed-line ranges
                 # against the parsed parent-side diff instead of the candidate filesystem.
                 if anchor_text is not None:
-                    if location.start_character > len(anchor_text):
-                        continue
+                    if location.end_line is None:
+                        location.start_character = 0
+                    elif location.start_character > len(anchor_text):
+                        _degrade_to_line_anchor(location)
                     if location.end_line is not None:
                         end_text = changed_lines.get(
                             (location.path, DiffSide.PARENT, location.end_line)
                         )
                         if end_text is None:
-                            continue
-                        if location.end_character is None:
+                            _degrade_to_line_anchor(location)
+                        elif location.end_character is None:
                             location.end_character = len(end_text)
-                        if location.end_character > len(end_text):
-                            continue
+                        elif location.end_character > len(end_text):
+                            _degrade_to_line_anchor(location)
                 elif not is_previous_finding:
                     continue
             else:
@@ -85,16 +87,18 @@ class FindingValidator:
                 start_text = line_text.get(location.start_line)
                 if start_text is None:
                     continue
-                if location.start_character > len(start_text):
-                    continue
+                if location.end_line is None:
+                    location.start_character = 0
+                elif location.start_character > len(start_text):
+                    _degrade_to_line_anchor(location)
                 if location.end_line is not None:
                     end_text = line_text.get(location.end_line)
                     if end_text is None:
-                        continue
-                    if location.end_character is None:
+                        _degrade_to_line_anchor(location)
+                    elif location.end_character is None:
                         location.end_character = len(end_text)
-                    if location.end_character > len(end_text):
-                        continue
+                    elif location.end_character > len(end_text):
+                        _degrade_to_line_anchor(location)
             category = finding.category.strip().lower()
             if category in {"style", "naming", "documentation", "formatting"}:
                 continue
@@ -108,6 +112,12 @@ class FindingValidator:
         severity_order = {Severity.P0: 0, Severity.P1: 1, Severity.P2: 2}
         accepted.sort(key=lambda item: (severity_order[item.severity], -item.confidence))
         return accepted
+
+
+def _degrade_to_line_anchor(location: FindingLocation) -> None:
+    location.start_character = 0
+    location.end_line = None
+    location.end_character = None
 
 
 def _read_utf8_lines(target: Path, line_numbers: set[int]) -> dict[int, str] | None:

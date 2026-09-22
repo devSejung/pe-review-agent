@@ -1413,6 +1413,8 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
 
     assert response.status_code == 200
     assert "Audit summary: one actionable issue was found." in response.text
+    assert "Open CR ↗" in response.text
+    assert 'href="https://gerrit/c/team/fw/+/778"' in response.text
     assert "Timeout is ignored" in response.text
     assert "poll_done() returns -ETIMEDOUT." in response.text
     assert "exact inline audit message" in response.text
@@ -1429,6 +1431,22 @@ def test_job_audit_shows_exact_review_findings_attempts_and_publication(
     assert "cccccccccccc" in response.text
     assert " KST" in response.text
     assert "+00:00" not in response.text
+
+
+def test_jobs_list_has_direct_gerrit_cr_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PE_REVIEW_TEST_ADMIN_PASSWORD", "correct-horse")
+    settings = _settings(tmp_path)
+    asyncio.run(_truncate(settings))
+    asyncio.run(_failed_job(settings))
+
+    with TestClient(create_admin_app(settings)) as client:
+        response = client.get("/jobs", auth=("ops", "correct-horse"))
+
+    assert response.status_code == 200
+    assert 'href="https://gerrit/c/team/fw/+/777"' in response.text
+    assert "CR ↗" in response.text
 
 
 def test_logs_page_and_api_expose_full_structured_error(

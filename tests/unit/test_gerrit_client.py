@@ -42,6 +42,7 @@ def _change_info(
     more: bool = False,
     updated: str = "2026-09-16 06:00:00.000000000",
     created: str | None = None,
+    status: str = "NEW",
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": f"{project}~main~Ideadbeef",
@@ -49,7 +50,7 @@ def _change_info(
         "branch": "main",
         "change_id": "Ideadbeef",
         "subject": "Fix memory ordering",
-        "status": "NEW",
+        "status": status,
         "updated": updated,
         "_number": number,
         "current_revision": revision,
@@ -193,7 +194,10 @@ async def test_publish_review_builds_summary_inline_and_range_comments() -> None
     line_comment, range_comment = payload["comments"]["drivers/dma.c"]
     assert line_comment["line"] == 88
     assert line_comment["side"] == "REVISION"
-    assert "[P1] Unchecked descriptor index" in line_comment["message"]
+    assert "**[P1] Unchecked descriptor index**" in line_comment["message"]
+    assert "**Impact:** Out-of-bounds MMIO access." in line_comment["message"]
+    assert "**Evidence:** idx is incremented without modulo reduction." in line_comment["message"]
+    assert "**Suggested fix:** Mask or reduce idx before dereference." in line_comment["message"]
     assert range_comment["range"] == {
         "start_line": 120,
         "start_character": 4,
@@ -282,6 +286,52 @@ async def test_publish_review_input_rejects_superseded_revision_before_post() ->
                 change_number=123,
                 revision_sha=REVISION,
                 payload={"message": "Stored summary"},
+            )
+
+    assert methods == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_publish_review_input_can_comment_on_merged_same_revision() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.method == "GET":
+            return _gerrit_json(_change_info(status="MERGED"))
+        return _gerrit_json({"labels": {}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = GerritRestClient(_settings(), client=http_client)
+        result = await client.publish_review_input(
+            project="team/fw",
+            change_number=123,
+            revision_sha=REVISION,
+            payload={"message": "Review completed before merge"},
+            allow_merged=True,
+        )
+
+    assert result == {"labels": {}}
+    assert methods == ["GET", "POST"]
+
+
+@pytest.mark.asyncio
+async def test_publish_review_input_merged_still_rejects_different_revision() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return _gerrit_json(_change_info(status="MERGED", revision=NEW_REVISION, patchset=5))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = GerritRestClient(_settings(), client=http_client)
+        with pytest.raises(SupersededRevisionError):
+            await client.publish_review_input(
+                project="team/fw",
+                change_number=123,
+                revision_sha=REVISION,
+                payload={"message": "stale"},
+                allow_merged=True,
             )
 
     assert methods == ["GET"]

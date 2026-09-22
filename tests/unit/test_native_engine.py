@@ -248,6 +248,86 @@ def test_candidate_schema_error_distinguishes_valid_json_from_json_syntax_error(
         )
 
 
+def test_candidate_invalid_zero_width_character_range_falls_back_to_line_anchor() -> None:
+    llm = FakeLlm([])
+    engine = NativeFirmwareReviewEngine(llm, ReviewSettings())  # type: ignore[arg-type]
+    payload = json.loads(_review_json())
+    payload["findings"][0]["location"] = {
+        "path": "DramFW/Bl2/src/init.c",
+        "side": "REVISION",
+        "start_line": 470,
+        "start_character": 0,
+        "end_line": 470,
+        "end_character": 0,
+    }
+
+    parsed = engine._parse_candidate_review(json.dumps(payload), stage="candidate test")  # noqa: SLF001
+
+    location = parsed.findings[0].location
+    assert location.start_line == 470
+    assert location.start_character == 0
+    assert location.end_line is None
+    assert location.end_character is None
+
+
+def test_verifier_invalid_optional_character_range_does_not_discard_finding() -> None:
+    llm = FakeLlm([])
+    engine = NativeFirmwareReviewEngine(llm, ReviewSettings())  # type: ignore[arg-type]
+    payload = json.loads(_review_json())
+    payload["findings"][0]["location"].update(
+        {"end_line": 2, "start_character": 4, "end_character": 4}
+    )
+
+    parsed = engine._parse_verification_review(  # noqa: SLF001
+        json.dumps(payload), stage="verification test"
+    )
+
+    assert len(parsed.findings) == 1
+    assert parsed.findings[0].location.end_line is None
+
+
+def test_candidate_invalid_multiline_end_character_falls_back_to_start_line() -> None:
+    llm = FakeLlm([])
+    engine = NativeFirmwareReviewEngine(llm, ReviewSettings())  # type: ignore[arg-type]
+    payload = json.loads(_review_json())
+    payload["findings"][0]["location"] = {
+        "path": "fw/train.c",
+        "side": "REVISION",
+        "start_line": 2,
+        "start_character": 0,
+        "end_line": 5,
+        "end_character": "bad",
+    }
+
+    parsed = engine._parse_candidate_review(json.dumps(payload), stage="candidate test")  # noqa: SLF001
+
+    location = parsed.findings[0].location
+    assert location.start_line == 2
+    assert location.end_line is None
+    assert location.end_character is None
+
+
+def test_candidate_invalid_start_character_drops_optional_range_too() -> None:
+    llm = FakeLlm([])
+    engine = NativeFirmwareReviewEngine(llm, ReviewSettings())  # type: ignore[arg-type]
+    payload = json.loads(_review_json())
+    payload["findings"][0]["location"] = {
+        "path": "fw/train.c",
+        "side": "REVISION",
+        "start_line": 2,
+        "start_character": "bad",
+        "end_line": 5,
+        "end_character": 3,
+    }
+
+    parsed = engine._parse_candidate_review(json.dumps(payload), stage="candidate test")  # noqa: SLF001
+
+    location = parsed.findings[0].location
+    assert location.start_character == 0
+    assert location.end_line is None
+    assert location.end_character is None
+
+
 @pytest.mark.asyncio
 async def test_duplicate_repository_tool_call_is_suppressed_and_finalized(tmp_path: Path) -> None:
     target = tmp_path / "fw.c"

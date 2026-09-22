@@ -19,7 +19,7 @@
       <tbody>
       {% for job in jobs %}
       <tr>
-        <td><div class="fw-semibold"><a href="/jobs/{{ job.id }}" class="text-reset">{{ job.project }}</a></div><div class="text-secondary"><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a> · {{ job.revision_sha[:10] }}</div></td>
+        <td><div class="fw-semibold"><a href="/jobs/{{ job.id }}" class="text-reset">{{ job.project }}</a></div><div class="text-secondary"><a href="/jobs/{{ job.id }}">#{{ job.change_number }}</a> · {{ job.revision_sha[:10] }}{% if job.cr_url %} · <a href="{{ job.cr_url }}" target="_blank" rel="noopener noreferrer">CR ↗</a>{% endif %}</div></td>
         <td>{{ job.patchset_number }}</td>
         <td><span class="badge {% if job.state == 'DONE' %}bg-green-lt{% elif job.state == 'FAILED_PERMANENT' %}bg-red-lt{% elif job.state in ['RETRY_WAIT','REVIEWING'] and job.last_error_class == 'ProviderUnavailableError' %}bg-yellow-lt{% elif job.state in ['SUPERSEDED','SKIPPED_SCOPE'] %}bg-secondary-lt{% else %}bg-blue-lt{% endif %}">{{ job.state }}</span>{% if job.retry_state %}<div class="small text-secondary mt-1">→ {{ job.retry_state }}</div>{% endif %}</td>
         <td>{{ job.attempt_count }}{% if job.vote_status == 'FAILED' %}<div class="small text-danger">Vote failed; comments posted</div>{% elif job.vote_status in ['PENDING','AMBIGUOUS'] %}<div class="small text-warning">Vote pending</div>{% endif %}</td>

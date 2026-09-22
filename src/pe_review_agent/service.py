@@ -615,11 +615,14 @@ class ReviewWorker:
                 return
 
             # A successful message lookup proves an earlier ambiguous POST did not leave this
-            # durable ReviewInput behind. Only after that observation is it safe to treat a closed
-            # or superseded Change as terminal rather than preserving publication uncertainty.
+            # durable ReviewInput behind. Re-check the exact revision next: NEW and same-revision
+            # MERGED changes remain comment-publishable; ABANDONED or a different revision do not.
             reconciliation_observed_absent = True
-            await self.gerrit.ensure_current_revision(
-                job.project, job.change_number, job.revision_sha
+            publish_change = await self.gerrit.ensure_current_revision(
+                job.project,
+                job.change_number,
+                job.revision_sha,
+                allow_merged=True,
             )
 
             await self._finish_attempt(reconcile_attempt, success=True)
@@ -645,6 +648,7 @@ class ReviewWorker:
                     revision_sha=job.revision_sha,
                     payload=publication.request_payload,
                     pre_post_guard=lambda: self._publish_guard(job.id, worker_id=worker_id),
+                    allow_merged=True,
                 )
             finally:
                 METRICS.gerrit_publish_latency_seconds.observe(perf_counter() - publish_started)
@@ -655,6 +659,13 @@ class ReviewWorker:
                 publication.id,
                 worker_id=worker_id,
                 gerrit_response=response,
+                allow_vote=publish_change.status == "NEW",
+                vote_skip_reason=(
+                    "Change merged after review; comments were published and no Code-Review vote "
+                    "was sent."
+                    if publish_change.status == "MERGED"
+                    else None
+                ),
             )
         except SupersededRevisionError:
             if reconcile_attempt is not None:
@@ -723,6 +734,7 @@ class ReviewWorker:
         worker_id: str,
         gerrit_response: dict | None,
         allow_vote: bool = True,
+        vote_skip_reason: str | None = None,
     ) -> None:
         # Old already-published jobs are never retroactively opted into voting on upgrade.
         policy = (
@@ -758,6 +770,7 @@ class ReviewWorker:
             job,
             worker_id=worker_id,
             allow_vote=allow_vote,
+            skip_reason=vote_skip_reason,
             guard=lambda: self._publish_guard(job.id, worker_id=worker_id),
         )
         if completed:

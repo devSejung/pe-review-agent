@@ -91,6 +91,45 @@ def test_validator_derives_multiline_end_character_from_file(tmp_path: Path) -> 
     assert accepted[0].location.end_character == len("d")
 
 
+def test_validator_keeps_line_anchor_when_optional_start_character_exceeds_line(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    finding = _finding()
+    finding.location = FindingLocation(
+        path="fw/train.c",
+        start_line=3,
+        start_character=999,
+    )
+
+    accepted = FindingValidator(ReviewSettings()).validate(context, [finding])
+
+    assert len(accepted) == 1
+    assert accepted[0].location.start_line == 3
+    assert accepted[0].location.start_character == 0
+    assert accepted[0].location.end_line is None
+
+
+def test_validator_degrades_invalid_revision_range_to_start_line(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    finding = _finding()
+    finding.location = FindingLocation(
+        path="fw/train.c",
+        start_line=3,
+        start_character=0,
+        end_line=4,
+        end_character=999,
+    )
+
+    accepted = FindingValidator(ReviewSettings()).validate(context, [finding])
+
+    assert len(accepted) == 1
+    assert accepted[0].location.start_line == 3
+    assert accepted[0].location.start_character == 0
+    assert accepted[0].location.end_line is None
+    assert accepted[0].location.end_character is None
+
+
 def test_validator_streams_only_needed_lines_from_large_revision_file(tmp_path: Path) -> None:
     relative = "build/tools/register/LPDDR56_PHY.csv"
     target = tmp_path / relative
